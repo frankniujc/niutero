@@ -19,17 +19,42 @@ fn arb_key() -> impl Strategy<Value = String> {
 fn arb_name() -> impl Strategy<Value = String> {
     "[a-z][a-z0-9]{0,12}"
 }
-// No structural chars ({ } " @ # \ newline); commas/parens are fine inside a
-// brace-delimited value.
+// Rich set of characters that are valid *literals* inside a brace-delimited
+// value — quotes, #, @, %, $, &, backslash, accents, CJK — but NO braces, so
+// the value is trivially balanced. The earlier generator excluded exactly
+// these, which is why the determinism tests couldn't exercise value handling.
 fn arb_value() -> impl Strategy<Value = String> {
-    "[a-zA-Z0-9 ,.:;()/?!'+=_-]{0,40}"
+    "[a-zA-Z0-9 ,.:;()/?!'+=_@#%$&\"\\\\éàüäöñç中-]{0,40}"
+}
+
+// Values that contain *balanced* braces, built so every `{` has a matching
+// `}` (one nesting level; deeper nesting is covered by the sample fixture).
+fn arb_braced_value() -> impl Strategy<Value = String> {
+    let atom = "[a-zA-Z0-9 ,.:@#%\"'+=_-]{0,8}";
+    prop::collection::vec((any::<bool>(), atom), 0..6).prop_map(|segs| {
+        let mut s = String::new();
+        for (wrap, a) in segs {
+            if wrap {
+                s.push('{');
+                s.push_str(&a);
+                s.push('}');
+            } else {
+                s.push_str(&a);
+            }
+        }
+        s
+    })
+}
+
+fn arb_field_value() -> impl Strategy<Value = String> {
+    prop_oneof![arb_value(), arb_braced_value()]
 }
 
 fn arb_entry() -> impl Strategy<Value = BibEntry> {
     (
         arb_type(),
         arb_key(),
-        prop::collection::vec((arb_name(), arb_value()), 0..8),
+        prop::collection::vec((arb_name(), arb_field_value()), 0..8),
     )
         .prop_map(|(typ, key, fields)| {
             let mut e = BibEntry::new(typ, key);

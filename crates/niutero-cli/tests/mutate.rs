@@ -264,3 +264,72 @@ fn add_then_edit_then_rm_is_consistent() {
         .success();
     assert_eq!(bib(&d), "@misc{x,\n  title = {A},\n  year = {2024}\n}\n");
 }
+
+// ------------------------------------------------ validation (review C1)
+
+#[test]
+fn add_rejects_illegal_citekey_without_writing() {
+    let d = new_vault();
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args(["--type", "misc", "--key", "x} @evil{y"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("illegal character"));
+    // The corrupt entry was never written.
+    assert_eq!(bib(&d), "");
+}
+
+#[test]
+fn add_rejects_unbalanced_value_without_writing() {
+    let d = new_vault();
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args(["--type", "misc", "--key", "ok", "--field", "title=x}"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("unbalanced"));
+    assert_eq!(bib(&d), "");
+}
+
+#[test]
+fn edit_rejects_unbalanced_value_preserving_original() {
+    let d = new_vault();
+    set_bib(&d, "@misc{k,\n  title = {ok}\n}\n");
+    niutero()
+        .arg("edit")
+        .arg(d.path())
+        .arg("k")
+        .args(["--field", "title=a}b{c"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("unbalanced"));
+    assert_eq!(bib(&d), "@misc{k,\n  title = {ok}\n}\n");
+}
+
+#[test]
+fn add_accepts_balanced_tricky_value() {
+    let d = new_vault();
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args([
+            "--type",
+            "misc",
+            "--key",
+            "k",
+            "--field",
+            "title=Hello {World} and \"q\" # x",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        bib(&d),
+        "@misc{k,\n  title = {Hello {World} and \"q\" # x}\n}\n"
+    );
+}

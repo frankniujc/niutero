@@ -19,7 +19,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use niutero_bib::{parse, to_bibtex, BibItem};
 use serde::{Deserialize, Serialize};
@@ -121,7 +123,7 @@ impl Vault {
             root,
         };
         if !vault.bib_path().exists() {
-            fs::write(vault.bib_path(), "")?;
+            atomic_write(&vault.bib_path(), "")?;
         }
         vault.save_sidecar()?;
         Ok(vault)
@@ -158,19 +160,21 @@ impl Vault {
         })
     }
 
-    /// Write the whole sidecar to disk (creating `.niutero/` if needed).
+    /// Write the whole sidecar to disk (creating `.niutero/` if needed). Each
+    /// file is written atomically; the three are not transactional together,
+    /// but each is individually crash-consistent.
     pub fn save_sidecar(&self) -> io::Result<()> {
         fs::create_dir_all(self.niutero_dir())?;
-        fs::write(
-            self.config_path(),
-            toml::to_string(&self.config).map_err(invalid_data)?,
+        atomic_write(
+            &self.config_path(),
+            &toml::to_string(&self.config).map_err(invalid_data)?,
         )?;
         let mut json = serde_json::to_string_pretty(&self.meta).map_err(invalid_data)?;
         json.push('\n');
-        fs::write(self.meta_path(), json)?;
-        fs::write(
-            self.views_path(),
-            toml::to_string(&self.views).map_err(invalid_data)?,
+        atomic_write(&self.meta_path(), &json)?;
+        atomic_write(
+            &self.views_path(),
+            &toml::to_string(&self.views).map_err(invalid_data)?,
         )?;
         Ok(())
     }
@@ -184,10 +188,39 @@ impl Vault {
         }
     }
 
-    /// Serialize an item stream back to `references.bib` deterministically.
+    /// Serialize an item stream back to `references.bib` deterministically and
+    /// atomically (the source of truth is never left half-written).
     pub fn write_items(&self, items: &[BibItem]) -> io::Result<()> {
-        fs::write(self.bib_path(), to_bibtex(items))
+        atomic_write(&self.bib_path(), &to_bibtex(items))
     }
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `contents` to `path` atomically: a uniquely-named temp file in the
+/// same directory is written and fsynced, then renamed over `path`. `rename`
+/// is atomic on the same volume and replaces an existing file (including on
+/// Windows), so a crash leaves either the old file or the new one intact —
+/// never a truncated `references.bib`.
+fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("out");
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.{}.{n}.tmp", std::process::id()));
+
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp); // best-effort cleanup
+    }
+    result
 }
 
 fn folder_name(root: &Path) -> String {
@@ -298,5 +331,41 @@ mod tests {
         v.save_sidecar().unwrap();
         let second = fs::read_to_string(v.meta_path()).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn atomic_writes_leave_no_temp_files() {
+        let dir = tmp();
+        let v = Vault::init(dir.path()).unwrap();
+        v.write_items(&[BibItem::Entry(BibEntry::new("misc", "k"))])
+            .unwrap();
+        v.save_sidecar().unwrap();
+        let tmp_count = |p: &std::path::Path| {
+            fs::read_dir(p)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .count()
+        };
+        assert_eq!(tmp_count(dir.path()), 0, "no temp files left in vault root");
+        assert_eq!(
+            tmp_count(&v.niutero_dir()),
+            0,
+            "no temp files left in .niutero"
+        );
+        assert_eq!(fs::read_to_string(v.bib_path()).unwrap(), "@misc{k\n}\n");
+    }
+
+    #[test]
+    fn write_items_overwrites_atomically() {
+        let dir = tmp();
+        let v = Vault::init(dir.path()).unwrap();
+        v.write_items(&[BibItem::Entry(BibEntry::new("misc", "a"))])
+            .unwrap();
+        v.write_items(&[BibItem::Entry(BibEntry::new("misc", "b"))])
+            .unwrap();
+        let s = fs::read_to_string(v.bib_path()).unwrap();
+        assert!(s.contains("@misc{b"));
+        assert!(!s.contains("@misc{a"));
     }
 }

@@ -329,6 +329,11 @@ fn cmd_add(
         }
     };
 
+    // Validate before touching disk so a corrupt entry never gets written.
+    for e in &new_entries {
+        e.validate()?;
+    }
+
     // Reject duplicates against existing entries and within the batch.
     let mut seen: std::collections::HashSet<String> =
         entries(&items).map(|e| e.citekey.clone()).collect();
@@ -380,6 +385,10 @@ fn cmd_edit(
         for name in &unset {
             e.remove(name);
         }
+    }
+    // Validate the mutated entry before writing (e.g. a bad --field value).
+    if let BibItem::Entry(e) = &items[idx] {
+        e.validate()?;
     }
     v.write_items(&items)
         .map_err(|e| format!("write references.bib: {e}"))?;

@@ -50,6 +50,76 @@ impl BibEntry {
     pub fn remove(&mut self, name: &str) -> Option<String> {
         self.fields.shift_remove(&name.to_ascii_lowercase())
     }
+
+    /// Check that this entry can be serialized to valid, round-trippable
+    /// BibTeX. The serializer assumes this holds (it writes the cite key and
+    /// field names raw and wraps values in `{...}` without escaping), so the
+    /// boundary that *constructs* entries from untrusted input — cite keys and
+    /// values from the CLI or another tool — must call this before writing.
+    ///
+    /// Rejects: empty/illegal cite keys, non-alphanumeric entry types, illegal
+    /// field names, and field values whose braces are unbalanced (which would
+    /// corrupt the surrounding `.bib`).
+    pub fn validate(&self) -> Result<(), String> {
+        // Characters a BibTeX cite key (and our identifiers) must not contain.
+        const FORBIDDEN: &[char] = &['{', '}', '(', ')', ',', '=', '@', '"', '#', '%', '~', '\\'];
+
+        if self.citekey.is_empty() {
+            return Err("cite key is empty".into());
+        }
+        if let Some(c) = self
+            .citekey
+            .chars()
+            .find(|c| c.is_whitespace() || FORBIDDEN.contains(c))
+        {
+            return Err(format!(
+                "cite key {:?} contains an illegal character {:?}",
+                self.citekey, c
+            ));
+        }
+        if self.entry_type.is_empty() || !self.entry_type.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(format!(
+                "entry type {:?} must be non-empty and alphanumeric",
+                self.entry_type
+            ));
+        }
+        for (name, value) in &self.fields {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'+' | b':'))
+            {
+                return Err(format!("field name {name:?} is not a valid identifier"));
+            }
+            if !braces_balanced(value) {
+                return Err(format!(
+                    "field {name:?} has unbalanced braces (would corrupt the .bib): {value:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// True if `{` / `}` are balanced with no prefix dipping below zero — exactly
+/// the condition for `{value}` to serialize as one well-formed group that
+/// parses back to `value`.
+fn braces_balanced(value: &str) -> bool {
+    let mut depth: i32 = 0;
+    for b in value.bytes() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -100,5 +170,57 @@ mod tests {
     fn values_are_kept_verbatim() {
         let e = BibEntry::new("article", "k").with_field("title", "Hello {World} $x$");
         assert_eq!(e.get("title"), Some("Hello {World} $x$"));
+    }
+
+    #[test]
+    fn validate_accepts_normal_and_tricky_balanced() {
+        assert!(BibEntry::new("article", "niu-etal:2025")
+            .with_field("title", "Hello {World} and \"quotes\" # $x$")
+            .with_field("author", "Doe, John and Smith, A.")
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_illegal_citekey() {
+        for bad in ["x}", "a,b", "with space", "a@b", "", "a{b"] {
+            assert!(
+                BibEntry::new("misc", bad).validate().is_err(),
+                "should reject citekey {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_entry_type() {
+        // entry_type is a public field, so it can be set to anything.
+        let mut e = BibEntry::new("misc", "k");
+        e.entry_type = "mis}c".into();
+        assert!(e.validate().is_err());
+        e.entry_type = String::new();
+        assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unbalanced_value() {
+        assert!(BibEntry::new("misc", "k")
+            .with_field("title", "x}")
+            .validate()
+            .is_err());
+        assert!(BibEntry::new("misc", "k")
+            .with_field("title", "a}b{c") // net zero but dips negative
+            .validate()
+            .is_err());
+        assert!(BibEntry::new("misc", "k")
+            .with_field("title", "{unclosed")
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_field_name() {
+        let mut e = BibEntry::new("misc", "k");
+        e.fields.insert("bad=name".into(), "v".into());
+        assert!(e.validate().is_err());
     }
 }
