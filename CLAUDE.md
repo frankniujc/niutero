@@ -35,11 +35,19 @@ A Cargo workspace that keeps domain logic out of any UI. Planned crates (built i
 milestone order — see `plan.md`):
 
 ```
-niutero-core    domain model (BibEntry, Library, config/meta/view types, filter) — no IO/UI
+niutero-core    domain model (BibEntry + validate(), Library, filter) — no IO/UI
 niutero-bib     tolerant .bib parser + deterministic serializer   <- the foundation
-niutero-vault   vault IO: .niutero/ sidecar + machine-local registry
-niutero-cli     the complete interface — a thin wrapper over the crates above
+niutero-vault   vault IO: .niutero/ sidecar, atomic writes (temp + rename)
+niutero-engine  operations layer: init/open/list/show/add/edit/rm + owned EntryView DTO
+niutero-cli     thin arg-parse + output shell over niutero-engine
 ```
+
+`niutero-engine` is the reusable surface that makes "CLI is the complete interface"
+real: every capability is an engine function over an open `Vault`, the CLI only
+parses args and formats output, and the Phase-2 GUI will call the engine directly
+(not shell out). Add new capabilities to the engine first, then expose a thin CLI
+command. Entries from untrusted input must pass `BibEntry::validate()` before being
+written (the serializer assumes valid, brace-balanced values).
 
 Data model: **a library is a folder** ("vault"). The folder holds `references.bib`
 (portable, tool-agnostic) plus a `.niutero/` sidecar (`config.toml`, `meta.json`
