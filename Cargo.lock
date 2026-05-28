@@ -392,8 +392,16 @@ dependencies = [
  "indexmap",
  "niutero-bib",
  "niutero-core",
+ "niutero-sync",
  "niutero-vault",
  "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "niutero-sync"
+version = "0.1.0"
+dependencies = [
  "tempfile",
 ]
 

@@ -1,0 +1,12 @@
+[package]
+name = "niutero-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No runtime dependencies: sync shells out to the user's system `git`, which
+# handles credentials via their configured helper / SSH agent. niutero never
+# touches credentials and does not link libgit2.
+
+[dev-dependencies]
+tempfile = { workspace = true }

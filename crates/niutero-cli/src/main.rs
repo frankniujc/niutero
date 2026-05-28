@@ -167,6 +167,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Connect the vault to a git remote for syncing.
+    Connect {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Remote URL (e.g. git@github.com:user/repo.git).
+        url: String,
+    },
+    /// Commit local changes, pull, and push (needs `connect` first).
+    Sync {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Commit message (default: "niutero: sync").
+        #[arg(long)]
+        message: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -274,6 +289,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             out,
             json,
         } => cmd_tex_scan(&vault, &tex, out, json),
+        Cmd::Connect { vault, url } => cmd_connect(&vault, &url).map(ok),
+        Cmd::Sync { vault, message } => cmd_sync(&vault, message),
     }
 }
 
@@ -578,4 +595,32 @@ fn cmd_tex_scan(
     } else {
         ExitCode::from(2)
     })
+}
+
+fn cmd_connect(vault: &Path, url: &str) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    engine::connect(&v, url)?;
+    println!("Connected {} to {url}", v.root.display());
+    Ok(())
+}
+
+fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
+    let v = engine::open(vault)?;
+    match engine::sync(&v, message)? {
+        engine::SyncStatus::Synced { committed } => {
+            let what = if committed {
+                "committed local changes"
+            } else {
+                "nothing to commit"
+            };
+            println!("Synced ({what})");
+            Ok(ExitCode::SUCCESS)
+        }
+        engine::SyncStatus::Conflict => {
+            eprintln!(
+                "sync hit a merge conflict and was aborted; resolve it with git, then re-run"
+            );
+            Ok(ExitCode::from(2))
+        }
+    }
 }

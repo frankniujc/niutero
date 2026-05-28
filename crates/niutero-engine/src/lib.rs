@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
 use niutero_core::{filter, texscan, BibEntry};
+use niutero_sync as git;
 use serde::{Deserialize, Serialize};
 
 pub use niutero_core::texscan::TexReport;
@@ -380,6 +381,44 @@ pub fn export_keys(v: &Vault, keys: &[String], out: &Path) -> Result<usize, Stri
     std::fs::write(out, to_bibtex_entries(&selected))
         .map_err(|e| format!("write {}: {e}", out.display()))?;
     Ok(selected.len())
+}
+
+// ------------------------------------------------------------------- sync
+
+/// Outcome of a [`sync`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// Pulled and pushed cleanly; `committed` is whether local changes were committed.
+    Synced { committed: bool },
+    /// A pull conflict was hit and the merge aborted — the user must resolve it.
+    Conflict,
+}
+
+/// Initialize git in the vault (if needed) and point `origin` at `url`.
+pub fn connect(v: &Vault, url: &str) -> Result<(), String> {
+    if !git::is_repo(&v.root) {
+        git::init(&v.root)?;
+    }
+    git::set_remote(&v.root, "origin", url)
+}
+
+/// Commit local changes, pull, then push. Requires a git repo with an `origin`
+/// remote (set up via [`connect`]). A pull conflict aborts and returns
+/// [`SyncStatus::Conflict`] rather than leaving a half-merged tree.
+pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
+    if !git::is_repo(&v.root) {
+        return Err("not a git repository — run `niutero connect <url>` first".into());
+    }
+    if git::remote_url(&v.root, "origin").is_none() {
+        return Err("no 'origin' remote — run `niutero connect <url>` first".into());
+    }
+    let message = message.unwrap_or_else(|| "niutero: sync".to_string());
+    let committed = git::commit_all(&v.root, &message)?;
+    if git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict {
+        return Ok(SyncStatus::Conflict);
+    }
+    git::push(&v.root)?;
+    Ok(SyncStatus::Synced { committed })
 }
 
 // ----------------------------------------------------------------- helpers
@@ -779,5 +818,87 @@ mod tests {
         let w = std::fs::read_to_string(&out).unwrap();
         assert!(w.contains("@article{used1,"));
         assert!(!w.contains("unused1"));
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+    }
+
+    fn git_identity(dir: &std::path::Path) {
+        run_git(dir, &["config", "user.email", "t@e.com"]);
+        run_git(dir, &["config", "user.name", "T"]);
+        run_git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn git_clone(bare: &str, dst: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["clone", bare, dst.to_str().unwrap()])
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn sync_without_connect_errors() {
+        let (_d, v) = vault();
+        assert!(sync(&v, None).unwrap_err().contains("not a git repository"));
+    }
+
+    #[test]
+    fn sync_pushes_and_a_clone_sees_it() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, v) = vault();
+        connect(&v, bare).unwrap();
+        git_identity(&v.root);
+        add(&v, fields("misc", "k", &["title=Hi"])).unwrap();
+        assert_eq!(
+            sync(&v, None).unwrap(),
+            SyncStatus::Synced { committed: true }
+        );
+
+        let dst = tempfile::tempdir().unwrap();
+        let clone = dst.path().join("clone");
+        git_clone(bare, &clone);
+        let bib = std::fs::read_to_string(clone.join("references.bib")).unwrap();
+        assert!(bib.contains("@misc{k,"));
+    }
+
+    #[test]
+    fn sync_detects_conflict() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        // A: connect, add, push.
+        let (_da, a) = vault();
+        connect(&a, bare).unwrap();
+        git_identity(&a.root);
+        add(&a, fields("misc", "k", &["title=A"])).unwrap();
+        sync(&a, None).unwrap();
+
+        // B: clone the pushed repo.
+        let dstb = tempfile::tempdir().unwrap();
+        let b_path = dstb.path().join("b");
+        git_clone(bare, &b_path);
+        git_identity(&b_path);
+        let b = open(&b_path).unwrap();
+
+        // A and B change the same line differently; B's sync conflicts.
+        edit(&a, "k", &["title=A2".into()], &[], None).unwrap();
+        sync(&a, None).unwrap();
+        edit(&b, "k", &["title=B2".into()], &[], None).unwrap();
+        assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
     }
 }

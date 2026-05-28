@@ -8,6 +8,7 @@ license.workspace = true
 niutero-core = { path = "../niutero-core" }
 niutero-bib = { path = "../niutero-bib" }
 niutero-vault = { path = "../niutero-vault" }
+niutero-sync = { path = "../niutero-sync" }
 indexmap = { workspace = true }
 serde = { workspace = true }
 
