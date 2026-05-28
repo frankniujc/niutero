@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
-use niutero_core::{filter, BibEntry};
+use niutero_core::{filter, texscan, BibEntry};
 use serde::{Deserialize, Serialize};
 
+pub use niutero_core::texscan::TexReport;
 pub use niutero_vault::{Vault, View};
 
 /// An owned, serializable view of an entry plus its sidecar tags/notes — the
@@ -342,6 +343,38 @@ pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
                 .unwrap_or(&[]);
             filter::entry_matches(&query, e, tags)
         })
+        .cloned()
+        .collect();
+    std::fs::write(out, to_bibtex_entries(&selected))
+        .map_err(|e| format!("write {}: {e}", out.display()))?;
+    Ok(selected.len())
+}
+
+// ------------------------------------------------------------- LaTeX glue
+
+/// Scan `.tex`/`.aux` files and report cite-key usage against the library.
+pub fn tex_scan(v: &Vault, tex_files: &[PathBuf]) -> Result<TexReport, String> {
+    let items = read_items(v)?;
+    let lib_keys: std::collections::BTreeSet<String> =
+        entries(&items).map(|e| e.citekey.clone()).collect();
+    let mut cited = texscan::Cited::default();
+    for path in tex_files {
+        let src =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let c = texscan::cited_keys(&src);
+        cited.keys.extend(c.keys);
+        cited.cite_all |= c.cite_all;
+    }
+    Ok(texscan::report(&lib_keys, &cited))
+}
+
+/// Write only the entries whose cite key is in `keys` to a standalone `.bib`
+/// (e.g. a pruned bibliography for a paper). Returns the number written.
+pub fn export_keys(v: &Vault, keys: &[String], out: &Path) -> Result<usize, String> {
+    let items = read_items(v)?;
+    let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let selected: Vec<BibEntry> = entries(&items)
+        .filter(|e| wanted.contains(e.citekey.as_str()))
         .cloned()
         .collect();
     std::fs::write(out, to_bibtex_entries(&selected))
@@ -728,5 +761,23 @@ mod tests {
         let written = std::fs::read_to_string(&out).unwrap();
         assert!(written.contains("@article{a,"));
         assert!(!written.contains("@misc{b,"));
+    }
+
+    #[test]
+    fn tex_scan_reports_and_export_keys_prunes() {
+        let (d, v) = vault();
+        add(&v, fields("article", "used1", &["title=U1"])).unwrap();
+        add(&v, fields("misc", "unused1", &["title=N"])).unwrap();
+        let tex = write_file(&d, "paper.tex", r"\cite{used1,missing1}");
+        let report = tex_scan(&v, &[tex]).unwrap();
+        assert_eq!(report.used, vec!["used1".to_string()]);
+        assert_eq!(report.missing, vec!["missing1".to_string()]);
+        assert_eq!(report.unused, vec!["unused1".to_string()]);
+
+        let out = d.path().join("cited.bib");
+        assert_eq!(export_keys(&v, &report.used, &out).unwrap(), 1);
+        let w = std::fs::read_to_string(&out).unwrap();
+        assert!(w.contains("@article{used1,"));
+        assert!(!w.contains("unused1"));
     }
 }

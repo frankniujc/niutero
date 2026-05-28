@@ -153,6 +153,20 @@ enum Cmd {
         #[arg(long)]
         view: Option<String>,
     },
+    /// Scan .tex/.aux files and report used / missing / unused cite keys.
+    TexScan {
+        /// Vault folder.
+        vault: PathBuf,
+        /// One or more .tex/.aux files to scan.
+        #[arg(required = true)]
+        tex: Vec<PathBuf>,
+        /// Write a pruned .bib of only the cited (used) entries here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -187,7 +201,7 @@ enum ViewAction {
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
@@ -195,20 +209,25 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+/// Adapt a `()`-returning handler to a success exit code.
+fn ok(_: ()) -> ExitCode {
+    ExitCode::SUCCESS
+}
+
+fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.cmd {
-        Cmd::Init { path } => cmd_init(&path),
+        Cmd::Init { path } => cmd_init(&path).map(ok),
         Cmd::List {
             vault,
             query,
             view,
             json,
-        } => cmd_list(&vault, query, view, json),
+        } => cmd_list(&vault, query, view, json).map(ok),
         Cmd::Show {
             vault,
             citekey,
             json,
-        } => cmd_show(&vault, &citekey, json),
+        } => cmd_show(&vault, &citekey, json).map(ok),
         Cmd::Add {
             vault,
             bibtex,
@@ -216,39 +235,45 @@ fn run(cli: Cli) -> Result<(), String> {
             type_,
             key,
             field,
-        } => cmd_add(&vault, bibtex, from, type_, key, field),
+        } => cmd_add(&vault, bibtex, from, type_, key, field).map(ok),
         Cmd::Edit {
             vault,
             citekey,
             field,
             unset,
             type_,
-        } => cmd_edit(&vault, &citekey, field, unset, type_),
-        Cmd::Rm { vault, citekey } => cmd_rm(&vault, &citekey),
+        } => cmd_edit(&vault, &citekey, field, unset, type_).map(ok),
+        Cmd::Rm { vault, citekey } => cmd_rm(&vault, &citekey).map(ok),
         Cmd::Tag {
             vault,
             citekey,
             add,
             remove,
-        } => cmd_tag(&vault, &citekey, add, remove),
+        } => cmd_tag(&vault, &citekey, add, remove).map(ok),
         Cmd::Note {
             vault,
             citekey,
             set,
             clear,
-        } => cmd_note(&vault, &citekey, set, clear),
-        Cmd::View { vault, action } => cmd_view(&vault, action),
+        } => cmd_note(&vault, &citekey, set, clear).map(ok),
+        Cmd::View { vault, action } => cmd_view(&vault, action).map(ok),
         Cmd::Import {
             vault,
             file,
             on_dup,
-        } => cmd_import(&vault, &file, on_dup),
+        } => cmd_import(&vault, &file, on_dup).map(ok),
         Cmd::Export {
             vault,
             out,
             query,
             view,
-        } => cmd_export(&vault, &out, query, view),
+        } => cmd_export(&vault, &out, query, view).map(ok),
+        Cmd::TexScan {
+            vault,
+            tex,
+            out,
+            json,
+        } => cmd_tex_scan(&vault, &tex, out, json),
     }
 }
 
@@ -503,4 +528,54 @@ fn cmd_export(
     let n = engine::export(&v, filter_from(query, view)?, out)?;
     println!("Exported {n} entr(ies) to {}", out.display());
     Ok(())
+}
+
+fn cmd_tex_scan(
+    vault: &Path,
+    tex: &[PathBuf],
+    out: Option<PathBuf>,
+    json: bool,
+) -> Result<ExitCode, String> {
+    let v = engine::open(vault)?;
+    let report = engine::tex_scan(&v, tex)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "used {}, missing {}, unused {}{}",
+            report.used.len(),
+            report.missing.len(),
+            report.unused.len(),
+            if report.cite_all {
+                "  (\\nocite{*})"
+            } else {
+                ""
+            }
+        );
+        if !report.missing.is_empty() {
+            println!("missing (cited, not in library):");
+            for k in &report.missing {
+                println!("  {k}");
+            }
+        }
+        if !report.unused.is_empty() {
+            println!("unused (in library, never cited):");
+            for k in &report.unused {
+                println!("  {k}");
+            }
+        }
+    }
+    if let Some(out) = out {
+        let n = engine::export_keys(&v, &report.used, &out)?;
+        println!("Wrote {n} cited entr(ies) to {}", out.display());
+    }
+    // CI gate: undefined references are actionable.
+    Ok(if report.missing.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }

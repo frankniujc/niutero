@@ -8,6 +8,7 @@
 mod entry;
 pub mod filter;
 mod library;
+pub mod texscan;
 
 pub use entry::BibEntry;
 pub use library::Library;
