@@ -371,12 +371,8 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
- "indexmap",
- "niutero-bib",
- "niutero-core",
- "niutero-vault",
+ "niutero-engine",
  "predicates",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -387,6 +383,18 @@ version = "0.1.0"
 dependencies = [
  "indexmap",
  "serde",
+]
+
+[[package]]
+name = "niutero-engine"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "niutero-bib",
+ "niutero-core",
+ "niutero-vault",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

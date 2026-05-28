@@ -9,13 +9,9 @@ name = "niutero"
 path = "src/main.rs"
 
 [dependencies]
-niutero-core = { path = "../niutero-core" }
-niutero-bib = { path = "../niutero-bib" }
-niutero-vault = { path = "../niutero-vault" }
+niutero-engine = { path = "../niutero-engine" }
 clap = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-indexmap = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

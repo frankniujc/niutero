@@ -1,0 +1,15 @@
+[package]
+name = "niutero-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+niutero-core = { path = "../niutero-core" }
+niutero-bib = { path = "../niutero-bib" }
+niutero-vault = { path = "../niutero-vault" }
+indexmap = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
