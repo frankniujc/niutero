@@ -96,6 +96,62 @@ enum Cmd {
         /// Cite key to remove.
         citekey: String,
     },
+    /// Add/remove tags on an entry (no flags = show current tags).
+    Tag {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+        /// Tag to add (repeatable).
+        #[arg(long = "add", value_name = "TAG")]
+        add: Vec<String>,
+        /// Tag to remove (repeatable).
+        #[arg(long = "remove", value_name = "TAG")]
+        remove: Vec<String>,
+    },
+    /// Set, clear, or show an entry's note.
+    Note {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+        /// Set the note to this text.
+        #[arg(long)]
+        set: Option<String>,
+        /// Clear the note.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Manage saved filter views.
+    View {
+        /// Vault folder.
+        vault: PathBuf,
+        #[command(subcommand)]
+        action: ViewAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ViewAction {
+    /// List saved views.
+    List {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a saved view.
+    Add {
+        /// View name.
+        name: String,
+        /// The view's filter query.
+        #[arg(long)]
+        query: String,
+    },
+    /// Remove a saved view by name.
+    Rm {
+        /// View name.
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -138,6 +194,19 @@ fn run(cli: Cli) -> Result<(), String> {
             type_,
         } => cmd_edit(&vault, &citekey, field, unset, type_),
         Cmd::Rm { vault, citekey } => cmd_rm(&vault, &citekey),
+        Cmd::Tag {
+            vault,
+            citekey,
+            add,
+            remove,
+        } => cmd_tag(&vault, &citekey, add, remove),
+        Cmd::Note {
+            vault,
+            citekey,
+            set,
+            clear,
+        } => cmd_note(&vault, &citekey, set, clear),
+        Cmd::View { vault, action } => cmd_view(&vault, action),
     }
 }
 
@@ -275,5 +344,80 @@ fn cmd_rm(vault: &Path, citekey: &str) -> Result<(), String> {
     let mut v = engine::open(vault)?;
     engine::rm(&mut v, citekey)?;
     println!("Removed {citekey}");
+    Ok(())
+}
+
+fn cmd_tag(
+    vault: &Path,
+    citekey: &str,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<(), String> {
+    let tags = if add.is_empty() && remove.is_empty() {
+        engine::current_tags(&engine::open(vault)?, citekey)?
+    } else {
+        let mut v = engine::open(vault)?;
+        engine::set_tags(&mut v, citekey, &add, &remove)?
+    };
+    if tags.is_empty() {
+        println!("(no tags)");
+    } else {
+        println!("tags: {}", tags.join(", "));
+    }
+    Ok(())
+}
+
+fn cmd_note(vault: &Path, citekey: &str, set: Option<String>, clear: bool) -> Result<(), String> {
+    if set.is_some() && clear {
+        return Err("use either --set or --clear, not both".into());
+    }
+    if let Some(text) = set {
+        let mut v = engine::open(vault)?;
+        engine::set_note(&mut v, citekey, Some(text))?;
+        println!("Set note for {citekey}");
+    } else if clear {
+        let mut v = engine::open(vault)?;
+        engine::set_note(&mut v, citekey, None)?;
+        println!("Cleared note for {citekey}");
+    } else {
+        let note = engine::current_note(&engine::open(vault)?, citekey)?;
+        if note.is_empty() {
+            println!("(no note)");
+        } else {
+            println!("{note}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_view(vault: &Path, action: ViewAction) -> Result<(), String> {
+    match action {
+        ViewAction::List { json } => {
+            let v = engine::open(vault)?;
+            let views = engine::views(&v);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(views).map_err(|e| e.to_string())?
+                );
+            } else if views.is_empty() {
+                println!("(no saved views)");
+            } else {
+                for w in views {
+                    println!("{}: {}", w.name, w.query);
+                }
+            }
+        }
+        ViewAction::Add { name, query } => {
+            let mut v = engine::open(vault)?;
+            engine::add_view(&mut v, name.clone(), query)?;
+            println!("Added view '{name}'");
+        }
+        ViewAction::Rm { name } => {
+            let mut v = engine::open(vault)?;
+            engine::remove_view(&mut v, &name)?;
+            println!("Removed view '{name}'");
+        }
+    }
     Ok(())
 }

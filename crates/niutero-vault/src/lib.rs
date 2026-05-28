@@ -61,6 +61,14 @@ pub struct EntryMeta {
     pub added: Option<String>,
 }
 
+impl EntryMeta {
+    /// True when there is nothing worth persisting, so callers can drop the
+    /// map entry and keep `meta.json` minimal.
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.note.is_empty() && self.added.is_none()
+    }
+}
+
 /// `.niutero/meta.json` — keyed by cite key, ordered for stable diffs.
 pub type Meta = BTreeMap<String, EntryMeta>;
 
