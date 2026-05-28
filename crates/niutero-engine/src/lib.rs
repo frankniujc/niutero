@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use niutero_bib::{entries, parse, BibItem};
+use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
 use niutero_core::{filter, BibEntry};
 use serde::{Deserialize, Serialize};
 
@@ -61,17 +61,7 @@ pub fn init(path: &Path) -> Result<Vault, String> {
 /// Entries matching `filter`, each with its sidecar tags/notes.
 pub fn list(v: &Vault, filter: Filter) -> Result<Vec<EntryView>, String> {
     let items = read_items(v)?;
-    let query = match filter {
-        Filter::All => String::new(),
-        Filter::Query(q) => q,
-        Filter::View(name) => v
-            .views
-            .views
-            .iter()
-            .find(|w| w.name == name)
-            .map(|w| w.query.clone())
-            .ok_or_else(|| format!("no saved view named '{name}'"))?,
-    };
+    let query = resolve_query(v, filter)?;
     Ok(entries(&items)
         .filter(|e| {
             let tags = v
@@ -267,7 +257,121 @@ pub fn remove_view(v: &mut Vault, name: &str) -> Result<(), String> {
     save_sidecar(v)
 }
 
+// ------------------------------------------------------- import / export
+
+/// What to do when an imported entry's cite key already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DupPolicy {
+    /// Keep the existing entry; drop the imported one.
+    Skip,
+    /// Replace the existing entry (in place) with the imported one.
+    Overwrite,
+    /// Add the imported entry under a fresh, unique cite key.
+    Rename,
+}
+
+/// Outcome of an [`import`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ImportReport {
+    pub added: usize,
+    pub skipped: usize,
+    pub overwritten: usize,
+    /// `(original, new)` for each renamed entry.
+    pub renamed: Vec<(String, String)>,
+}
+
+/// Merge the entries of an external `.bib` into the library under `policy`.
+/// The whole import is atomic: if any entry is invalid the library is left
+/// untouched (validation happens before the single write). Existing entries
+/// and verbatim blocks are preserved.
+pub fn import(v: &Vault, file: &Path, policy: DupPolicy) -> Result<ImportReport, String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let incoming: Vec<BibEntry> = entries(&parse(&src)).cloned().collect();
+    if incoming.is_empty() {
+        return Err("no BibTeX entries found in the file".into());
+    }
+
+    let mut items = read_items(v)?;
+    let mut keys: std::collections::HashSet<String> =
+        entries(&items).map(|e| e.citekey.clone()).collect();
+    let mut report = ImportReport::default();
+
+    for mut entry in incoming {
+        if keys.contains(&entry.citekey) {
+            match policy {
+                DupPolicy::Skip => report.skipped += 1,
+                DupPolicy::Overwrite => {
+                    entry.validate()?;
+                    let idx = find_entry(&items, &entry.citekey)?;
+                    items[idx] = BibItem::Entry(entry);
+                    report.overwritten += 1;
+                }
+                DupPolicy::Rename => {
+                    let original = entry.citekey.clone();
+                    let new = unique_key(&original, &keys);
+                    entry.citekey = new.clone();
+                    entry.validate()?;
+                    keys.insert(new.clone());
+                    items.push(BibItem::Entry(entry));
+                    report.renamed.push((original, new));
+                }
+            }
+        } else {
+            entry.validate()?;
+            keys.insert(entry.citekey.clone());
+            items.push(BibItem::Entry(entry));
+            report.added += 1;
+        }
+    }
+
+    write_items(v, &items)?;
+    Ok(report)
+}
+
+/// Write the entries matching `filter` to a standalone `.bib` at `out`.
+/// Returns the number of entries written.
+pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
+    let items = read_items(v)?;
+    let query = resolve_query(v, filter)?;
+    let selected: Vec<BibEntry> = entries(&items)
+        .filter(|e| {
+            let tags = v
+                .meta
+                .get(&e.citekey)
+                .map(|m| m.tags.as_slice())
+                .unwrap_or(&[]);
+            filter::entry_matches(&query, e, tags)
+        })
+        .cloned()
+        .collect();
+    std::fs::write(out, to_bibtex_entries(&selected))
+        .map_err(|e| format!("write {}: {e}", out.display()))?;
+    Ok(selected.len())
+}
+
 // ----------------------------------------------------------------- helpers
+
+fn resolve_query(v: &Vault, filter: Filter) -> Result<String, String> {
+    Ok(match filter {
+        Filter::All => String::new(),
+        Filter::Query(q) => q,
+        Filter::View(name) => v
+            .views
+            .views
+            .iter()
+            .find(|w| w.name == name)
+            .map(|w| w.query.clone())
+            .ok_or_else(|| format!("no saved view named '{name}'"))?,
+    })
+}
+
+/// `base-2`, `base-3`, … — the first that is not already taken.
+fn unique_key(base: &str, taken: &std::collections::HashSet<String>) -> String {
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|k| !taken.contains(k))
+        .expect("infinite range yields an unused key")
+}
 
 fn entry_exists(v: &Vault, citekey: &str) -> Result<(), String> {
     let items = read_items(v)?;
@@ -524,5 +628,105 @@ mod tests {
         assert!(remove_view(&mut v, "NLP")
             .unwrap_err()
             .contains("no saved view named 'NLP'"));
+    }
+
+    fn write_file(d: &tempfile::TempDir, name: &str, contents: &str) -> std::path::PathBuf {
+        let p = d.path().join(name);
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    fn title(v: &Vault, key: &str) -> Option<String> {
+        show(v, key).unwrap().fields.get("title").cloned()
+    }
+
+    #[test]
+    fn import_skip_keeps_existing() {
+        let (d, v) = vault();
+        add(&v, fields("misc", "k", &["title=Orig"])).unwrap();
+        let f = write_file(
+            &d,
+            "in.bib",
+            "@misc{k, title = {New}}\n@misc{fresh, title = {F}}\n",
+        );
+        let r = import(&v, &f, DupPolicy::Skip).unwrap();
+        assert_eq!(r.added, 1);
+        assert_eq!(r.skipped, 1);
+        assert_eq!(title(&v, "k").as_deref(), Some("Orig"));
+        assert!(show(&v, "fresh").is_ok());
+    }
+
+    #[test]
+    fn import_overwrite_replaces_in_place() {
+        let (d, v) = vault();
+        add(&v, fields("misc", "k", &["title=Orig"])).unwrap();
+        let f = write_file(&d, "in.bib", "@article{k, title = {New}}\n");
+        let r = import(&v, &f, DupPolicy::Overwrite).unwrap();
+        assert_eq!(r.overwritten, 1);
+        let view = show(&v, "k").unwrap();
+        assert_eq!(view.entry_type, "article");
+        assert_eq!(view.fields.get("title").map(String::as_str), Some("New"));
+    }
+
+    #[test]
+    fn import_rename_keeps_both() {
+        let (d, v) = vault();
+        add(&v, fields("misc", "k", &["title=Orig"])).unwrap();
+        let f = write_file(&d, "in.bib", "@misc{k, title = {New}}\n");
+        let r = import(&v, &f, DupPolicy::Rename).unwrap();
+        assert_eq!(r.renamed, vec![("k".to_string(), "k-2".to_string())]);
+        assert_eq!(title(&v, "k").as_deref(), Some("Orig"));
+        assert_eq!(title(&v, "k-2").as_deref(), Some("New"));
+    }
+
+    #[test]
+    fn import_is_atomic_on_invalid_entry() {
+        let (d, v) = vault();
+        add(&v, fields("misc", "keep", &[])).unwrap();
+        let before = std::fs::read_to_string(v.bib_path()).unwrap();
+        let f = write_file(
+            &d,
+            "in.bib",
+            "@misc{good, title={G}}\n@misc{bad key, title={B}}\n",
+        );
+        assert!(import(&v, &f, DupPolicy::Skip).is_err());
+        // Nothing was written: the bad cite key aborted the whole import.
+        assert_eq!(std::fs::read_to_string(v.bib_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn import_no_entries_errors() {
+        let (d, v) = vault();
+        let f = write_file(&d, "empty.bib", "% just a comment\n");
+        assert!(import(&v, &f, DupPolicy::Skip)
+            .unwrap_err()
+            .contains("no BibTeX entries"));
+    }
+
+    #[test]
+    fn import_preserves_existing_verbatim() {
+        let (d, v) = vault();
+        v.write_items(&parse("@string{acl = {ACL}}\n\n@misc{k}\n"))
+            .unwrap();
+        let f = write_file(&d, "in.bib", "@misc{new1, title={N}}\n");
+        import(&v, &f, DupPolicy::Skip).unwrap();
+        let bib = std::fs::read_to_string(v.bib_path()).unwrap();
+        assert!(bib.contains("@string{acl = {ACL}}"));
+        assert!(bib.contains("@misc{new1"));
+    }
+
+    #[test]
+    fn export_all_query_and_count() {
+        let (d, v) = vault();
+        add(&v, fields("article", "a", &["title=Apple"])).unwrap();
+        add(&v, fields("misc", "b", &["title=Banana"])).unwrap();
+        let out = d.path().join("out.bib");
+
+        assert_eq!(export(&v, Filter::All, &out).unwrap(), 2);
+
+        assert_eq!(export(&v, Filter::Query("apple".into()), &out).unwrap(), 1);
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert!(written.contains("@article{a,"));
+        assert!(!written.contains("@misc{b,"));
     }
 }

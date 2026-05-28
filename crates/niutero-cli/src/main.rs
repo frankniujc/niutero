@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use niutero_engine::{self as engine, AddSource, Filter};
+use clap::{Parser, Subcommand, ValueEnum};
+use niutero_engine::{self as engine, AddSource, DupPolicy, Filter};
 
 #[derive(Parser)]
 #[command(
@@ -129,6 +129,37 @@ enum Cmd {
         #[command(subcommand)]
         action: ViewAction,
     },
+    /// Import entries from a .bib file (merge with a duplicate-key policy).
+    Import {
+        /// Vault folder.
+        vault: PathBuf,
+        /// The .bib file to import.
+        file: PathBuf,
+        /// What to do when a cite key already exists.
+        #[arg(long = "on-dup", value_enum, default_value_t = OnDup::Skip)]
+        on_dup: OnDup,
+    },
+    /// Export the (optionally filtered) library to a standalone .bib file.
+    Export {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Output file path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Filter query: free text and `tag:foo` terms, all ANDed.
+        #[arg(long)]
+        query: Option<String>,
+        /// Use a saved view's query (mutually exclusive with --query).
+        #[arg(long)]
+        view: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnDup {
+    Skip,
+    Overwrite,
+    Rename,
 }
 
 #[derive(Subcommand)]
@@ -207,6 +238,27 @@ fn run(cli: Cli) -> Result<(), String> {
             clear,
         } => cmd_note(&vault, &citekey, set, clear),
         Cmd::View { vault, action } => cmd_view(&vault, action),
+        Cmd::Import {
+            vault,
+            file,
+            on_dup,
+        } => cmd_import(&vault, &file, on_dup),
+        Cmd::Export {
+            vault,
+            out,
+            query,
+            view,
+        } => cmd_export(&vault, &out, query, view),
+    }
+}
+
+/// Translate `--query` / `--view` into a [`Filter`], rejecting both at once.
+fn filter_from(query: Option<String>, view: Option<String>) -> Result<Filter, String> {
+    match (query, view) {
+        (Some(_), Some(_)) => Err("use either --query or --view, not both".into()),
+        (Some(q), None) => Ok(Filter::Query(q)),
+        (None, Some(name)) => Ok(Filter::View(name)),
+        (None, None) => Ok(Filter::All),
     }
 }
 
@@ -227,13 +279,7 @@ fn cmd_list(
     json: bool,
 ) -> Result<(), String> {
     let v = engine::open(vault)?;
-    let filter = match (query, view) {
-        (Some(_), Some(_)) => return Err("use either --query or --view, not both".into()),
-        (Some(q), None) => Filter::Query(q),
-        (None, Some(name)) => Filter::View(name),
-        (None, None) => Filter::All,
-    };
-    let views = engine::list(&v, filter)?;
+    let views = engine::list(&v, filter_from(query, view)?)?;
     if json {
         println!(
             "{}",
@@ -419,5 +465,42 @@ fn cmd_view(vault: &Path, action: ViewAction) -> Result<(), String> {
             println!("Removed view '{name}'");
         }
     }
+    Ok(())
+}
+
+fn cmd_import(vault: &Path, file: &Path, on_dup: OnDup) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    let policy = match on_dup {
+        OnDup::Skip => DupPolicy::Skip,
+        OnDup::Overwrite => DupPolicy::Overwrite,
+        OnDup::Rename => DupPolicy::Rename,
+    };
+    let r = engine::import(&v, file, policy)?;
+    let mut parts = vec![format!("{} added", r.added)];
+    if r.overwritten > 0 {
+        parts.push(format!("{} overwritten", r.overwritten));
+    }
+    if !r.renamed.is_empty() {
+        parts.push(format!("{} renamed", r.renamed.len()));
+    }
+    if r.skipped > 0 {
+        parts.push(format!("{} skipped", r.skipped));
+    }
+    println!("Imported: {}", parts.join(", "));
+    for (old, new) in &r.renamed {
+        println!("  {old} -> {new}");
+    }
+    Ok(())
+}
+
+fn cmd_export(
+    vault: &Path,
+    out: &Path,
+    query: Option<String>,
+    view: Option<String>,
+) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    let n = engine::export(&v, filter_from(query, view)?, out)?;
+    println!("Exported {n} entr(ies) to {}", out.display());
     Ok(())
 }
