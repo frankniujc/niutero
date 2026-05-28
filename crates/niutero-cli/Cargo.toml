@@ -1,0 +1,23 @@
+[package]
+name = "niutero-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "niutero"
+path = "src/main.rs"
+
+[dependencies]
+niutero-core = { path = "../niutero-core" }
+niutero-bib = { path = "../niutero-bib" }
+niutero-vault = { path = "../niutero-vault" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,4 @@
+/target
+# Machine-specific linker/xwin paths. Copy .cargo/config.toml.example and edit.
+/.cargo/config.toml
+*.pdb

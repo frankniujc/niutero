@@ -1,0 +1,18 @@
+# Template for the machine-specific build config (the real config.toml is
+# gitignored). Only needed on a Windows-on-ARM machine without Visual Studio,
+# where we link with llvm-mingw's lld-link and supply the MSVC CRT + Windows
+# SDK import libraries via xwin (https://github.com/Jake-Shadle/xwin).
+#
+# Setup:
+#   1. Install llvm-mingw and put its bin/ on PATH (provides clang + lld-link).
+#   2. Fetch the CRT/SDK libs with xwin into <XWIN>/ (crt/ and sdk/).
+#   3. Copy this file to .cargo/config.toml and fix the paths below.
+#
+# On a normal machine with a working native linker, no config is needed at all.
+[target.aarch64-pc-windows-msvc]
+linker = "C:\\path\\to\\llvm-mingw\\bin\\lld-link.exe"
+rustflags = [
+    "-Lnative=C:\\path\\to\\xwin\\crt\\lib\\aarch64",
+    "-Lnative=C:\\path\\to\\xwin\\sdk\\lib\\um\\aarch64",
+    "-Lnative=C:\\path\\to\\xwin\\sdk\\lib\\ucrt\\aarch64",
+]

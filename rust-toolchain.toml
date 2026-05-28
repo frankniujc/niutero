@@ -1,0 +1,5 @@
+# Pin the toolchain to 1.89, which is installed on this machine and matches the
+# linker/xwin build setup in .cargo/config.toml. (edition 2021 does not require
+# it, but pinning keeps builds reproducible.)
+[toolchain]
+channel = "1.89"

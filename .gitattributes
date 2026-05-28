@@ -1,0 +1,4 @@
+# Normalize line endings to LF in the repo and on checkout. The deterministic
+# .bib serializer emits '\n', so forcing LF keeps references.bib byte-stable
+# across platforms and avoids CRLF churn between niutero's writes and git.
+* text=auto eol=lf

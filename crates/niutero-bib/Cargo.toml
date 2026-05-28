@@ -1,0 +1,12 @@
+[package]
+name = "niutero-bib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+niutero-core = { path = "../niutero-core" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+insta = { workspace = true }
