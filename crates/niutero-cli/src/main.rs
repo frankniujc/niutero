@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use niutero_bib::entries;
+use niutero_bib::{entries, parse, BibItem};
 use niutero_core::{filter, BibEntry};
 use niutero_vault::Vault;
 use serde::Serialize;
@@ -56,6 +56,49 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Add a new entry: from raw BibTeX, a file, or --type/--key/--field.
+    Add {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Raw BibTeX to add (one or more entries).
+        #[arg(long)]
+        bibtex: Option<String>,
+        /// Read BibTeX from a file.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Entry type (requires --key).
+        #[arg(long = "type")]
+        type_: Option<String>,
+        /// Cite key (requires --type).
+        #[arg(long)]
+        key: Option<String>,
+        /// Field as NAME=VALUE (repeatable; flag-built entry).
+        #[arg(long = "field", value_name = "NAME=VALUE")]
+        field: Vec<String>,
+    },
+    /// Edit an existing entry's fields or type.
+    Edit {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key to edit.
+        citekey: String,
+        /// Set a field as NAME=VALUE (repeatable).
+        #[arg(long = "field", value_name = "NAME=VALUE")]
+        field: Vec<String>,
+        /// Remove a field by name (repeatable).
+        #[arg(long = "unset", value_name = "NAME")]
+        unset: Vec<String>,
+        /// Change the entry type.
+        #[arg(long = "type")]
+        type_: Option<String>,
+    },
+    /// Remove an entry (and its sidecar metadata).
+    Rm {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key to remove.
+        citekey: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -82,6 +125,40 @@ fn run(cli: Cli) -> Result<(), String> {
             citekey,
             json,
         } => cmd_show(&vault, &citekey, json),
+        Cmd::Add {
+            vault,
+            bibtex,
+            from,
+            type_,
+            key,
+            field,
+        } => cmd_add(&vault, bibtex, from, type_, key, field),
+        Cmd::Edit {
+            vault,
+            citekey,
+            field,
+            unset,
+            type_,
+        } => cmd_edit(&vault, &citekey, field, unset, type_),
+        Cmd::Rm { vault, citekey } => cmd_rm(&vault, &citekey),
+    }
+}
+
+/// Split a `NAME=VALUE` argument on the first `=`.
+fn split_field(s: &str) -> Result<(&str, &str), String> {
+    s.split_once('=')
+        .filter(|(n, _)| !n.is_empty())
+        .ok_or_else(|| format!("field must be NAME=VALUE: '{s}'"))
+}
+
+/// Parse BibTeX source into its entries, erroring if there are none.
+fn parse_entries(src: &str) -> Result<Vec<BibEntry>, String> {
+    let parsed = parse(src);
+    let es: Vec<BibEntry> = entries(&parsed).cloned().collect();
+    if es.is_empty() {
+        Err("no BibTeX entries found in input".into())
+    } else {
+        Ok(es)
     }
 }
 
@@ -207,5 +284,126 @@ fn cmd_show(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_add(
+    vault: &Path,
+    bibtex: Option<String>,
+    from: Option<PathBuf>,
+    type_: Option<String>,
+    key: Option<String>,
+    field: Vec<String>,
+) -> Result<(), String> {
+    let v = open(vault)?;
+    let mut items = v
+        .read_items()
+        .map_err(|e| format!("read references.bib: {e}"))?;
+
+    let new_entries: Vec<BibEntry> = match (bibtex, from) {
+        (Some(_), Some(_)) => return Err("use either --bibtex or --from, not both".into()),
+        (Some(src), None) => {
+            if type_.is_some() || key.is_some() {
+                return Err("--bibtex cannot be combined with --type/--key".into());
+            }
+            parse_entries(&src)?
+        }
+        (None, Some(path)) => {
+            if type_.is_some() || key.is_some() {
+                return Err("--from cannot be combined with --type/--key".into());
+            }
+            let src = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            parse_entries(&src)?
+        }
+        (None, None) => {
+            let (Some(t), Some(k)) = (type_, key) else {
+                return Err("specify --bibtex, --from, or both --type and --key".into());
+            };
+            let mut e = BibEntry::new(t, k);
+            for f in &field {
+                let (name, value) = split_field(f)?;
+                e.set(name, value);
+            }
+            vec![e]
+        }
+    };
+
+    // Reject duplicates against existing entries and within the batch.
+    let mut seen: std::collections::HashSet<String> =
+        entries(&items).map(|e| e.citekey.clone()).collect();
+    for e in &new_entries {
+        if !seen.insert(e.citekey.clone()) {
+            return Err(format!(
+                "cite key '{}' already exists (use `edit` to change it)",
+                e.citekey
+            ));
+        }
+    }
+
+    let keys: Vec<String> = new_entries.iter().map(|e| e.citekey.clone()).collect();
+    for e in new_entries {
+        items.push(BibItem::Entry(e));
+    }
+    v.write_items(&items)
+        .map_err(|e| format!("write references.bib: {e}"))?;
+    println!("Added {}: {}", keys.len(), keys.join(", "));
+    Ok(())
+}
+
+fn cmd_edit(
+    vault: &Path,
+    citekey: &str,
+    field: Vec<String>,
+    unset: Vec<String>,
+    type_: Option<String>,
+) -> Result<(), String> {
+    if field.is_empty() && unset.is_empty() && type_.is_none() {
+        return Err("specify at least one of --field, --unset, or --type".into());
+    }
+    let v = open(vault)?;
+    let mut items = v
+        .read_items()
+        .map_err(|e| format!("read references.bib: {e}"))?;
+    let idx = items
+        .iter()
+        .position(|it| matches!(it, BibItem::Entry(e) if e.citekey == citekey))
+        .ok_or_else(|| format!("no entry with cite key '{citekey}'"))?;
+    if let BibItem::Entry(e) = &mut items[idx] {
+        if let Some(t) = type_ {
+            e.entry_type = t.to_ascii_lowercase();
+        }
+        for f in &field {
+            let (name, value) = split_field(f)?;
+            e.set(name, value);
+        }
+        for name in &unset {
+            e.remove(name);
+        }
+    }
+    v.write_items(&items)
+        .map_err(|e| format!("write references.bib: {e}"))?;
+    println!("Updated {citekey}");
+    Ok(())
+}
+
+fn cmd_rm(vault: &Path, citekey: &str) -> Result<(), String> {
+    let mut v = open(vault)?;
+    let mut items = v
+        .read_items()
+        .map_err(|e| format!("read references.bib: {e}"))?;
+    let idx = items
+        .iter()
+        .position(|it| matches!(it, BibItem::Entry(e) if e.citekey == citekey))
+        .ok_or_else(|| format!("no entry with cite key '{citekey}'"))?;
+    items.remove(idx);
+    v.write_items(&items)
+        .map_err(|e| format!("write references.bib: {e}"))?;
+    // Clean up the sidecar entry, but only touch disk if there was one.
+    if v.meta.remove(citekey).is_some() {
+        v.save_sidecar()
+            .map_err(|e| format!("update sidecar: {e}"))?;
+    }
+    println!("Removed {citekey}");
     Ok(())
 }
