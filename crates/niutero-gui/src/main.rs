@@ -14,6 +14,9 @@ use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
+        // OpenGL backend — the native graphics path that works on this
+        // Windows-on-ARM hardware (wgpu's DX12/Vulkan device creation fails here).
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 820.0])
             .with_min_inner_size([880.0, 580.0])

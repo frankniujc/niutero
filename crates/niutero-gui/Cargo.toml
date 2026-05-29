@@ -14,11 +14,13 @@ name = "niutero"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
-# Pull wgpu directly (same 27.x eframe uses) so its default GPU backends —
-# DX12/Vulkan on Windows, Metal on macOS, Vulkan/GL on Linux — are enabled.
-# `eframe`'s `wgpu` feature alone wires the integration but selects no backend.
-wgpu = "27"
+# Renderer: glow (OpenGL). egui is 2D, so OpenGL is plenty and far more portable
+# than wgpu's native APIs. Critically, wgpu 27's DX12 path creates the device via
+# the newer ID3D12DeviceFactory, which fails on this Windows-on-ARM hardware
+# (MESA "dzn" → VK_ERROR_INITIALIZATION_FAILED); OpenGL renders fine here. glow
+# uses GL on Win/Linux and Metal-via-ANGLE-style paths elsewhere — works across
+# Windows/macOS/Linux.
+eframe = { version = "0.33.3", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 niutero-engine = { path = "../niutero-engine" }
 # eframe pinned via `cargo add` to the latest release compatible with the 1.89
 # toolchain; wgpu backend for GPU rendering.
