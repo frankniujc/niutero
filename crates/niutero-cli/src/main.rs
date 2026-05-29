@@ -201,6 +201,16 @@ enum Cmd {
         /// Cite key.
         citekey: String,
     },
+    /// Show the git history of one entry (the commits that changed it).
+    History {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -316,6 +326,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             check,
         } => cmd_normalize(&vault, write, check),
         Cmd::Cite { vault, citekey } => cmd_cite(&vault, &citekey).map(ok),
+        Cmd::History {
+            vault,
+            citekey,
+            json,
+        } => cmd_history(&vault, &citekey, json).map(ok),
     }
 }
 
@@ -684,5 +699,26 @@ fn cmd_normalize(vault: &Path, write: bool, check: bool) -> Result<ExitCode, Str
 fn cmd_cite(vault: &Path, citekey: &str) -> Result<(), String> {
     let v = engine::open(vault)?;
     println!("{}", engine::cite(&v, citekey)?);
+    Ok(())
+}
+
+fn cmd_history(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    let commits = engine::history(&v, citekey)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&commits).map_err(|e| e.to_string())?
+        );
+    } else if commits.is_empty() {
+        println!("(no history for {citekey})");
+    } else {
+        for c in &commits {
+            // Abbreviated hash and the date (not the time) for a scannable log.
+            let short = c.hash.get(..9).unwrap_or(&c.hash);
+            let day = c.date.get(..10).unwrap_or(&c.date);
+            println!("{short}  {day}  {}", c.subject);
+        }
+    }
     Ok(())
 }

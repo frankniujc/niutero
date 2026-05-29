@@ -91,3 +91,86 @@ fn connect_then_sync_pushes_to_remote() {
     let bib = std::fs::read_to_string(clone.join("references.bib")).unwrap();
     assert!(bib.contains("@misc{k,"));
 }
+
+#[test]
+fn history_lists_commits_for_an_entry() {
+    if !git_available() {
+        return;
+    }
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    let bare = remote.path().to_str().unwrap();
+
+    let d = new_vault();
+    niutero()
+        .arg("connect")
+        .arg(d.path())
+        .arg(bare)
+        .assert()
+        .success();
+    git(d.path(), &["config", "user.email", "t@e.com"]);
+    git(d.path(), &["config", "user.name", "T"]);
+    git(d.path(), &["config", "commit.gpgsign", "false"]);
+
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args(["--type", "misc", "--key", "k", "--field", "title=One"])
+        .assert()
+        .success();
+    niutero().arg("sync").arg(d.path()).assert().success();
+    niutero()
+        .arg("edit")
+        .arg(d.path())
+        .arg("k")
+        .args(["--field", "title=Two"])
+        .assert()
+        .success();
+    niutero().arg("sync").arg(d.path()).assert().success();
+
+    // Text: both commits, newest first.
+    niutero()
+        .arg("history")
+        .arg(d.path())
+        .arg("k")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 changed"))
+        .stdout(predicate::str::contains("initial import"));
+
+    // JSON: an array of two commit objects with the stable field shape.
+    let out = niutero()
+        .arg("history")
+        .arg(d.path())
+        .arg("k")
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let commits: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(commits.as_array().unwrap().len(), 2);
+    assert!(commits[0]["hash"].as_str().unwrap().len() >= 7);
+    assert!(commits[0]["subject"]
+        .as_str()
+        .unwrap()
+        .contains("1 changed"));
+}
+
+#[test]
+fn history_without_a_repo_errors() {
+    let d = new_vault();
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args(["--type", "misc", "--key", "k"])
+        .assert()
+        .success();
+    niutero()
+        .arg("history")
+        .arg(d.path())
+        .arg("k")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("not a git repository"));
+}

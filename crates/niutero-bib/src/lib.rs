@@ -27,7 +27,7 @@ mod parse;
 mod serialize;
 
 pub use item::BibItem;
-pub use parse::parse;
+pub use parse::{entry_line_span, parse};
 pub use serialize::{to_bibtex, to_bibtex_entries};
 
 use niutero_core::BibEntry;

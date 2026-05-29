@@ -96,6 +96,56 @@ pub fn file_at_head(dir: &Path, path: &str) -> Option<String> {
     ok(dir, &["show", &format!("HEAD:{path}")]).ok()
 }
 
+/// One commit in a line range's history, as reported by [`log_lines`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// Full commit hash.
+    pub hash: String,
+    /// Author name.
+    pub author: String,
+    /// Author date, strict ISO-8601 (e.g. `2026-05-29T15:38:13+02:00`).
+    pub date: String,
+    /// Commit subject — the first line of the message.
+    pub subject: String,
+}
+
+/// History of lines `start..=end` (1-based, inclusive) of `file`, newest commit
+/// first — a thin wrapper over `git log -L<start>,<end>:<file>`. `git`
+/// interprets the line range against the committed `HEAD`, so callers must
+/// derive it from `HEAD`'s content (see [`file_at_head`]), not the working tree.
+pub fn log_lines(dir: &Path, file: &str, start: usize, end: usize) -> Result<Vec<Commit>, String> {
+    // `--no-patch` drops the per-line diff `-L` would otherwise force, leaving
+    // one record per commit; `\x1f` (unit separator) can't appear in a one-line
+    // subject, so it's a safe field delimiter.
+    let range = format!("-L{start},{end}:{file}");
+    let out = ok(
+        dir,
+        &[
+            "log",
+            &range,
+            "--no-patch",
+            "--format=%H%x1f%an%x1f%aI%x1f%s",
+        ],
+    )?;
+    Ok(out.lines().filter_map(parse_commit_line).collect())
+}
+
+/// Parse one `%H \x1f %an \x1f %aI \x1f %s` record. Returns `None` for a blank or
+/// truncated line so a stray line can never abort the whole history.
+fn parse_commit_line(line: &str) -> Option<Commit> {
+    let mut f = line.split('\u{1f}');
+    let hash = f.next()?.trim().to_string();
+    if hash.is_empty() {
+        return None;
+    }
+    Some(Commit {
+        hash,
+        author: f.next().unwrap_or("").to_string(),
+        date: f.next().unwrap_or("").to_string(),
+        subject: f.next().unwrap_or("").to_string(),
+    })
+}
+
 // ----------------------------------------------------------------- helpers
 
 fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {
@@ -188,5 +238,33 @@ mod tests {
         assert!(commit_all(d.path(), "first").unwrap());
         // nothing changed since
         assert!(!commit_all(d.path(), "noop").unwrap());
+    }
+
+    #[test]
+    fn log_lines_traces_only_the_given_range() {
+        if !git_available() {
+            return;
+        }
+        let d = repo();
+        let bib = d.path().join("references.bib");
+        // Two entries; `a` on lines 1-3, `b` on lines 5-7.
+        std::fs::write(&bib, "@misc{a,\n  t = {A}\n}\n\n@misc{b,\n  t = {B}\n}\n").unwrap();
+        commit_all(d.path(), "add a,b").unwrap();
+        // Change only `a`'s title; `b`'s lines are untouched.
+        std::fs::write(&bib, "@misc{a,\n  t = {A2}\n}\n\n@misc{b,\n  t = {B}\n}\n").unwrap();
+        commit_all(d.path(), "change a").unwrap();
+
+        let a = log_lines(d.path(), "references.bib", 1, 3).unwrap();
+        assert_eq!(
+            a.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(),
+            vec!["change a", "add a,b"], // newest first
+        );
+        assert!(!a[0].hash.is_empty() && !a[0].date.is_empty() && !a[0].author.is_empty());
+
+        let b = log_lines(d.path(), "references.bib", 5, 7).unwrap();
+        assert_eq!(
+            b.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(),
+            vec!["add a,b"],
+        );
     }
 }

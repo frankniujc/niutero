@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 
 use crate::item::BibItem;
 use niutero_core::BibEntry;
@@ -16,6 +17,52 @@ pub fn parse(src: &str) -> Vec<BibItem> {
         i: 0,
     }
     .run()
+}
+
+/// The 1-based, inclusive line numbers `(start, end)` of the entry with cite key
+/// `citekey` within `src`, or `None` if there is no such entry. Lines are
+/// counted by `\n`, exactly as `git` numbers them, so the result can be handed
+/// straight to `git log -L<start>,<end>:<file>`. Verbatim blocks
+/// (`@string`/`@preamble`/`@comment` and free text) are skipped.
+///
+/// The span is recovered from the *actual* source text (not a re-serialization),
+/// so it is correct even for a hand-formatted `.bib`. Line numbers count `\n`
+/// the way git does (a CRLF counts once, a lone CR not at all), so passing a
+/// committed blob's content yields numbers that match `git log -L` byte-for-byte.
+pub fn entry_line_span(src: &str, citekey: &str) -> Option<(usize, usize)> {
+    let normalized = normalize_input(src);
+    let s = normalized.as_ref();
+    let range = Parser {
+        src: s,
+        b: s.as_bytes(),
+        i: 0,
+    }
+    .run_spanned()
+    .into_iter()
+    .find_map(|(it, r)| match it {
+        BibItem::Entry(e) if e.citekey == citekey => Some(r),
+        _ => None,
+    })?;
+    // Count lines exactly as git numbers them: by physical `\n` only.
+    // `normalize_input` folds lone CRs into `\n` (right for canonical output, but
+    // wrong here — git does *not* treat a lone CR as a line break), so we count
+    // against a byte-aligned text that keeps lone CRs as `\r`. It strips the same
+    // BOM and folds only `\r\n`; the only remaining difference from `s` is that
+    // each lone CR stays one `\r` byte instead of one `\n` byte, so every offset
+    // in `range` still indexes the same position. `range` brackets the entry from
+    // its `@` to just past the closing delimiter — neither endpoint is a `\n`.
+    let counted = src
+        .strip_prefix('\u{feff}')
+        .unwrap_or(src)
+        .replace("\r\n", "\n");
+    debug_assert_eq!(
+        counted.len(),
+        s.len(),
+        "line-counting text must align with parse text"
+    );
+    let bytes = counted.as_bytes();
+    let line_of = |end: usize| bytes[..end].iter().filter(|&&b| b == b'\n').count() + 1;
+    Some((line_of(range.start), line_of(range.end)))
 }
 
 /// Strip a leading UTF-8 BOM and normalize line endings to `\n`. Borrows when
@@ -36,7 +83,14 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn run(mut self) -> Vec<BibItem> {
+    fn run(self) -> Vec<BibItem> {
+        self.run_spanned().into_iter().map(|(it, _)| it).collect()
+    }
+
+    /// Like [`run`](Self::run), but pairs each item with its byte range in the
+    /// (normalized) source. Used to recover an entry's line span; `run`
+    /// delegates here so the two can never disagree on item boundaries.
+    fn run_spanned(mut self) -> Vec<(BibItem, Range<usize>)> {
         let mut items = Vec::new();
         let n = self.b.len();
         while self.i < n {
@@ -48,7 +102,7 @@ impl<'a> Parser<'a> {
             if self.i > start {
                 let txt = self.src[start..self.i].trim();
                 if !txt.is_empty() {
-                    items.push(BibItem::Verbatim(txt.to_string()));
+                    items.push((BibItem::Verbatim(txt.to_string()), start..self.i));
                 }
             }
             if self.i >= n {
@@ -59,8 +113,9 @@ impl<'a> Parser<'a> {
         items
     }
 
-    /// Precondition: `self.b[self.i] == b'@'`.
-    fn item(&mut self, items: &mut Vec<BibItem>) {
+    /// Precondition: `self.b[self.i] == b'@'`. Pushes the parsed item paired
+    /// with its `[start, end)` byte range (`@` through the closing delimiter).
+    fn item(&mut self, items: &mut Vec<(BibItem, Range<usize>)>) {
         let at = self.i;
         self.i += 1; // consume '@'
         let type_start = self.i;
@@ -74,7 +129,7 @@ impl<'a> Parser<'a> {
         if self.i >= self.b.len() || (self.b[self.i] != b'{' && self.b[self.i] != b'(') {
             let txt = self.src[at..self.i].trim();
             if !txt.is_empty() {
-                items.push(BibItem::Verbatim(txt.to_string()));
+                items.push((BibItem::Verbatim(txt.to_string()), at..self.i));
             }
             return;
         }
@@ -83,10 +138,13 @@ impl<'a> Parser<'a> {
             "string" | "preamble" | "comment" => {
                 let end = self.scan_block(self.i);
                 let raw = self.src[at..end].trim();
-                items.push(BibItem::Verbatim(raw.to_string()));
+                items.push((BibItem::Verbatim(raw.to_string()), at..end));
                 self.i = end;
             }
-            _ => items.push(BibItem::Entry(self.entry(typ))),
+            _ => {
+                let e = self.entry(typ);
+                items.push((BibItem::Entry(e), at..self.i));
+            }
         }
     }
 
@@ -386,6 +444,61 @@ mod tests {
     fn concatenation_kept_raw() {
         let e = one_entry(r#"@misc{k, m = jan # " 2020"}"#);
         assert_eq!(e.get("m"), Some(r#"jan # " 2020""#));
+    }
+
+    #[test]
+    fn line_span_of_a_canonical_entry() {
+        // Two entries separated by a blank line, exactly as the serializer emits.
+        let src = "@misc{a,\n  title = {A}\n}\n\n@article{b,\n  title = {B},\n  year = {2020}\n}\n";
+        assert_eq!(entry_line_span(src, "a"), Some((1, 3)));
+        assert_eq!(entry_line_span(src, "b"), Some((5, 8)));
+        assert_eq!(entry_line_span(src, "missing"), None);
+    }
+
+    #[test]
+    fn line_span_skips_leading_verbatim() {
+        // A @string macro and a comment precede the entry; only the entry counts.
+        let src = "@string{acl = {ACL}}\n\n% a note\n@misc{k,\n  title = {Hi}\n}\n";
+        // @misc starts on line 4 (`@string` line 1, blank line 2, comment line 3).
+        assert_eq!(entry_line_span(src, "k"), Some((4, 6)));
+        assert_eq!(entry_line_span(src, "acl"), None); // @string is not an entry
+    }
+
+    #[test]
+    fn line_span_of_a_no_field_entry() {
+        let src = "@misc{lone\n}\n";
+        assert_eq!(entry_line_span(src, "lone"), Some((1, 2)));
+    }
+
+    #[test]
+    fn line_span_handles_values_with_braces_and_commas() {
+        // A field value spanning the line with a brace group and a comma must not
+        // confuse where the entry ends.
+        let src =
+            "@misc{k,\n  author = {Doe, John and {Foo} Bar},\n  year = {2020}\n}\n\n@misc{after}\n";
+        assert_eq!(entry_line_span(src, "k"), Some((1, 4)));
+        assert_eq!(entry_line_span(src, "after"), Some((6, 6)));
+    }
+
+    #[test]
+    fn line_span_is_invariant_under_crlf_and_bom() {
+        let lf = "@misc{a,\n  t = {A}\n}\n\n@misc{b}\n";
+        let crlf_bom = "\u{feff}@misc{a,\r\n  t = {A}\r\n}\r\n\r\n@misc{b}\r\n";
+        assert_eq!(entry_line_span(lf, "b"), entry_line_span(crlf_bom, "b"));
+        assert_eq!(entry_line_span(crlf_bom, "a"), Some((1, 3)));
+    }
+
+    #[test]
+    fn line_span_counts_lone_cr_the_way_git_does() {
+        // git numbers lines by `\n` only — a lone CR (old-Mac, or a stray CR in a
+        // committed blob) is NOT a line break. Entry `a` uses lone CRs internally;
+        // to git the file is 5 newline-delimited lines and `b` begins on line 4.
+        // The span must match that, not an over-count that would feed `git log -L`
+        // an out-of-range line number.
+        let blob = "@misc{a,\r  t = {A}\r}\n\n@misc{b,\n  t = {B}\n}\n";
+        // Lines (by \n): 1=`@misc{a,\r  t = {A}\r}`, 2=``, 3=`@misc{b,`, 4=`  t = {B}`, 5=`}`.
+        assert_eq!(entry_line_span(blob, "a"), Some((1, 1)));
+        assert_eq!(entry_line_span(blob, "b"), Some((3, 5)));
     }
 
     #[test]

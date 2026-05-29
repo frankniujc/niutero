@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
+use niutero_bib::{entries, entry_line_span, parse, to_bibtex_entries, BibItem};
 use niutero_core::{filter, texscan, BibEntry};
 use niutero_norm::{normalize_entry, NormConfig};
 use niutero_sync as git;
@@ -509,6 +509,57 @@ fn entry_diff(old: &str, new: &str) -> EntryDiff {
             .filter(|(k, v)| o.get(*k).is_some_and(|ov| ov != *v))
             .count(),
     }
+}
+
+// ---------------------------------------------------------------- history
+
+/// One commit in an entry's history — the stable shape `history --json` emits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HistoryCommit {
+    pub hash: String,
+    pub author: String,
+    pub date: String,
+    pub subject: String,
+}
+
+/// The commits that touched one entry, newest first.
+///
+/// `git log -L` numbers lines against the committed `HEAD`, so we locate the
+/// entry's span in `HEAD`'s `references.bib` — not the working tree, whose
+/// uncommitted edits could shift (or remove) the entry and make the range
+/// wrong. Because the lookup is HEAD-driven, an entry deleted from the working
+/// tree but still present in the last commit can still have its history shown;
+/// the working tree is consulted only to give a precise error when the entry
+/// isn't in HEAD (added-but-not-synced vs. no such entry at all).
+pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
+    if !git::is_repo(&v.root) {
+        return Err("not a git repository — run `niutero connect <url>` first".into());
+    }
+    let head = git::file_at_head(&v.root, "references.bib").ok_or_else(|| {
+        "references.bib has no committed history yet — run `niutero sync` first".to_string()
+    })?;
+    let (start, end) = match entry_line_span(&head, citekey) {
+        Some(span) => span,
+        // Not in the last commit: distinguish "added locally, not synced yet"
+        // from "no such entry" by consulting the working tree.
+        None => {
+            let exists = entries(&read_items(v)?).any(|e| e.citekey == citekey);
+            return Err(if exists {
+                format!("'{citekey}' isn't in the last commit yet — run `niutero sync` first")
+            } else {
+                format!("no entry with cite key '{citekey}'")
+            });
+        }
+    };
+    Ok(git::log_lines(&v.root, "references.bib", start, end)?
+        .into_iter()
+        .map(|c| HistoryCommit {
+            hash: c.hash,
+            author: c.author,
+            date: c.date,
+            subject: c.subject,
+        })
+        .collect())
 }
 
 // -------------------------------------------------------------- normalize
@@ -1054,6 +1105,189 @@ mod tests {
         sync(&a, None).unwrap();
         edit(&b, "k", &["title=B2".into()], &[], None).unwrap();
         assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn history_lists_an_entrys_commits_newest_first() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, v) = vault();
+        connect(&v, bare).unwrap();
+        git_identity(&v.root);
+        add(&v, fields("misc", "k", &["title=One"])).unwrap();
+        sync(&v, None).unwrap(); // commit 1: "niutero: initial import"
+        edit(&v, "k", &["title=Two".into()], &[], None).unwrap();
+        sync(&v, None).unwrap(); // commit 2: "niutero: 1 changed"
+
+        let h = history(&v, "k").unwrap();
+        assert_eq!(h.len(), 2);
+        assert!(h[0].subject.contains("1 changed"), "newest: {:?}", h[0]);
+        assert!(
+            h[1].subject.contains("initial import"),
+            "oldest: {:?}",
+            h[1]
+        );
+        assert!(!h[0].hash.is_empty() && !h[0].date.is_empty());
+    }
+
+    #[test]
+    fn history_errors_when_not_a_repo() {
+        let (_d, v) = vault();
+        add(&v, fields("misc", "k", &[])).unwrap();
+        // Without git, the missing repo is the actionable problem — regardless of
+        // whether the queried key exists.
+        assert!(history(&v, "k")
+            .unwrap_err()
+            .contains("not a git repository"));
+        assert!(history(&v, "ghost")
+            .unwrap_err()
+            .contains("not a git repository"));
+    }
+
+    #[test]
+    fn history_errors_when_no_commits_yet() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, v) = vault();
+        connect(&v, bare).unwrap(); // inits git, but commits nothing
+        git_identity(&v.root);
+        add(&v, fields("misc", "k", &[])).unwrap();
+        // Connected, but never synced: a repo with no HEAD.
+        assert!(history(&v, "k")
+            .unwrap_err()
+            .contains("no committed history yet"));
+    }
+
+    #[test]
+    fn history_for_an_uncommitted_entry_is_actionable() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, v) = vault();
+        connect(&v, bare).unwrap();
+        git_identity(&v.root);
+        add(&v, fields("misc", "committed", &["title=A"])).unwrap();
+        sync(&v, None).unwrap();
+        // Added locally but not synced: in the working tree, not in HEAD.
+        add(&v, fields("misc", "fresh", &["title=B"])).unwrap();
+        assert!(history(&v, "fresh")
+            .unwrap_err()
+            .contains("isn't in the last commit"));
+    }
+
+    #[test]
+    fn history_traces_only_the_queried_entry() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, v) = vault();
+        connect(&v, bare).unwrap();
+        git_identity(&v.root);
+        add(&v, fields("misc", "a", &["title=A"])).unwrap();
+        add(&v, fields("misc", "b", &["title=B"])).unwrap();
+        sync(&v, None).unwrap(); // commit 1: both entries (a above b)
+        edit(&v, "b", &["title=B2".into()], &[], None).unwrap();
+        sync(&v, None).unwrap(); // commit 2: only b's lines changed
+
+        // `a`'s lines were only ever touched by the first commit.
+        let ha = history(&v, "a").unwrap();
+        assert_eq!(ha.len(), 1, "a should not pick up b's commit: {ha:?}");
+        assert!(ha[0].subject.contains("initial import"));
+        // `b` was added then changed — both commits touched its lines.
+        let hb = history(&v, "b").unwrap();
+        assert_eq!(hb.len(), 2, "b: {hb:?}");
+
+        // A key in neither HEAD nor the working tree is a plain "no entry".
+        assert!(history(&v, "ghost")
+            .unwrap_err()
+            .contains("no entry with cite key 'ghost'"));
+    }
+
+    #[test]
+    fn history_follows_a_moved_entry_using_the_head_span() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, v) = vault();
+        connect(&v, bare).unwrap();
+        git_identity(&v.root);
+        let write = |bib: &str| std::fs::write(v.bib_path(), bib).unwrap();
+
+        // c1: only `a`, on lines 1-3.
+        write("@misc{a,\n  t = {A}\n}\n");
+        sync(&v, None).unwrap();
+        // c2: insert `z` before `a`, moving `a` to lines 5-7 (its content unchanged).
+        write("@misc{z,\n  t = {Z}\n}\n\n@misc{a,\n  t = {A}\n}\n");
+        sync(&v, None).unwrap();
+        // c3: change `a`, now living at lines 5-7.
+        write("@misc{z,\n  t = {Z}\n}\n\n@misc{a,\n  t = {A2}\n}\n");
+        sync(&v, None).unwrap();
+        // Uncommitted: shift `a` again so the WORKING-TREE span (9-11) differs from
+        // HEAD's (5-7) — and the working tree is now longer than HEAD. A working-
+        // tree-based lookup would feed git an out-of-range line range and fail;
+        // the HEAD-based lookup must still succeed.
+        write("@misc{y,\n  t = {Y}\n}\n\n@misc{z,\n  t = {Z}\n}\n\n@misc{a,\n  t = {A2}\n}\n");
+
+        let h =
+            history(&v, "a").expect("history must use the HEAD span, not the longer working tree");
+        let subjects: Vec<&str> = h.iter().map(|c| c.subject.as_str()).collect();
+        // git follows `a` back across its move, so its introduction (c1) and its
+        // edit (c3) both appear, proving the right (current HEAD) span was traced.
+        assert!(
+            subjects.iter().any(|s| s.contains("initial import")),
+            "should trace `a` back to its introduction: {subjects:?}"
+        );
+        assert!(
+            subjects.iter().any(|s| s.contains("1 changed")),
+            "should include the edit to `a`: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn history_works_for_an_entry_deleted_from_the_working_tree() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        let (_d, mut v) = vault();
+        connect(&v, bare).unwrap();
+        git_identity(&v.root);
+        add(&v, fields("misc", "k", &["title=A"])).unwrap();
+        sync(&v, None).unwrap(); // k is now in HEAD
+        rm(&mut v, "k").unwrap(); // removed locally, but not yet committed
+        assert!(
+            show(&v, "k").is_err(),
+            "k should be gone from the working tree"
+        );
+        // history is HEAD-driven, so a locally-deleted entry's past is still viewable.
+        let h = history(&v, "k").unwrap();
+        assert_eq!(h.len(), 1);
+        assert!(h[0].subject.contains("initial import"));
     }
 
     #[test]
