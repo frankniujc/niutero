@@ -392,10 +392,20 @@ dependencies = [
  "indexmap",
  "niutero-bib",
  "niutero-core",
+ "niutero-norm",
  "niutero-sync",
  "niutero-vault",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "niutero-norm"
+version = "0.1.0"
+dependencies = [
+ "niutero-core",
+ "serde",
+ "toml",
 ]
 
 [[package]]

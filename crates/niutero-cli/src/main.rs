@@ -182,6 +182,17 @@ enum Cmd {
         #[arg(long)]
         message: Option<String>,
     },
+    /// Normalize entries offline (propose-only): review, then --write.
+    Normalize {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Apply the changes (default is a dry-run preview).
+        #[arg(long)]
+        write: bool,
+        /// CI gate: exit 2 if anything would change (does not write).
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -291,6 +302,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         } => cmd_tex_scan(&vault, &tex, out, json),
         Cmd::Connect { vault, url } => cmd_connect(&vault, &url).map(ok),
         Cmd::Sync { vault, message } => cmd_sync(&vault, message),
+        Cmd::Normalize {
+            vault,
+            write,
+            check,
+        } => cmd_normalize(&vault, write, check),
     }
 }
 
@@ -623,4 +639,35 @@ fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
             Ok(ExitCode::from(2))
         }
     }
+}
+
+fn cmd_normalize(vault: &Path, write: bool, check: bool) -> Result<ExitCode, String> {
+    if write && check {
+        return Err("use either --write or --check, not both".into());
+    }
+    let v = engine::open(vault)?;
+    let changes = if write {
+        engine::normalize_apply(&v)?
+    } else {
+        engine::normalize_preview(&v)?
+    };
+    if changes.is_empty() {
+        println!("Already normalized: nothing to change.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let verb = if write { "changed" } else { "would change" };
+    println!("{} entr(ies) {verb}:", changes.len());
+    for c in &changes {
+        println!("  {}", c.citekey);
+        for n in &c.notes {
+            println!("    - {n}");
+        }
+    }
+    if check {
+        return Ok(ExitCode::from(2));
+    }
+    if !write {
+        println!("(dry run — re-run with --write to apply)");
+    }
+    Ok(ExitCode::SUCCESS)
 }

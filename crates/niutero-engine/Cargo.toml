@@ -9,6 +9,7 @@ niutero-core = { path = "../niutero-core" }
 niutero-bib = { path = "../niutero-bib" }
 niutero-vault = { path = "../niutero-vault" }
 niutero-sync = { path = "../niutero-sync" }
+niutero-norm = { path = "../niutero-norm" }
 indexmap = { workspace = true }
 serde = { workspace = true }
 

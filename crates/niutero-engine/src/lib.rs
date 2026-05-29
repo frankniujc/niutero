@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
 use niutero_core::{filter, texscan, BibEntry};
+use niutero_norm::{normalize_entry, NormConfig};
 use niutero_sync as git;
 use serde::{Deserialize, Serialize};
 
@@ -419,6 +420,55 @@ pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
     }
     git::push(&v.root)?;
     Ok(SyncStatus::Synced { committed })
+}
+
+// -------------------------------------------------------------- normalize
+
+/// One entry that offline normalization would change, with human-readable notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NormChange {
+    pub citekey: String,
+    pub notes: Vec<String>,
+}
+
+/// Preview offline normalization — compute what would change without writing.
+pub fn normalize_preview(v: &Vault) -> Result<Vec<NormChange>, String> {
+    let items = read_items(v)?;
+    let cfg = NormConfig::load(&v.niutero_dir());
+    Ok(norm_changes(&items, &cfg).1)
+}
+
+/// Apply offline normalization, writing the result (only if something changed).
+/// Returns the changes that were applied.
+pub fn normalize_apply(v: &Vault) -> Result<Vec<NormChange>, String> {
+    let items = read_items(v)?;
+    let cfg = NormConfig::load(&v.niutero_dir());
+    let (normalized, changes) = norm_changes(&items, &cfg);
+    if !changes.is_empty() {
+        write_items(v, &normalized)?;
+    }
+    Ok(changes)
+}
+
+fn norm_changes(items: &[BibItem], cfg: &NormConfig) -> (Vec<BibItem>, Vec<NormChange>) {
+    let mut out = Vec::with_capacity(items.len());
+    let mut changes = Vec::new();
+    for it in items {
+        match it {
+            BibItem::Entry(e) => {
+                let (normalized, notes) = normalize_entry(e, cfg);
+                if !notes.is_empty() {
+                    changes.push(NormChange {
+                        citekey: e.citekey.clone(),
+                        notes,
+                    });
+                }
+                out.push(BibItem::Entry(normalized));
+            }
+            BibItem::Verbatim(s) => out.push(BibItem::Verbatim(s.clone())),
+        }
+    }
+    (out, changes)
 }
 
 // ----------------------------------------------------------------- helpers
@@ -900,5 +950,47 @@ mod tests {
         sync(&a, None).unwrap();
         edit(&b, "k", &["title=B2".into()], &[], None).unwrap();
         assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn normalize_previews_then_applies_idempotently() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{k, title={A  B}, abstract={x}}".into()),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(v.bib_path()).unwrap();
+
+        // preview reports the change but does not write
+        let changes = normalize_preview(&v).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].citekey, "k");
+        assert_eq!(std::fs::read_to_string(v.bib_path()).unwrap(), before);
+
+        // apply writes; the noise field is gone and whitespace tidied
+        assert_eq!(normalize_apply(&v).unwrap().len(), 1);
+        let view = show(&v, "k").unwrap();
+        assert!(view.fields.get("abstract").is_none());
+        assert_eq!(view.fields.get("title").map(String::as_str), Some("A B"));
+
+        // idempotent: nothing left to change
+        assert!(normalize_preview(&v).unwrap().is_empty());
+    }
+
+    #[test]
+    fn normalize_respects_norm_toml() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{k, title={A  B}, abstract={x}}".into()),
+        )
+        .unwrap();
+        std::fs::write(
+            v.niutero_dir().join("norm.toml"),
+            "drop_fields = []\ntidy_whitespace = false\narxiv = false\n",
+        )
+        .unwrap();
+        assert!(normalize_preview(&v).unwrap().is_empty());
     }
 }
