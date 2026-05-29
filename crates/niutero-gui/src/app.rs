@@ -132,6 +132,107 @@ impl NiuteroApp {
     fn entry_count(&self) -> usize {
         self.library.as_ref().map(|l| l.entries.len()).unwrap_or(0)
     }
+
+    /// Open `path` as the active library, resetting view state. On failure the
+    /// error shows in the empty state + a toast (the old library is dropped).
+    fn switch_to(&mut self, path: PathBuf) {
+        match Library::load(&path) {
+            Ok(lib) => {
+                info!(
+                    "opened library '{}' ({} entries)",
+                    lib.vault.config.name,
+                    lib.entries.len()
+                );
+                self.library = Some(lib);
+                self.open_error = None;
+                self.lib = LibState::default();
+            }
+            Err(e) => {
+                warn!("open library: {e}");
+                self.open_error = Some(e.clone());
+                self.toast = Some(e);
+                self.library = None;
+            }
+        }
+    }
+
+    /// Apply a library pick from the titlebar menu / empty state.
+    fn apply_vault_pick(&mut self, pick: VaultPick) {
+        match pick {
+            VaultPick::Open(p) => self.switch_to(p),
+            VaultPick::New(p) => match engine::init(&p) {
+                Ok(_) => self.switch_to(p),
+                Err(e) => self.toast = Some(e),
+            },
+        }
+    }
+}
+
+/// A library chosen from the switcher: open an existing vault, or create one.
+enum VaultPick {
+    Open(PathBuf),
+    New(PathBuf),
+}
+
+/// Native folder picker (`rfd`); `None` if the user cancels.
+fn pick_folder(title: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title(title).pick_folder()
+}
+
+/// The library switcher menu: recent libraries + open/new.
+fn library_menu(ui: &mut egui::Ui, theme: &Theme, pick: &mut Option<VaultPick>) {
+    ui.set_min_width(280.0);
+    ui.label(
+        RichText::new("RECENT LIBRARIES")
+            .size(10.5)
+            .strong()
+            .color(theme.muted),
+    );
+    ui.add_space(2.0);
+    let recents = engine::recent_vaults().unwrap_or_default();
+    if recents.is_empty() {
+        ui.label(RichText::new("(none yet)").color(theme.faint).size(12.0));
+    }
+    for rv in recents.iter().take(8) {
+        let name = rv
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(library)");
+        let resp = ui
+            .add(egui::Button::new(RichText::new(name).size(13.0).color(theme.text)).frame(false))
+            .on_hover_text(rv.path.display().to_string());
+        if resp.clicked() {
+            *pick = Some(VaultPick::Open(rv.path.clone()));
+        }
+    }
+    ui.separator();
+    if ui
+        .add(
+            egui::Button::new(
+                RichText::new("Open library…")
+                    .size(13.0)
+                    .color(theme.accent),
+            )
+            .frame(false),
+        )
+        .clicked()
+    {
+        if let Some(p) = pick_folder("Open a library folder") {
+            *pick = Some(VaultPick::Open(p));
+        }
+    }
+    if ui
+        .add(
+            egui::Button::new(RichText::new("New library…").size(13.0).color(theme.accent))
+                .frame(false),
+        )
+        .clicked()
+    {
+        if let Some(p) = pick_folder("Choose a folder for the new library") {
+            *pick = Some(VaultPick::New(p));
+        }
+    }
 }
 
 impl eframe::App for NiuteroApp {
@@ -221,6 +322,7 @@ impl NiuteroApp {
             egui::Stroke::new(1.0, theme.border),
         );
 
+        let mut pick: Option<VaultPick> = None;
         ui.horizontal_centered(|ui| {
             ui.add_space(2.0);
             self.window_controls(ui);
@@ -233,10 +335,13 @@ impl NiuteroApp {
                     .color(theme.text),
             );
             ui.label(RichText::new("—").color(theme.faint));
-            ui.label(
+            // Library name → menu: switch to a recent library, open a folder, or
+            // create a new one.
+            ui.menu_button(
                 RichText::new(self.lib_name())
                     .color(theme.text_2)
                     .size(12.5),
+                |ui| library_menu(ui, theme, &mut pick),
             );
 
             // centered view switcher (Library only)
@@ -254,6 +359,9 @@ impl NiuteroApp {
                 }
             });
         });
+        if let Some(p) = pick {
+            self.apply_vault_pick(p);
+        }
     }
 
     /// macOS-style traffic lights — functional in a frameless window.
@@ -385,9 +493,13 @@ impl NiuteroApp {
     fn body_library(&mut self, ctx: &egui::Context, theme: &Theme) {
         if self.library.is_none() {
             let err = self.open_error.clone();
+            let mut pick = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::default().fill(theme.bg))
-                .show(ctx, |ui| empty_state(ui, theme, err.as_deref()));
+                .show(ctx, |ui| empty_state(ui, theme, err.as_deref(), &mut pick));
+            if let Some(p) = pick {
+                self.apply_vault_pick(p);
+            }
             return;
         }
         let mut actions = Vec::new();
@@ -553,22 +665,68 @@ fn placeholder(ui: &mut egui::Ui, theme: &Theme, title: &str, sub: &str) {
     });
 }
 
-fn empty_state(ui: &mut egui::Ui, theme: &Theme, err: Option<&str>) {
+fn empty_state(ui: &mut egui::Ui, theme: &Theme, err: Option<&str>, pick: &mut Option<VaultPick>) {
     ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.35);
+        ui.add_space(ui.available_height() * 0.32);
         ui.label(
             RichText::new("No library open")
                 .font(theme::serif(22.0))
                 .color(theme.text),
         );
-        ui.add_space(6.0);
-        match err {
-            Some(e) => ui.label(RichText::new(e).color(theme.rose)),
-            None => ui.label(
-                RichText::new("Pass a vault folder:  niutero <path>   (or open one — coming soon)")
-                    .font(theme::mono(12.0))
+        ui.add_space(4.0);
+        if let Some(e) = err {
+            ui.label(RichText::new(e).color(theme.rose));
+        } else {
+            ui.label(
+                RichText::new("Open a folder as a library, or create a new one.")
                     .color(theme.muted),
-            ),
-        };
+            );
+        }
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            // center the two buttons
+            let pad = (ui.available_width() - 300.0).max(0.0) * 0.5;
+            ui.add_space(pad);
+            let open = ui.add(
+                egui::Button::new(
+                    RichText::new("Open library…")
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(theme.accent)
+                .corner_radius(8.0)
+                .min_size(egui::vec2(140.0, 34.0)),
+            );
+            if open.clicked() {
+                if let Some(p) = pick_folder("Open a library folder") {
+                    *pick = Some(VaultPick::Open(p));
+                }
+            }
+            ui.add_space(10.0);
+            let new = ui.add(
+                egui::Button::new(
+                    RichText::new("New library…")
+                        .size(13.0)
+                        .strong()
+                        .color(theme.text),
+                )
+                .fill(theme.surface)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .corner_radius(8.0)
+                .min_size(egui::vec2(140.0, 34.0)),
+            );
+            if new.clicked() {
+                if let Some(p) = pick_folder("Choose a folder for the new library") {
+                    *pick = Some(VaultPick::New(p));
+                }
+            }
+        });
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new("(or launch with a path:  niutero <folder>)")
+                .font(theme::mono(11.0))
+                .color(theme.faint),
+        );
     });
 }

@@ -27,5 +27,6 @@ niutero-engine = { path = "../niutero-engine" }
 log = "0.4"
 env_logger = "0.11"
 egui_extras = { version = "0.33.3", features = ["svg"] }
+rfd = "0.17.2"
 # eframe pinned via `cargo add` to the latest release compatible with the 1.89
 # toolchain; wgpu backend for GPU rendering.
