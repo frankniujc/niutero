@@ -8,6 +8,7 @@
 //! niutero stores field *values* without their outer delimiters, so the rules
 //! here operate on the inner text directly (no brace add/strip needed).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -36,6 +37,11 @@ pub struct NormConfig {
     pub doi_to_url: bool,
     /// Collapse runs of whitespace and trim each field value.
     pub tidy_whitespace: bool,
+    /// Named alternative profiles (`[profiles.<name>]` in `norm.toml`), selected
+    /// with `normalize --profile <name>`. Each is a *full* config: any key it
+    /// omits falls back to the built-in default (not to the base above).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub profiles: HashMap<String, NormConfig>,
 }
 
 impl Default for NormConfig {
@@ -48,6 +54,7 @@ impl Default for NormConfig {
             canonicalize_venues: true,
             doi_to_url: true,
             tidy_whitespace: true,
+            profiles: HashMap::new(),
         }
     }
 }
@@ -59,6 +66,20 @@ impl NormConfig {
         match std::fs::read_to_string(niutero_dir.join("norm.toml")) {
             Ok(s) => toml::from_str(&s).unwrap_or_default(),
             Err(_) => Self::default(),
+        }
+    }
+
+    /// The config to normalize with: the base config (`profile = None`) or a
+    /// named `[profiles.<name>]`. Errors if a requested profile isn't defined.
+    pub fn resolve(niutero_dir: &Path, profile: Option<&str>) -> Result<Self, String> {
+        let base = Self::load(niutero_dir);
+        match profile {
+            None => Ok(base),
+            Some(name) => base
+                .profiles
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("no normalize profile '{name}' in norm.toml")),
         }
     }
 
@@ -897,6 +918,14 @@ doi_to_url = true
 
 # Collapse runs of whitespace and trim each field value.
 tidy_whitespace = true
+
+# Named profiles selectable with `normalize --profile <name>`. Each profile is a
+# FULL config: any key it omits falls back to the built-in default (not to the
+# base above). Uncomment to define one:
+#
+# [profiles.minimal]
+# conference_acronyms = false
+# protect_title_caps = false
 ";
 
 #[cfg(test)]

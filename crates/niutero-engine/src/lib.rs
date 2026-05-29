@@ -1122,18 +1122,19 @@ pub struct NormChange {
 }
 
 /// Preview offline normalization — compute what would change without writing.
-pub fn normalize_preview(v: &Vault) -> Result<Vec<NormChange>, String> {
+/// `profile` selects a `[profiles.<name>]` from `norm.toml` (None = base config).
+pub fn normalize_preview(v: &Vault, profile: Option<&str>) -> Result<Vec<NormChange>, String> {
     let items = read_items(v)?;
-    let cfg = NormConfig::load(&v.niutero_dir());
+    let cfg = NormConfig::resolve(&v.niutero_dir(), profile)?;
     Ok(norm_changes(&items, &cfg).1)
 }
 
 /// Apply offline normalization, writing the result (only if something changed).
-/// Returns the changes that were applied.
-pub fn normalize_apply(v: &Vault) -> Result<Vec<NormChange>, String> {
+/// Returns the changes that were applied. `profile` as in [`normalize_preview`].
+pub fn normalize_apply(v: &Vault, profile: Option<&str>) -> Result<Vec<NormChange>, String> {
     let _lock = lock_vault(v)?;
     let items = read_items(v)?;
-    let cfg = NormConfig::load(&v.niutero_dir());
+    let cfg = NormConfig::resolve(&v.niutero_dir(), profile)?;
     let (normalized, changes) = norm_changes(&items, &cfg);
     if !changes.is_empty() {
         write_items(v, &normalized)?;
@@ -2165,13 +2166,13 @@ mod tests {
         let before = std::fs::read_to_string(v.bib_path()).unwrap();
 
         // preview reports the change but does not write
-        let changes = normalize_preview(&v).unwrap();
+        let changes = normalize_preview(&v, None).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].citekey, "k");
         assert_eq!(std::fs::read_to_string(v.bib_path()).unwrap(), before);
 
         // apply writes; the noise field is gone and whitespace tidied
-        assert_eq!(normalize_apply(&v).unwrap().len(), 1);
+        assert_eq!(normalize_apply(&v, None).unwrap().len(), 1);
         let view = show(&v, "k").unwrap();
         assert!(view.fields.get("abstract").is_none());
         // capitalized title words are {{}}-protected (bib_fixer behavior)
@@ -2181,7 +2182,7 @@ mod tests {
         );
 
         // idempotent: nothing left to change
-        assert!(normalize_preview(&v).unwrap().is_empty());
+        assert!(normalize_preview(&v, None).unwrap().is_empty());
     }
 
     #[test]
@@ -2198,7 +2199,33 @@ mod tests {
              conference_acronyms = false\ndoi_to_url = false\ntidy_whitespace = false\n",
         )
         .unwrap();
-        assert!(normalize_preview(&v).unwrap().is_empty());
+        assert!(normalize_preview(&v, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn normalize_profile_selects_an_alternative_config() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{k, title={Deep Learning}, abstract={x}}".into()),
+        )
+        .unwrap();
+        // Base config: keep abstract, everything off → nothing changes. The
+        // `aggressive` profile sets only protect_title_caps, so the rest fall
+        // back to the built-in defaults (default keep-list drops abstract).
+        std::fs::write(
+            v.niutero_dir().join("norm.toml"),
+            "keep_fields = [\"title\", \"abstract\"]\nprotect_title_caps = false\n\
+             conference_acronyms = false\ndoi_to_url = false\ntidy_whitespace = false\n\n\
+             [profiles.aggressive]\nprotect_title_caps = true\n",
+        )
+        .unwrap();
+
+        assert!(normalize_preview(&v, None).unwrap().is_empty());
+        assert_eq!(normalize_preview(&v, Some("aggressive")).unwrap().len(), 1);
+        assert!(normalize_preview(&v, Some("nope"))
+            .unwrap_err()
+            .contains("no normalize profile 'nope'"));
     }
 
     #[test]
@@ -2502,7 +2529,7 @@ mod tests {
             AddSource::Bibtex("@article{k, title={A  B}, abstract={x}}".into()),
         )
         .unwrap();
-        let changes = normalize_preview(&v).unwrap();
+        let changes = normalize_preview(&v, None).unwrap();
         assert_eq!(changes.len(), 1);
         let diffs = &changes[0].diffs;
         // abstract is dropped (not on the keep-field whitelist)

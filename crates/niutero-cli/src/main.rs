@@ -196,6 +196,9 @@ enum Cmd {
         /// Emit JSON (the per-entry field-level diffs) instead of text.
         #[arg(long)]
         json: bool,
+        /// Use a named `[profiles.<name>]` from norm.toml instead of the base config.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Print `\cite{key}` for an entry (to paste into LaTeX).
     Cite {
@@ -398,7 +401,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             write,
             check,
             json,
-        } => cmd_normalize(&vault, write, check, json),
+            profile,
+        } => cmd_normalize(&vault, write, check, json, profile),
         Cmd::Cite { vault, citekey } => cmd_cite(&vault, &citekey).map(ok),
         Cmd::History {
             vault,
@@ -767,15 +771,21 @@ fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
     }
 }
 
-fn cmd_normalize(vault: &Path, write: bool, check: bool, json: bool) -> Result<ExitCode, String> {
+fn cmd_normalize(
+    vault: &Path,
+    write: bool,
+    check: bool,
+    json: bool,
+    profile: Option<String>,
+) -> Result<ExitCode, String> {
     if write && check {
         return Err("use either --write or --check, not both".into());
     }
     let v = engine::open(vault)?;
     let changes = if write {
-        engine::normalize_apply(&v)?
+        engine::normalize_apply(&v, profile.as_deref())?
     } else {
-        engine::normalize_preview(&v)?
+        engine::normalize_preview(&v, profile.as_deref())?
     };
     if json {
         println!(

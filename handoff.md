@@ -88,10 +88,22 @@ is the explicit spec that W2's offline normalizer was ported from.
     review that caught two HIGH silent-data-loss bugs): bails unless all three
     git stages exist (no whole-file modify/delete), both sides agree on the
     verbatim/`@string` blocks, and only references.bib conflicted.
+  - **W4a** (`3c6563d`): **file locking** (#46). `Vault::lock()` (std 1.89
+    `File::try_lock`, lock file in temp dir keyed by vault path) — every mutating
+    engine op takes it; readers don't. Serializes concurrent processes.
+  - **W4b** (`a7fcb53`): **duplicate detection & merge** (#47).
+    `niutero-core::dedup::duplicate_groups` (surname+year+title signature);
+    `analyze` "Likely duplicates" check; engine `dedupe_preview`/`dedupe_merge`
+    (fold cluster into richest entry, union fields + sidecar); CLI `dedupe [--merge]`.
+  - **W4c** (**committed, NOT yet pushed**): **normalize profiles** (half of #48).
+    `[profiles.<name>]` in norm.toml, `NormConfig::resolve`, `normalize --profile`.
+    Plus a top-level repo **README.md** (long-flagged gap). *(sync-strategy config,
+    the other half of #48, deferred — see below.)*
 
-- **Git**: `main` is **5 commits ahead of `origin/main`** (W3a + W3b + W-design +
-  W-norm + W3c unpushed). Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
-- **Tests**: full `cargo test --workspace` green at W3c (224 tests); fmt +
+- **Git**: `main` is **8 commits ahead of `origin/main`** (W3a · W3b · W-design ·
+  W-norm · W3c · W4a · W4b · W4c — all unpushed). Working tree clean.
+  Remote: `git@github.com:frankniujc/niutero_2.git`.
+- **Tests**: full `cargo test --workspace` green at W4c (233 tests); fmt +
   clippy (`-D warnings`) clean. Re-run the full gate before the next commit.
   Norm has an optional whole-library idempotence test: run with
   `NIUTERO_BIB_FIXTURE=/path/to/library.bib cargo test -p niutero-norm`.
@@ -101,12 +113,20 @@ is the explicit spec that W2's offline normalizer was ported from.
 Routing decision in force: **do the non-external-dependency waves first
 (W2–W4)**; external-service crates are deferred (see below).
 
-- ~~**W3b — per-entry `history` command** (#43)~~ — **DONE**.
-- ~~**W3c — 3-way entry-level merge resolver** (#44)~~ — **DONE** (see above).
-- **W4 — medium batch** (next): keep-updated auto-export (#45), file locking via
-  fs2 (#46), duplicate detection & merge (#47), normalize profiles + sync-strategy
-  config (#48). Plus small gaps: `--json` on mutating commands, top-level repo
-  `README.md`. Then the deferred external/online optional features (see below).
+- ~~**W3b — per-entry `history`** (#43)~~ · ~~**W3c — 3-way merge** (#44)~~ — **DONE**.
+- ~~**#46 file locking** (W4a)~~ · ~~**#47 dup detection & merge** (W4b)~~ —
+  **DONE**. ~~repo README~~ — **DONE** (W4c).
+- **#48 — half done**: ~~normalize profiles (W4c)~~ done; **sync-strategy config**
+  still open (pull/push timing, merge mode, conflict policy). Note: a push toggle
+  / merge-mode is partly a *machine-local preference*, which ties into the
+  unbuilt machine-local registry (see #45).
+- **#45 — keep-updated auto-export** (still open, biggest remaining offline piece):
+  register target `.bib` files and auto-rewrite on every change. Needs a
+  **machine-local registry** (per-vault export targets are machine-specific
+  paths, must NOT sync into `.niutero/`) — that infra doesn't exist yet, so this
+  is the one tracked item that requires new groundwork.
+- **Small gap**: `--json` on the mutating commands (add/edit/rm/tag/note/status/
+  stars) for the future GUI. Low-urgency.
 
 Each wave: tests + `cargo fmt --all --check` + `cargo clippy --workspace
 --all-targets -- -D warnings` + `cargo test --workspace` all green, then commit

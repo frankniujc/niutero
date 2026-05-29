@@ -8,7 +8,9 @@ fields, tidy whitespace, protect title capitals, clip long author lists, and the
 default **AI/ML venue canonicalization** ruleset; all idempotent. Default dry-run
 shows a per-entry diff; `--write` applies; `--check` exits **2** if anything would
 change (CI gate); `--json` emits the field-level `from→to` diffs. Config in
-`.niutero/norm.toml` (defaults if absent).
+`.niutero/norm.toml` (defaults if absent), with named `[profiles.<name>]`
+selectable via `--profile <name>` (each profile is a full config, unspecified
+keys falling back to the built-in defaults).
 
 **Venue canonicalization** (`canonicalize_venues`, on by default) collapses every
 messy spelling of a recognized AI/ML conference or journal — the ordinal / year /
