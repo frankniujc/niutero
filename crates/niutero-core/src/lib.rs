@@ -5,10 +5,12 @@
 //! sidecar (see `niutero-vault`). This crate only knows about bibliographic
 //! entries and a library of them.
 
+pub mod citekey;
 mod entry;
 pub mod filter;
 mod library;
 pub mod texscan;
 
+pub use citekey::KeyPattern;
 pub use entry::BibEntry;
 pub use library::Library;

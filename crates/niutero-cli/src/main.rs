@@ -64,7 +64,7 @@ enum Cmd {
         /// Read BibTeX from a file.
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Entry type (requires --key).
+        /// Entry type (--key optional; auto-generated from the pattern if omitted).
         #[arg(long = "type")]
         type_: Option<String>,
         /// Cite key (requires --type).
@@ -193,6 +193,9 @@ enum Cmd {
         /// CI gate: exit 2 if anything would change (does not write).
         #[arg(long)]
         check: bool,
+        /// Emit JSON (the per-entry field-level diffs) instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Print `\cite{key}` for an entry (to paste into LaTeX).
     Cite {
@@ -211,6 +214,48 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Regenerate cite keys from the library's pattern (preview, then --write).
+    Rekey {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Apply the changes (default is a preview).
+        #[arg(long)]
+        write: bool,
+        /// Override the library's citation-key pattern for this run.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or set an entry's reading status (unread / reading / done).
+    Status {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+        /// Set the status (omit to show the current one).
+        #[arg(long, value_enum)]
+        set: Option<StatusArg>,
+    },
+    /// Show or set an entry's star rating (0–5; 0 clears it).
+    Stars {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+        /// Set the rating (omit to show the current one).
+        #[arg(long)]
+        set: Option<u8>,
+    },
+    /// Scan the library for offline hygiene issues (a health report).
+    Analyze {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Emit JSON (full per-check entry lists) instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -218,6 +263,23 @@ enum OnDup {
     Skip,
     Overwrite,
     Rename,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StatusArg {
+    Unread,
+    Reading,
+    Done,
+}
+
+impl From<StatusArg> for engine::Status {
+    fn from(s: StatusArg) -> Self {
+        match s {
+            StatusArg::Unread => engine::Status::Unread,
+            StatusArg::Reading => engine::Status::Reading,
+            StatusArg::Done => engine::Status::Done,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -324,13 +386,31 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             vault,
             write,
             check,
-        } => cmd_normalize(&vault, write, check),
+            json,
+        } => cmd_normalize(&vault, write, check, json),
         Cmd::Cite { vault, citekey } => cmd_cite(&vault, &citekey).map(ok),
         Cmd::History {
             vault,
             citekey,
             json,
         } => cmd_history(&vault, &citekey, json).map(ok),
+        Cmd::Rekey {
+            vault,
+            write,
+            pattern,
+            json,
+        } => cmd_rekey(&vault, write, pattern, json).map(ok),
+        Cmd::Status {
+            vault,
+            citekey,
+            set,
+        } => cmd_status(&vault, &citekey, set).map(ok),
+        Cmd::Stars {
+            vault,
+            citekey,
+            set,
+        } => cmd_stars(&vault, &citekey, set).map(ok),
+        Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
     }
 }
 
@@ -394,6 +474,12 @@ fn cmd_show(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
         if !view.tags.is_empty() {
             println!("tags: {}", view.tags.join(", "));
         }
+        if view.status != "unread" {
+            println!("status: {}", view.status);
+        }
+        if let Some(n) = view.stars {
+            println!("stars: {n}");
+        }
         if !view.note.is_empty() {
             println!("note: {}", view.note);
         }
@@ -439,16 +525,17 @@ fn add_source(
             }
             Ok(AddSource::File(path))
         }
-        (None, None) => {
-            let (Some(t), Some(k)) = (type_, key) else {
-                return Err("specify --bibtex, --from, or both --type and --key".into());
-            };
-            Ok(AddSource::Fields {
+        (None, None) => match type_ {
+            // --key is optional: without it, the engine derives the key from the
+            // library's citation-key pattern.
+            Some(t) => Ok(AddSource::Fields {
                 type_: t,
-                key: k,
+                key: key.unwrap_or_default(),
                 fields: field,
-            })
-        }
+            }),
+            None if key.is_some() => Err("--key requires --type".into()),
+            None => Err("specify --bibtex, --from, or --type (with optional --key)".into()),
+        },
     }
 }
 
@@ -665,7 +752,7 @@ fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
     }
 }
 
-fn cmd_normalize(vault: &Path, write: bool, check: bool) -> Result<ExitCode, String> {
+fn cmd_normalize(vault: &Path, write: bool, check: bool, json: bool) -> Result<ExitCode, String> {
     if write && check {
         return Err("use either --write or --check, not both".into());
     }
@@ -675,6 +762,18 @@ fn cmd_normalize(vault: &Path, write: bool, check: bool) -> Result<ExitCode, Str
     } else {
         engine::normalize_preview(&v)?
     };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&changes).map_err(|e| e.to_string())?
+        );
+        // --check is still a CI gate even in JSON mode.
+        return Ok(if check && !changes.is_empty() {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
     if changes.is_empty() {
         println!("Already normalized: nothing to change.");
         return Ok(ExitCode::SUCCESS);
@@ -719,6 +818,91 @@ fn cmd_history(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
             let day = c.date.get(..10).unwrap_or(&c.date);
             println!("{short}  {day}  {}", c.subject);
         }
+    }
+    Ok(())
+}
+
+fn cmd_rekey(vault: &Path, write: bool, pattern: Option<String>, json: bool) -> Result<(), String> {
+    let changes = if write {
+        let mut v = engine::open(vault)?;
+        engine::rekey_apply(&mut v, pattern.as_deref())?
+    } else {
+        let v = engine::open(vault)?;
+        engine::rekey_preview(&v, pattern.as_deref())?
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&changes).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    if changes.is_empty() {
+        println!("All cite keys already match the pattern.");
+        return Ok(());
+    }
+    let verb = if write { "Re-keyed" } else { "Would re-key" };
+    println!("{verb} {} entr(ies):", changes.len());
+    for c in &changes {
+        let flag = if c.disambiguated {
+            "  (suffix added)"
+        } else {
+            ""
+        };
+        println!("  {} -> {}{flag}", c.citekey, c.new_key);
+    }
+    if !write {
+        println!("(preview — re-run with --write to apply)");
+    }
+    Ok(())
+}
+
+fn cmd_status(vault: &Path, citekey: &str, set: Option<StatusArg>) -> Result<(), String> {
+    if let Some(s) = set {
+        let mut v = engine::open(vault)?;
+        let status = engine::Status::from(s);
+        engine::set_status(&mut v, citekey, status)?;
+        println!("Set status of {citekey} to {}", status.as_str());
+    } else {
+        let view = engine::show(&engine::open(vault)?, citekey)?;
+        println!("{}", view.status);
+    }
+    Ok(())
+}
+
+fn cmd_stars(vault: &Path, citekey: &str, set: Option<u8>) -> Result<(), String> {
+    if let Some(n) = set {
+        let mut v = engine::open(vault)?;
+        engine::set_stars(&mut v, citekey, Some(n))?;
+        if n == 0 {
+            println!("Cleared rating of {citekey}");
+        } else {
+            println!("Set {citekey} to {n} star(s)");
+        }
+    } else {
+        match engine::show(&engine::open(vault)?, citekey)?.stars {
+            Some(n) => println!("{n}"),
+            None => println!("(unrated)"),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_analyze(vault: &Path, json: bool) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    let report = engine::analyze(&v)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    println!("{} entr(ies) scanned.", report.total);
+    for c in &report.checks {
+        let n = c.keys.len();
+        let mark = if n == 0 { "ok" } else { "!!" };
+        println!("  [{mark}] {:<22} {n:>4}   {}", c.label, c.hint);
     }
     Ok(())
 }

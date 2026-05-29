@@ -45,11 +45,29 @@ is the explicit spec that W2's offline normalizer was ported from.
     `history <citekey> [--json]`. Reviewed by a 4-lens adversarial workflow;
     fixes landed (lone-CR line-count fix, HEAD-driven existence check so a
     locally-deleted entry's history still shows, reworded no-commit error).
+  - **W-design** (**committed, NOT yet pushed**): four operational features
+    distilled from the UI design handoff (`api.anthropic.com/.../Niutero.html`;
+    the UI itself is **not** built — only the offline engine/CLI logic it implies):
+    (1) **citation-key pattern + re-key** — `niutero-core::KeyPattern`
+    (`{auth}{year}{title.N}{Title.N}{title-content-word.N}`, casing-by-token,
+    shared title-word cursor) + `Config.citekey_pattern`; engine
+    `rekey_preview`/`rekey_apply` (letter-suffix collisions, churn-minimizing,
+    **migrates the meta.json sidecar** on rename, validates + rolls back on
+    sidecar-write failure); `add` auto-keys when `--key` is omitted; CLI
+    `rekey [--write] [--pattern] [--json]`. (2) **status + stars** sidecar fields
+    (`EntryMeta`, default-pruned) + `set_status`/`set_stars` + `EntryView` +
+    `status:`/`stars:>=N` filter terms; CLI `status`/`stars`. (3) **`analyze`** —
+    offline health report (offline-changeable, odd titles, inconsistent venues,
+    missing url/year). (4) **structured normalize diffs** (`NormChange.diffs`) +
+    `normalize --json`. Reviewed by a 5-lens adversarial workflow (9 findings);
+    fixes landed (rekey idempotence on disambiguated keys, preview validates like
+    `--write`, sidecar-write rollback, `is_empty` folds defaults, `is_odd_title`
+    spares acronyms, stale-meta comment, help text).
 
-- **Git**: `main` is **2 commits ahead of `origin/main`** (W3a + W3b unpushed).
-  Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
-- **Tests**: full `cargo test --workspace` green at W3b (170 tests); fmt + clippy
-  (`-D warnings`) clean. Re-run the full gate before the next commit.
+- **Git**: `main` is **3 commits ahead of `origin/main`** (W3a + W3b + W-design
+  unpushed). Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
+- **Tests**: full `cargo test --workspace` green at W-design (197 tests); fmt +
+  clippy (`-D warnings`) clean. Re-run the full gate before the next commit.
 
 ## Remaining work (tracked as tasks #43–#48)
 
@@ -72,7 +90,11 @@ Each wave: tests + `cargo fmt --all --check` + `cargo clippy --workspace
 
 ## Deferred — do NOT build now
 
-- **Phase 2 GUI** (descoped entirely).
+- **Phase 2 GUI** (descoped entirely). The UI design handoff was mined for
+  *operational logic* only (see W-design); the rest of its surface — AI
+  assistant (chat across the library), online enrich / "arXiv → published",
+  browser-connector capture, share links, appearance/keymap/integrations — is
+  Phase-2 UI and/or the external-service crates below.
 - **External-service crates**: DOI import/fetch, online enrich, browser
   connector, LLM, PDF management; cross-platform CI. These must stay off the
   base path — the core works fully offline with all of them disabled.

@@ -38,6 +38,11 @@ pub struct Config {
     pub name: String,
     #[serde(default = "default_schema")]
     pub schema: u32,
+    /// Citation-key pattern for generated keys (e.g. `{auth}{year}{Title.2}`).
+    /// `None` means the engine's built-in default applies. Synced with the
+    /// library, so collaborators share one key convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citekey_pattern: Option<String>,
 }
 
 impl Config {
@@ -45,6 +50,28 @@ impl Config {
         Self {
             name: name.into(),
             schema: SCHEMA_VERSION,
+            citekey_pattern: None,
+        }
+    }
+}
+
+/// A reading-workflow state for an entry. `Unread` is the default and is never
+/// persisted (an absent `status` *is* unread), so `meta.json` stays minimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Unread,
+    Reading,
+    Done,
+}
+
+impl Status {
+    /// The lowercase name, as written in `meta.json` and matched by queries.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Unread => "unread",
+            Status::Reading => "reading",
+            Status::Done => "done",
         }
     }
 }
@@ -57,6 +84,12 @@ pub struct EntryMeta {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Reading workflow state. `None`/absent == unread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+    /// Star rating, 1–5. `None`/absent == unrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stars: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added: Option<String>,
 }
@@ -65,7 +98,14 @@ impl EntryMeta {
     /// True when there is nothing worth persisting, so callers can drop the
     /// map entry and keep `meta.json` minimal.
     pub fn is_empty(&self) -> bool {
-        self.tags.is_empty() && self.note.is_empty() && self.added.is_none()
+        // Fold the defaults: an explicit `unread` / `0` (e.g. from a hand-edited
+        // meta.json) counts as nothing, so the entry is still pruned to keep the
+        // sidecar minimal.
+        self.tags.is_empty()
+            && self.note.is_empty()
+            && self.added.is_none()
+            && self.status.is_none_or(|s| s == Status::Unread)
+            && self.stars.is_none_or(|n| n == 0)
     }
 }
 
@@ -298,6 +338,8 @@ mod tests {
             EntryMeta {
                 tags: vec!["nlp".into(), "llm".into()],
                 note: "key paper".into(),
+                status: Some(Status::Reading),
+                stars: Some(4),
                 added: Some("2026-05-28".into()),
             },
         );

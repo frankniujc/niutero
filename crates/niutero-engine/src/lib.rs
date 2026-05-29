@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use niutero_bib::{entries, entry_line_span, parse, to_bibtex_entries, BibItem};
-use niutero_core::{filter, texscan, BibEntry};
+use niutero_core::filter::Facets;
+use niutero_core::{filter, texscan, BibEntry, KeyPattern};
 use niutero_norm::{normalize_entry, NormConfig};
 use niutero_sync as git;
 use serde::{Deserialize, Serialize};
 
 pub use niutero_core::texscan::TexReport;
-pub use niutero_vault::{Vault, View};
+pub use niutero_vault::{EntryMeta, Status, Vault, View};
 
 /// An owned, serializable view of an entry plus its sidecar tags/notes — the
 /// stable shape the CLI's `--json` emits and a GUI consumes.
@@ -28,6 +29,10 @@ pub struct EntryView {
     pub fields: IndexMap<String, String>,
     pub tags: Vec<String>,
     pub note: String,
+    /// Reading status name (`unread` / `reading` / `done`).
+    pub status: String,
+    /// Star rating 1–5, or `None` if unrated.
+    pub stars: Option<u8>,
     pub added: Option<String>,
 }
 
@@ -72,14 +77,7 @@ pub fn list(v: &Vault, filter: Filter) -> Result<Vec<EntryView>, String> {
     let items = read_items(v)?;
     let query = resolve_query(v, filter)?;
     Ok(entries(&items)
-        .filter(|e| {
-            let tags = v
-                .meta
-                .get(&e.citekey)
-                .map(|m| m.tags.as_slice())
-                .unwrap_or(&[]);
-            filter::entry_matches(&query, e, tags)
-        })
+        .filter(|e| filter::entry_matches(&query, e, &facets_of(v, &e.citekey)))
         .map(|e| view_of(e, v))
         .collect())
 }
@@ -110,6 +108,10 @@ pub fn add(v: &Vault, source: AddSource) -> Result<Vec<String>, String> {
             for f in &fields {
                 let (name, value) = split_field(f)?;
                 e.set(name, value);
+            }
+            // No cite key given: generate one from the library's pattern.
+            if e.citekey.is_empty() {
+                e.citekey = generate_citekey(v, &e, &items);
             }
             vec![e]
         }
@@ -240,6 +242,30 @@ pub fn set_note(v: &mut Vault, citekey: &str, note: Option<String>) -> Result<()
     save_sidecar(v)
 }
 
+/// Set an entry's reading status. `Unread` is the default and is stored as
+/// *absent* so `meta.json` stays minimal. Sidecar only.
+pub fn set_status(v: &mut Vault, citekey: &str, status: Status) -> Result<(), String> {
+    entry_exists(v, citekey)?;
+    let stored = (status != Status::Unread).then_some(status);
+    v.meta.entry(citekey.to_string()).or_default().status = stored;
+    prune_meta(v, citekey);
+    save_sidecar(v)
+}
+
+/// Set (`1..=5`) or clear (`0`/`None`) an entry's star rating. Rejects ratings
+/// above 5. Sidecar only.
+pub fn set_stars(v: &mut Vault, citekey: &str, stars: Option<u8>) -> Result<(), String> {
+    entry_exists(v, citekey)?;
+    let stored = match stars {
+        Some(0) | None => None,
+        Some(n) if n <= 5 => Some(n),
+        Some(n) => return Err(format!("stars must be between 0 and 5, got {n}")),
+    };
+    v.meta.entry(citekey.to_string()).or_default().stars = stored;
+    prune_meta(v, citekey);
+    save_sidecar(v)
+}
+
 // ------------------------------------------------------------- saved views
 
 /// All saved views, in order.
@@ -343,14 +369,7 @@ pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
     let items = read_items(v)?;
     let query = resolve_query(v, filter)?;
     let selected: Vec<BibEntry> = entries(&items)
-        .filter(|e| {
-            let tags = v
-                .meta
-                .get(&e.citekey)
-                .map(|m| m.tags.as_slice())
-                .unwrap_or(&[]);
-            filter::entry_matches(&query, e, tags)
-        })
+        .filter(|e| filter::entry_matches(&query, e, &facets_of(v, &e.citekey)))
         .cloned()
         .collect();
     std::fs::write(out, to_bibtex_entries(&selected))
@@ -562,13 +581,303 @@ pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
         .collect())
 }
 
+// ------------------------------------------------------------------ rekey
+
+/// One entry's cite-key change under [`rekey_preview`] / [`rekey_apply`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Rekey {
+    pub citekey: String,
+    pub new_key: String,
+    /// A disambiguating suffix was appended because the generated key collided.
+    pub disambiguated: bool,
+}
+
+/// Preview re-keying: the cite-key changes the library's pattern would make,
+/// without touching disk. `pattern` overrides the vault's configured pattern.
+/// Validates the proposed keys, so a pattern that would produce an illegal key
+/// fails here exactly as it would on `--write` (preview and apply agree).
+pub fn rekey_preview(v: &Vault, pattern: Option<&str>) -> Result<Vec<Rekey>, String> {
+    let items = read_items(v)?;
+    let changes = plan_rekey(&items, &resolve_pattern(v, pattern));
+    validate_rekey(&items, &changes)?;
+    Ok(changes)
+}
+
+/// Apply re-keying: rewrite each entry's cite key per the pattern and migrate
+/// the sidecar (tags/notes/status/stars are keyed by cite key, so they must
+/// follow the rename). Returns the changes applied (entries whose key changed).
+pub fn rekey_apply(v: &mut Vault, pattern: Option<&str>) -> Result<Vec<Rekey>, String> {
+    let mut items = read_items(v)?;
+    let changes = plan_rekey(&items, &resolve_pattern(v, pattern));
+    if changes.is_empty() {
+        return Ok(changes);
+    }
+    validate_rekey(&items, &changes)?; // before any write
+    let original = items.clone(); // for rollback if the sidecar write fails
+    let renames: std::collections::HashMap<&str, &str> = changes
+        .iter()
+        .map(|c| (c.citekey.as_str(), c.new_key.as_str()))
+        .collect();
+    for it in &mut items {
+        if let BibItem::Entry(e) = it {
+            if let Some(new) = renames.get(e.citekey.as_str()) {
+                e.citekey = (*new).to_string();
+            }
+        }
+    }
+    write_items(v, &items)?;
+
+    // Migrate sidecar metadata to the new keys. This is pure in-memory work, so
+    // it can't fail; the only fallible step left is persisting it. If that
+    // fails, roll `references.bib` back to its pre-rekey state so the on-disk
+    // `.bib` and sidecar never disagree about which keys exist.
+    let mut migrated: niutero_vault::Meta = std::collections::BTreeMap::new();
+    for c in &changes {
+        if let Some(m) = v.meta.remove(&c.citekey) {
+            migrated.insert(c.new_key.clone(), m);
+        }
+    }
+    // Fold in any leftover (stale) meta — entries with no matching `.bib` entry.
+    // On a key clash a live entry's migrated meta wins; the stale value is dropped.
+    for (k, m) in std::mem::take(&mut v.meta) {
+        migrated.entry(k).or_insert(m);
+    }
+    v.meta = migrated;
+    if let Err(e) = save_sidecar(v) {
+        let _ = write_items(v, &original);
+        return Err(e);
+    }
+    Ok(changes)
+}
+
+/// Validate each renamed entry under its new cite key, so an illegal generated
+/// key (e.g. a custom pattern whose literals inject a forbidden character) is
+/// caught before any write.
+fn validate_rekey(items: &[BibItem], changes: &[Rekey]) -> Result<(), String> {
+    let renames: std::collections::HashMap<&str, &str> = changes
+        .iter()
+        .map(|c| (c.citekey.as_str(), c.new_key.as_str()))
+        .collect();
+    for e in entries(items) {
+        if let Some(new) = renames.get(e.citekey.as_str()) {
+            let mut renamed = e.clone();
+            renamed.citekey = (*new).to_string();
+            renamed.validate()?;
+        }
+    }
+    Ok(())
+}
+
+/// Plan the new key for every entry, reporting only those that change. Entries
+/// whose pattern output already equals their current key keep it (reserved
+/// first), so re-keying churns only the keys that actually need to move;
+/// remaining collisions get a deterministic `a`/`b`/… suffix in document order.
+fn plan_rekey(items: &[BibItem], pattern: &KeyPattern) -> Vec<Rekey> {
+    let es: Vec<&BibEntry> = entries(items).collect();
+    let bases: Vec<String> = es
+        .iter()
+        .map(|e| {
+            let b = pattern.render(e);
+            if b.trim().is_empty() {
+                e.citekey.clone() // empty pattern output: leave the key alone
+            } else {
+                b
+            }
+        })
+        .collect();
+    let mut taken: std::collections::HashSet<String> = es
+        .iter()
+        .zip(&bases)
+        .filter(|(e, base)| **base == e.citekey)
+        .map(|(e, _)| e.citekey.clone())
+        .collect();
+    let mut out = Vec::new();
+    for (e, base) in es.iter().zip(&bases) {
+        if *base == e.citekey {
+            continue; // unchanged; already reserved above
+        }
+        let (new_key, disambiguated) = next_free_key(base, &taken);
+        taken.insert(new_key.clone()); // reserve even on a self-rename below
+                                       // The disambiguating suffix can resolve back to this entry's own
+                                       // key (e.g. it already carries the suffix); that's a no-op, so
+                                       // re-keying stays idempotent.
+        if new_key != e.citekey {
+            out.push(Rekey {
+                citekey: e.citekey.clone(),
+                new_key,
+                disambiguated,
+            });
+        }
+    }
+    out
+}
+
+fn resolve_pattern(v: &Vault, override_: Option<&str>) -> KeyPattern {
+    let s = override_
+        .map(str::to_string)
+        .or_else(|| v.config.citekey_pattern.clone())
+        .unwrap_or_else(|| KeyPattern::DEFAULT.to_string());
+    KeyPattern::parse(&s)
+}
+
+// ---------------------------------------------------------------- analyze
+
+/// One library-health check: a class of issue plus the entries that have it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Check {
+    pub id: String,
+    pub label: String,
+    pub hint: String,
+    pub keys: Vec<String>,
+}
+
+/// An offline scan of the library's overall hygiene.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnalysisReport {
+    pub total: usize,
+    pub checks: Vec<Check>,
+}
+
+/// Scan the library for hygiene issues, entirely offline. Reports, per check,
+/// the entries that fail it. Online checks (e.g. "arXiv mislabeled" needs a DOI
+/// lookup) and duplicate-merge are intentionally out of scope here.
+pub fn analyze(v: &Vault) -> Result<AnalysisReport, String> {
+    let items = read_items(v)?;
+    let cfg = NormConfig::load(&v.niutero_dir());
+    let es: Vec<&BibEntry> = entries(&items).collect();
+
+    let offline: Vec<String> = norm_changes(&items, &cfg)
+        .1
+        .into_iter()
+        .map(|c| c.citekey)
+        .collect();
+    let odd_titles = keys_where(&es, |e| is_odd_title(e.get("title")));
+    let missing_url = keys_where(&es, |e| blank(e.get("url")) && blank(e.get("doi")));
+    let missing_year = keys_where(&es, |e| blank(e.get("year")));
+    let inconsistent_venues = inconsistent_venue_keys(&es);
+
+    Ok(AnalysisReport {
+        total: es.len(),
+        checks: vec![
+            Check {
+                id: "offline".into(),
+                label: "Offline-changeable".into(),
+                hint: "A local cleanup pass (normalize) would rewrite these".into(),
+                keys: offline,
+            },
+            Check {
+                id: "titles".into(),
+                label: "Odd titles".into(),
+                hint: "ALL-CAPS, missing, or very short titles".into(),
+                keys: odd_titles,
+            },
+            Check {
+                id: "venues".into(),
+                label: "Inconsistent venues".into(),
+                hint: "Same venue spelled several ways (casing / punctuation)".into(),
+                keys: inconsistent_venues,
+            },
+            Check {
+                id: "url".into(),
+                label: "Missing URL".into(),
+                hint: "No url or doi to resolve the entry".into(),
+                keys: missing_url,
+            },
+            Check {
+                id: "year".into(),
+                label: "Missing year".into(),
+                hint: "No publication year set".into(),
+                keys: missing_year,
+            },
+        ],
+    })
+}
+
+fn blank(field: Option<&str>) -> bool {
+    field.unwrap_or("").trim().is_empty()
+}
+
+fn keys_where(es: &[&BibEntry], pred: impl Fn(&BibEntry) -> bool) -> Vec<String> {
+    es.iter()
+        .filter(|e| pred(e))
+        .map(|e| e.citekey.clone())
+        .collect()
+}
+
+/// A title is "odd" if it is missing/blank, has fewer than three alphanumerics
+/// (a sign of truncation), or is a multi-word ALL-CAPS shout. The multi-word
+/// guard avoids flagging legitimate single-token acronyms (`GAN`, `GPT-3`) and
+/// brace-protected proper nouns (`{{BERT}}`), which the normalizer itself emits.
+fn is_odd_title(title: Option<&str>) -> bool {
+    let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) else {
+        return true;
+    };
+    // Strip BibTeX brace protection so `{{BERT}}` reads as `BERT`.
+    let plain: String = t.chars().filter(|&c| c != '{' && c != '}').collect();
+    if plain.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+        return true; // too short / truncated
+    }
+    let words_with_letters = plain
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .count();
+    let letters: Vec<char> = plain.chars().filter(|c| c.is_alphabetic()).collect();
+    // ALL-CAPS only counts as a "shout" across two or more words.
+    words_with_letters >= 2 && !letters.is_empty() && letters.iter().all(|c| c.is_uppercase())
+}
+
+/// Entries whose venue (booktitle / journal / venue) shares a normalized form
+/// with a *different* spelling elsewhere in the library.
+fn inconsistent_venue_keys(es: &[&BibEntry]) -> Vec<String> {
+    fn venue(e: &BibEntry) -> Option<&str> {
+        ["booktitle", "journal", "venue"]
+            .iter()
+            .find_map(|f| e.get(f))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+    fn normalized(s: &str) -> String {
+        s.to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect()
+    }
+    let mut groups: std::collections::BTreeMap<
+        String,
+        (std::collections::BTreeSet<String>, Vec<String>),
+    > = std::collections::BTreeMap::new();
+    for e in es {
+        if let Some(v) = venue(e) {
+            let g = groups.entry(normalized(v)).or_default();
+            g.0.insert(v.to_string());
+            g.1.push(e.citekey.clone());
+        }
+    }
+    groups
+        .into_values()
+        .filter(|(spellings, _)| spellings.len() > 1)
+        .flat_map(|(_, keys)| keys)
+        .collect()
+}
+
 // -------------------------------------------------------------- normalize
 
-/// One entry that offline normalization would change, with human-readable notes.
+/// A single field-level change normalization would make (`from`/`to` are
+/// `None` when the field is absent on that side).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldChange {
+    pub field: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// One entry that offline normalization would change, with human-readable notes
+/// and the structured field-level diff (for a UI / `--json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NormChange {
     pub citekey: String,
     pub notes: Vec<String>,
+    pub diffs: Vec<FieldChange>,
 }
 
 /// Preview offline normalization — compute what would change without writing.
@@ -597,10 +906,15 @@ fn norm_changes(items: &[BibItem], cfg: &NormConfig) -> (Vec<BibItem>, Vec<NormC
         match it {
             BibItem::Entry(e) => {
                 let (normalized, notes) = normalize_entry(e, cfg);
-                if !notes.is_empty() {
+                let diffs = entry_field_diff(e, &normalized);
+                // `notes` and `diffs` are non-empty together today; the `||` is
+                // defensive, so a future rule that mutates a field without a note
+                // is still recorded (and surfaced in the structured diff).
+                if !notes.is_empty() || !diffs.is_empty() {
                     changes.push(NormChange {
                         citekey: e.citekey.clone(),
                         notes,
+                        diffs,
                     });
                 }
                 out.push(BibItem::Entry(normalized));
@@ -609,6 +923,45 @@ fn norm_changes(items: &[BibItem], cfg: &NormConfig) -> (Vec<BibItem>, Vec<NormC
         }
     }
     (out, changes)
+}
+
+/// The field-level delta between an entry and its normalized form: the entry
+/// type plus each added / removed / changed field, in normalized-then-removed
+/// order.
+fn entry_field_diff(orig: &BibEntry, norm: &BibEntry) -> Vec<FieldChange> {
+    let mut diffs = Vec::new();
+    if orig.entry_type() != norm.entry_type() {
+        diffs.push(FieldChange {
+            field: "entrytype".into(),
+            from: Some(orig.entry_type().to_string()),
+            to: Some(norm.entry_type().to_string()),
+        });
+    }
+    for (k, nv) in &norm.fields {
+        match orig.fields.get(k) {
+            Some(ov) if ov != nv => diffs.push(FieldChange {
+                field: k.clone(),
+                from: Some(ov.clone()),
+                to: Some(nv.clone()),
+            }),
+            Some(_) => {}
+            None => diffs.push(FieldChange {
+                field: k.clone(),
+                from: None,
+                to: Some(nv.clone()),
+            }),
+        }
+    }
+    for (k, ov) in &orig.fields {
+        if !norm.fields.contains_key(k) {
+            diffs.push(FieldChange {
+                field: k.clone(),
+                from: Some(ov.clone()),
+                to: None,
+            });
+        }
+    }
+    diffs
 }
 
 // ----------------------------------------------------------------- helpers
@@ -633,6 +986,45 @@ fn unique_key(base: &str, taken: &std::collections::HashSet<String>) -> String {
         .map(|n| format!("{base}-{n}"))
         .find(|k| !taken.contains(k))
         .expect("infinite range yields an unused key")
+}
+
+/// Generate a unique cite key for `entry` from the library's pattern, avoiding
+/// keys already present in `items`. Falls back to `ref` when the pattern yields
+/// nothing (the entry has no author / year / title to build from).
+fn generate_citekey(v: &Vault, entry: &BibEntry, items: &[BibItem]) -> String {
+    let base = resolve_pattern(v, None).render(entry);
+    let base = if base.trim().is_empty() {
+        "ref".to_string()
+    } else {
+        base
+    };
+    let taken: std::collections::HashSet<String> =
+        entries(items).map(|e| e.citekey.clone()).collect();
+    next_free_key(&base, &taken).0
+}
+
+/// `base` if free, else `base` + the first free letter suffix (`a`, `b`, …,
+/// `z`, `aa`, …). The bool reports whether a suffix was needed.
+fn next_free_key(base: &str, taken: &std::collections::HashSet<String>) -> (String, bool) {
+    if !taken.contains(base) {
+        return (base.to_string(), false);
+    }
+    (1..)
+        .map(|n| format!("{base}{}", letter_suffix(n)))
+        .find(|k| !taken.contains(k))
+        .map(|k| (k, true))
+        .expect("infinite range yields an unused key")
+}
+
+/// `1 → "a"`, `26 → "z"`, `27 → "aa"`, … (spreadsheet-column lettering).
+fn letter_suffix(mut n: usize) -> String {
+    let mut chars = Vec::new();
+    while n > 0 {
+        n -= 1;
+        chars.push((b'a' + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    chars.iter().rev().collect()
 }
 
 fn entry_exists(v: &Vault, citekey: &str) -> Result<(), String> {
@@ -680,7 +1072,23 @@ fn view_of(entry: &BibEntry, v: &Vault) -> EntryView {
         fields: entry.fields.clone(),
         tags: meta.map(|m| m.tags.clone()).unwrap_or_default(),
         note: meta.map(|m| m.note.clone()).unwrap_or_default(),
+        status: meta
+            .and_then(|m| m.status)
+            .unwrap_or(Status::Unread)
+            .as_str()
+            .to_string(),
+        stars: meta.and_then(|m| m.stars),
         added: meta.and_then(|m| m.added.clone()),
+    }
+}
+
+/// Build the query facets (tags / status / stars) for an entry from its sidecar.
+fn facets_of<'a>(v: &'a Vault, citekey: &str) -> Facets<'a> {
+    let meta = v.meta.get(citekey);
+    Facets {
+        tags: meta.map(|m| m.tags.as_slice()).unwrap_or(&[]),
+        status: meta.and_then(|m| m.status).map(|s| s.as_str()),
+        stars: meta.and_then(|m| m.stars),
     }
 }
 
@@ -838,7 +1246,7 @@ mod tests {
             niutero_vault::EntryMeta {
                 tags: vec!["nlp".into()],
                 note: "n".into(),
-                added: None,
+                ..Default::default()
             },
         );
         let view = show(&v, "k").unwrap();
@@ -1377,5 +1785,239 @@ mod tests {
         add(&v, fields("misc", "k", &[])).unwrap();
         assert_eq!(cite(&v, "k").unwrap(), "\\cite{k}");
         assert!(cite(&v, "nope").unwrap_err().contains("no entry"));
+    }
+
+    // ------------------------------------------------- citekey pattern / rekey
+
+    #[test]
+    fn add_generates_a_key_when_none_is_given() {
+        let (_d, v) = vault();
+        let keys = add(
+            &v,
+            fields(
+                "article",
+                "", // no cite key
+                &[
+                    "author=Vaswani, Ashish",
+                    "year=2017",
+                    "title=Attention Is All You Need",
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(keys, vec!["vaswani2017attentionIsAll".to_string()]);
+        assert!(show(&v, "vaswani2017attentionIsAll").is_ok());
+    }
+
+    #[test]
+    fn add_autokey_disambiguates_against_existing() {
+        let (_d, v) = vault();
+        let mk = || {
+            fields(
+                "article",
+                "",
+                &["author=Gao, Leo", "year=2025", "title=Scaling Sparse"],
+            )
+        };
+        let k1 = add(&v, mk()).unwrap();
+        let k2 = add(&v, mk()).unwrap();
+        assert_eq!(k1[0], "gao2025scalingSparse");
+        assert_eq!(k2[0], "gao2025scalingSparsea"); // letter suffix on collision
+    }
+
+    #[test]
+    fn rekey_applies_and_migrates_the_sidecar() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            fields(
+                "article",
+                "OLD",
+                &["author=Arad, Dana", "year=2025", "title=SAEs Are Good"],
+            ),
+        )
+        .unwrap();
+        set_tags(&mut v, "OLD", &["topics:sae".into()], &[]).unwrap();
+        set_status(&mut v, "OLD", Status::Reading).unwrap();
+        set_stars(&mut v, "OLD", Some(4)).unwrap();
+
+        // preview reports the change but writes nothing
+        let preview = rekey_preview(&v, None).unwrap();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].citekey, "OLD");
+        assert_eq!(preview[0].new_key, "arad2025saesAreGood");
+        assert!(show(&v, "OLD").is_ok());
+
+        // apply renames the entry and carries the sidecar over
+        rekey_apply(&mut v, None).unwrap();
+        assert!(show(&v, "OLD").is_err());
+        let view = show(&v, "arad2025saesAreGood").unwrap();
+        assert_eq!(view.tags, vec!["topics:sae".to_string()]);
+        assert_eq!(view.status, "reading");
+        assert_eq!(view.stars, Some(4));
+    }
+
+    #[test]
+    fn rekey_disambiguates_colliding_entries() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            fields(
+                "article",
+                "a",
+                &["author=Gao, Leo", "year=2025", "title=Scaling Up"],
+            ),
+        )
+        .unwrap();
+        add(
+            &v,
+            fields(
+                "article",
+                "b",
+                &["author=Gao, Leo", "year=2025", "title=Scaling Up"],
+            ),
+        )
+        .unwrap();
+        let changes = rekey_apply(&mut v, None).unwrap();
+        let new_keys: Vec<&str> = changes.iter().map(|c| c.new_key.as_str()).collect();
+        assert!(new_keys.contains(&"gao2025scalingUp"));
+        assert!(new_keys.contains(&"gao2025scalingUpa"));
+        assert!(changes.iter().any(|c| c.disambiguated));
+
+        // Idempotent: a second pass is a clean no-op — the already-suffixed key
+        // must not be reported as renaming to itself.
+        assert!(rekey_preview(&v, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rekey_leaves_already_patterned_keys_untouched() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            fields(
+                "article",
+                "arad2025saesAreGood", // already equals the pattern output
+                &["author=Arad, Dana", "year=2025", "title=SAEs Are Good"],
+            ),
+        )
+        .unwrap();
+        assert!(rekey_preview(&v, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rekey_respects_a_pattern_override() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            fields(
+                "misc",
+                "x",
+                &["author=Bricken, Trenton", "year=2023", "title=Toward Mono"],
+            ),
+        )
+        .unwrap();
+        let preview = rekey_preview(&v, Some("{auth}{year}")).unwrap();
+        assert_eq!(preview[0].new_key, "bricken2023");
+    }
+
+    // ----------------------------------------------------------- status / stars
+
+    #[test]
+    fn status_and_stars_set_show_and_prune() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "k", &[])).unwrap();
+        set_status(&mut v, "k", Status::Done).unwrap();
+        set_stars(&mut v, "k", Some(5)).unwrap();
+        let view = show(&v, "k").unwrap();
+        assert_eq!(view.status, "done");
+        assert_eq!(view.stars, Some(5));
+
+        // back to the defaults clears the sidecar entry entirely
+        set_status(&mut v, "k", Status::Unread).unwrap();
+        set_stars(&mut v, "k", Some(0)).unwrap();
+        assert_eq!(show(&v, "k").unwrap().status, "unread");
+        assert_eq!(show(&v, "k").unwrap().stars, None);
+        assert!(!v.meta.contains_key("k"), "empty meta should be pruned");
+
+        assert!(set_stars(&mut v, "k", Some(6))
+            .unwrap_err()
+            .contains("between 0 and 5"));
+        assert!(set_status(&mut v, "ghost", Status::Done).is_err());
+    }
+
+    #[test]
+    fn list_filters_by_status_and_stars() {
+        let (_d, mut v) = vault();
+        add(&v, fields("article", "a", &["title=A"])).unwrap();
+        add(&v, fields("article", "b", &["title=B"])).unwrap();
+        set_status(&mut v, "a", Status::Reading).unwrap();
+        set_stars(&mut v, "a", Some(5)).unwrap();
+
+        let reading = list(&v, Filter::Query("status:reading".into())).unwrap();
+        assert_eq!(reading.len(), 1);
+        assert_eq!(reading[0].citekey, "a");
+        let unread = list(&v, Filter::Query("status:unread".into())).unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].citekey, "b");
+        let top = list(&v, Filter::Query("stars:>=4".into())).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].citekey, "a");
+    }
+
+    // ----------------------------------------------------------------- analyze
+
+    #[test]
+    fn analyze_flags_offline_health_issues() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex(
+                concat!(
+                    "@article{a, title={A NICE PAPER}, journal={ICLR}}\n",
+                    "@article{b, title={Another Paper}, journal={iclr}, year={2024}, url={http://x}}\n",
+                    "@misc{c, title={A Good Title Here}, year={2023}, doi={10.1/x}}\n",
+                    // d & e share a *consistently* spelled venue — must NOT be flagged
+                    "@article{d, title={Paper Four}, journal={NeurIPS}, year={2023}, url={http://d}}\n",
+                    "@article{e, title={Paper Five}, journal={NeurIPS}, year={2023}, url={http://e}}\n",
+                )
+                .into(),
+            ),
+        )
+        .unwrap();
+        let report = analyze(&v).unwrap();
+        assert_eq!(report.total, 5);
+        let by = |id: &str| &report.checks.iter().find(|c| c.id == id).unwrap().keys;
+        assert!(by("titles").contains(&"a".to_string())); // ALL-CAPS shout
+        assert!(by("year").contains(&"a".to_string()) && !by("year").contains(&"c".to_string()));
+        assert!(by("url").contains(&"a".to_string()) && !by("url").contains(&"b".to_string()));
+        // a & b share a venue spelled two ways (ICLR / iclr) → flagged …
+        assert!(by("venues").contains(&"a".to_string()) && by("venues").contains(&"b".to_string()));
+        // … but d & e share one consistent spelling (NeurIPS) → NOT flagged.
+        assert!(
+            !by("venues").contains(&"d".to_string()) && !by("venues").contains(&"e".to_string())
+        );
+    }
+
+    // ----------------------------------------------------- structured norm diffs
+
+    #[test]
+    fn normalize_preview_includes_field_diffs() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{k, title={A  B}, abstract={x}}".into()),
+        )
+        .unwrap();
+        let changes = normalize_preview(&v).unwrap();
+        assert_eq!(changes.len(), 1);
+        let diffs = &changes[0].diffs;
+        // abstract is dropped (not on the keep-field whitelist)
+        assert!(diffs
+            .iter()
+            .any(|d| d.field == "abstract" && d.to.is_none()));
+        // title changed (whitespace tidy + capital protection)
+        assert!(diffs
+            .iter()
+            .any(|d| d.field == "title" && d.from.as_deref() == Some("A  B")));
     }
 }
