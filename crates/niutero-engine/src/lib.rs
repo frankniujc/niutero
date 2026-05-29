@@ -95,6 +95,7 @@ pub fn show(v: &Vault, citekey: &str) -> Result<EntryView, String> {
 /// or within the batch); existing entries and verbatim blocks are preserved.
 /// Returns the cite keys added.
 pub fn add(v: &Vault, source: AddSource) -> Result<Vec<String>, String> {
+    let _lock = lock_vault(v)?;
     let mut items = read_items(v)?;
     let new_entries: Vec<BibEntry> = match source {
         AddSource::Bibtex(src) => parse_entries(&src)?,
@@ -150,6 +151,7 @@ pub fn edit(
     unset: &[String],
     type_: Option<String>,
 ) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     let mut items = read_items(v)?;
     let idx = find_entry(&items, citekey)?;
     if let BibItem::Entry(e) = &mut items[idx] {
@@ -173,6 +175,7 @@ pub fn edit(
 /// Remove an entry and clean up its sidecar metadata (writing the sidecar only
 /// when something was removed).
 pub fn rm(v: &mut Vault, citekey: &str) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     let mut items = read_items(v)?;
     let idx = find_entry(&items, citekey)?;
     items.remove(idx);
@@ -203,6 +206,7 @@ pub fn set_tags(
     add: &[String],
     remove: &[String],
 ) -> Result<Vec<String>, String> {
+    let _lock = lock_vault(v)?;
     entry_exists(v, citekey)?;
     {
         let meta = v.meta.entry(citekey.to_string()).or_default();
@@ -236,6 +240,7 @@ pub fn current_note(v: &Vault, citekey: &str) -> Result<String, String> {
 
 /// Set (`Some`) or clear (`None`) an entry's note. Sidecar only.
 pub fn set_note(v: &mut Vault, citekey: &str, note: Option<String>) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     entry_exists(v, citekey)?;
     v.meta.entry(citekey.to_string()).or_default().note = note.unwrap_or_default();
     prune_meta(v, citekey);
@@ -245,6 +250,7 @@ pub fn set_note(v: &mut Vault, citekey: &str, note: Option<String>) -> Result<()
 /// Set an entry's reading status. `Unread` is the default and is stored as
 /// *absent* so `meta.json` stays minimal. Sidecar only.
 pub fn set_status(v: &mut Vault, citekey: &str, status: Status) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     entry_exists(v, citekey)?;
     let stored = (status != Status::Unread).then_some(status);
     v.meta.entry(citekey.to_string()).or_default().status = stored;
@@ -255,6 +261,7 @@ pub fn set_status(v: &mut Vault, citekey: &str, status: Status) -> Result<(), St
 /// Set (`1..=5`) or clear (`0`/`None`) an entry's star rating. Rejects ratings
 /// above 5. Sidecar only.
 pub fn set_stars(v: &mut Vault, citekey: &str, stars: Option<u8>) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     entry_exists(v, citekey)?;
     let stored = match stars {
         Some(0) | None => None,
@@ -275,6 +282,7 @@ pub fn views(v: &Vault) -> &[View] {
 
 /// Add a saved view; errors if the name is already taken.
 pub fn add_view(v: &mut Vault, name: String, query: String) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     if v.views.views.iter().any(|w| w.name == name) {
         return Err(format!("a view named '{name}' already exists"));
     }
@@ -284,6 +292,7 @@ pub fn add_view(v: &mut Vault, name: String, query: String) -> Result<(), String
 
 /// Remove a saved view by name; errors if there is no such view.
 pub fn remove_view(v: &mut Vault, name: &str) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     let before = v.views.views.len();
     v.views.views.retain(|w| w.name != name);
     if v.views.views.len() == before {
@@ -320,6 +329,7 @@ pub struct ImportReport {
 /// untouched (validation happens before the single write). Existing entries
 /// and verbatim blocks are preserved.
 pub fn import(v: &Vault, file: &Path, policy: DupPolicy) -> Result<ImportReport, String> {
+    let _lock = lock_vault(v)?;
     let src = std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
     let incoming: Vec<BibEntry> = entries(&parse(&src)).cloned().collect();
     if incoming.is_empty() {
@@ -432,6 +442,7 @@ pub enum SyncStatus {
 /// the repo's line-ending behavior so `references.bib` stays byte-identical
 /// across platforms (the source-of-truth invariant).
 pub fn connect(v: &Vault, url: &str) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
     if !git::is_repo(&v.root) {
         git::init(&v.root)?;
     }
@@ -463,6 +474,7 @@ const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
 /// merge is committed and the sync proceeds, otherwise the merge is aborted and
 /// [`SyncStatus::Conflict`] is returned (never a half-merged tree).
 pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
+    let _lock = lock_vault(v)?;
     if !git::is_repo(&v.root) {
         return Err("not a git repository — run `niutero connect <url>` first".into());
     }
@@ -694,6 +706,7 @@ pub fn rekey_preview(v: &Vault, pattern: Option<&str>) -> Result<Vec<Rekey>, Str
 /// the sidecar (tags/notes/status/stars are keyed by cite key, so they must
 /// follow the rename). Returns the changes applied (entries whose key changed).
 pub fn rekey_apply(v: &mut Vault, pattern: Option<&str>) -> Result<Vec<Rekey>, String> {
+    let _lock = lock_vault(v)?;
     let mut items = read_items(v)?;
     let changes = plan_rekey(&items, &resolve_pattern(v, pattern));
     if changes.is_empty() {
@@ -977,6 +990,7 @@ pub fn normalize_preview(v: &Vault) -> Result<Vec<NormChange>, String> {
 /// Apply offline normalization, writing the result (only if something changed).
 /// Returns the changes that were applied.
 pub fn normalize_apply(v: &Vault) -> Result<Vec<NormChange>, String> {
+    let _lock = lock_vault(v)?;
     let items = read_items(v)?;
     let cfg = NormConfig::load(&v.niutero_dir());
     let (normalized, changes) = norm_changes(&items, &cfg);
@@ -1134,6 +1148,13 @@ fn save_sidecar(v: &Vault) -> Result<(), String> {
     v.save_sidecar().map_err(|e| format!("update sidecar: {e}"))
 }
 
+/// Take the vault's exclusive lock for a mutating operation; held until the
+/// returned guard drops. Serializes concurrent `niutero` processes so a
+/// read-modify-write race can't lose an update.
+fn lock_vault(v: &Vault) -> Result<niutero_vault::VaultLock, String> {
+    v.lock().map_err(|e| format!("lock library: {e}"))
+}
+
 fn read_items(v: &Vault) -> Result<Vec<BibItem>, String> {
     v.read_items()
         .map_err(|e| format!("read references.bib: {e}"))
@@ -1229,6 +1250,21 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let v = init(d.path()).unwrap();
         (d, v)
+    }
+
+    #[test]
+    fn mutations_respect_the_vault_lock() {
+        let (_d, v) = vault();
+        // While the lock is held elsewhere, a mutating op refuses to proceed…
+        let guard = v.lock().unwrap();
+        assert!(add(&v, fields("misc", "k", &[]))
+            .unwrap_err()
+            .contains("lock library"));
+        // …and a read-only op is unaffected.
+        assert!(list(&v, Filter::All).is_ok());
+        // Once released, mutations work again.
+        drop(guard);
+        assert!(add(&v, fields("misc", "k", &[])).is_ok());
     }
 
     #[test]

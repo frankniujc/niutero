@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -248,6 +250,44 @@ impl Vault {
     pub fn write_items(&self, items: &[BibItem]) -> io::Result<()> {
         atomic_write(&self.bib_path(), &to_bibtex(items))
     }
+
+    /// Take an exclusive lock for the duration of a mutating operation, so two
+    /// `niutero` processes can't interleave read-modify-write and lose an
+    /// update. Errors with [`io::ErrorKind::WouldBlock`] if another process
+    /// already holds it. The lock file lives in the system temp dir (keyed by
+    /// the vault path), so it never enters the vault or git. Released when the
+    /// returned guard is dropped.
+    pub fn lock(&self) -> io::Result<VaultLock> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path(&self.root))?;
+        match file.try_lock() {
+            Ok(()) => Ok(VaultLock { _file: file }),
+            Err(TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another niutero process is modifying this library",
+            )),
+            Err(TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+/// An exclusive advisory lock on a vault (see [`Vault::lock`]). The lock is held
+/// until this guard is dropped.
+#[derive(Debug)]
+pub struct VaultLock {
+    _file: File,
+}
+
+/// A stable, machine-local lock-file path for a vault, in the temp dir so it is
+/// never committed/synced. Keyed by the canonicalized vault path.
+fn lock_path(root: &Path) -> PathBuf {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    std::env::temp_dir().join(format!("niutero-{:016x}.lock", hasher.finish()))
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -424,6 +464,18 @@ mod tests {
         let s = fs::read_to_string(v.bib_path()).unwrap();
         assert!(s.contains("@misc{b"));
         assert!(!s.contains("@misc{a"));
+    }
+
+    #[test]
+    fn exclusive_lock_blocks_a_second_holder() {
+        let dir = tmp();
+        let v = Vault::init(dir.path()).unwrap();
+        let guard = v.lock().expect("first lock");
+        // A second acquisition (even in-process, via a separate handle) is denied.
+        assert_eq!(v.lock().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        drop(guard);
+        // Once released, it can be re-taken.
+        assert!(v.lock().is_ok());
     }
 
     #[test]
