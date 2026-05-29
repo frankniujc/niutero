@@ -7,7 +7,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Result of a pull: a clean update or an aborted merge conflict.
+/// Result of a pull: a clean update, or a merge conflict left **in progress**
+/// (not aborted) so the caller can resolve it via the merge-stage primitives.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PullOutcome {
     Ok,
@@ -63,20 +64,48 @@ pub fn has_upstream(dir: &Path) -> bool {
     .is_ok()
 }
 
-/// `git pull` (merge). On a conflict, aborts the merge to leave a clean tree
-/// and reports [`PullOutcome::Conflict`].
+/// `git pull` (merge). On success, [`PullOutcome::Ok`]. On a merge conflict the
+/// merge is left **in progress** (not aborted) and [`PullOutcome::Conflict`] is
+/// returned, so the caller can read the [`merge_stage`]s and then either
+/// [`finalize_merge`] or [`abort_merge`]. A non-conflict failure is an `Err`.
 pub fn pull(dir: &Path) -> Result<PullOutcome, String> {
     let out = run(dir, &["pull", "--no-rebase", "--no-edit"])?;
     if out.status.success() {
-        return Ok(PullOutcome::Ok);
-    }
-    let unmerged = ok(dir, &["ls-files", "--unmerged"]).unwrap_or_default();
-    if unmerged.trim().is_empty() {
+        Ok(PullOutcome::Ok)
+    } else if conflicted_paths(dir).is_empty() {
         Err(format!("git pull: {}", stderr(&out)))
     } else {
-        let _ = run(dir, &["merge", "--abort"]);
         Ok(PullOutcome::Conflict)
     }
+}
+
+/// The distinct working-tree paths with unresolved merge conflicts.
+pub fn conflicted_paths(dir: &Path) -> Vec<String> {
+    ok(dir, &["diff", "--name-only", "--diff-filter=U"])
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Contents of `path` at a merge stage during a conflict: 1 = common ancestor
+/// (base), 2 = ours, 3 = theirs. `None` if that stage has no blob (e.g. the file
+/// was added on only one side, so it has no base stage).
+pub fn merge_stage(dir: &Path, stage: u8, path: &str) -> Option<String> {
+    ok(dir, &["show", &format!(":{stage}:{path}")]).ok()
+}
+
+/// Complete an in-progress merge: stage everything and commit with git's
+/// prepared merge message. Call after writing the resolved file(s).
+pub fn finalize_merge(dir: &Path) -> Result<(), String> {
+    ok(dir, &["add", "-A"])?;
+    ok(dir, &["commit", "--no-edit"]).map(|_| ())
+}
+
+/// Abort an in-progress merge, restoring the pre-merge working tree.
+pub fn abort_merge(dir: &Path) -> Result<(), String> {
+    ok(dir, &["merge", "--abort"]).map(|_| ())
 }
 
 /// Push the current branch to `origin`, setting upstream.

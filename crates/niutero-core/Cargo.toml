@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 indexmap = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

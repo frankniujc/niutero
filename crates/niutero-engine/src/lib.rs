@@ -420,9 +420,11 @@ pub fn cite(v: &Vault, citekey: &str) -> Result<String, String> {
 /// Outcome of a [`sync`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum SyncStatus {
-    /// Pulled and pushed cleanly; `committed` is whether local changes were committed.
-    Synced { committed: bool },
-    /// A pull conflict was hit and the merge aborted — the user must resolve it.
+    /// Pulled and pushed cleanly. `committed` = local changes were committed;
+    /// `merged` = a pull conflict was auto-resolved by a structured 3-way merge.
+    Synced { committed: bool, merged: bool },
+    /// A pull conflict could not be auto-resolved (real field conflict, or a
+    /// non-`references.bib` file conflicted); the merge was aborted.
     Conflict,
 }
 
@@ -456,8 +458,10 @@ fn ensure_repo_hygiene(v: &Vault) -> Result<(), String> {
 const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
 
 /// Commit local changes, pull, then push. Requires a git repo with an `origin`
-/// remote (set up via [`connect`]). A pull conflict aborts and returns
-/// [`SyncStatus::Conflict`] rather than leaving a half-merged tree.
+/// remote (set up via [`connect`]). On a pull conflict it attempts a structured
+/// entry-level 3-way merge of `references.bib`; if that resolves cleanly the
+/// merge is committed and the sync proceeds, otherwise the merge is aborted and
+/// [`SyncStatus::Conflict`] is returned (never a half-merged tree).
 pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
     if !git::is_repo(&v.root) {
         return Err("not a git repository — run `niutero connect <url>` first".into());
@@ -468,11 +472,94 @@ pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
     ensure_repo_hygiene(v)?;
     let message = message.unwrap_or_else(|| auto_commit_message(v));
     let committed = git::commit_all(&v.root, &message)?;
+    let mut merged = false;
     if git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict {
-        return Ok(SyncStatus::Conflict);
+        // A merge is now in progress; resolve it or leave a clean tree.
+        match try_resolve_merge(v) {
+            Ok(true) => merged = true,
+            Ok(false) => {
+                git::abort_merge(&v.root)?;
+                return Ok(SyncStatus::Conflict);
+            }
+            Err(e) => {
+                let _ = git::abort_merge(&v.root); // best effort; surface the real error
+                return Err(e);
+            }
+        }
     }
     git::push(&v.root)?;
-    Ok(SyncStatus::Synced { committed })
+    Ok(SyncStatus::Synced { committed, merged })
+}
+
+/// Try to auto-resolve an in-progress merge by 3-way merging the *entries* of
+/// `references.bib` (the structured resolver). Returns `Ok(true)` if it resolved
+/// and committed the merge, `Ok(false)` if it can't — in which case the caller
+/// aborts so the user resolves by hand.
+///
+/// It is deliberately conservative: it auto-resolves only when it can prove the
+/// result is correct, and bails (Ok(false)) otherwise. It declines when
+/// * anything other than `references.bib` conflicted (e.g. a sidecar);
+/// * the file was modify/deleted whole on a side (a stage is missing) — taking a
+///   missing stage as an empty library would silently delete the other side's
+///   entries;
+/// * the two sides disagree on the verbatim blocks (`@string`/`@preamble`/
+///   `@comment`/free text). Those aren't entry-keyed, so we only merge entries
+///   when both sides left the verbatim identical — never silently picking or
+///   duplicating a `@string`;
+/// * the entry-level 3-way merge reports any conflict.
+fn try_resolve_merge(v: &Vault) -> Result<bool, String> {
+    let conflicted = git::conflicted_paths(&v.root);
+    if conflicted.iter().any(|p| p != "references.bib") || conflicted.is_empty() {
+        return Ok(false);
+    }
+
+    // Require all three stages as real blobs. A missing stage means one side
+    // deleted the whole file (a modify/delete), which we must not auto-resolve.
+    let (Some(base_txt), Some(ours_txt), Some(theirs_txt)) = (
+        git::merge_stage(&v.root, 1, "references.bib"),
+        git::merge_stage(&v.root, 2, "references.bib"),
+        git::merge_stage(&v.root, 3, "references.bib"),
+    ) else {
+        return Ok(false);
+    };
+    let (base_items, ours_items, theirs_items) =
+        (parse(&base_txt), parse(&ours_txt), parse(&theirs_txt));
+
+    // Verbatim blocks have no cite key to merge on, so only proceed when both
+    // sides agree on them; otherwise the verbatim is itself in conflict.
+    let verbatim = |items: &[BibItem]| -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|it| match it {
+                BibItem::Verbatim(s) => Some(s.clone()),
+                BibItem::Entry(_) => None,
+            })
+            .collect()
+    };
+    let ours_verbatim = verbatim(&ours_items);
+    if ours_verbatim != verbatim(&theirs_items) {
+        return Ok(false);
+    }
+
+    let collect = |items: &[BibItem]| entries(items).cloned().collect::<Vec<BibEntry>>();
+    let result = niutero_core::merge::merge(
+        &collect(&base_items),
+        &collect(&ours_items),
+        &collect(&theirs_items),
+    );
+    if !result.is_clean() {
+        return Ok(false);
+    }
+
+    // Rebuild: the (agreed-upon) verbatim blocks, then the merged entries.
+    let mut items: Vec<BibItem> = ours_items
+        .into_iter()
+        .filter(|it| matches!(it, BibItem::Verbatim(_)))
+        .collect();
+    items.extend(result.merged.into_iter().map(BibItem::Entry));
+    write_items(v, &items)?;
+    git::finalize_merge(&v.root)?;
+    Ok(true)
 }
 
 /// A commit message describing what changed in `references.bib` since `HEAD`,
@@ -1475,7 +1562,10 @@ mod tests {
         add(&v, fields("misc", "k", &["title=Hi"])).unwrap();
         assert_eq!(
             sync(&v, None).unwrap(),
-            SyncStatus::Synced { committed: true }
+            SyncStatus::Synced {
+                committed: true,
+                merged: false
+            }
         );
 
         let dst = tempfile::tempdir().unwrap();
@@ -1508,11 +1598,173 @@ mod tests {
         git_identity(&b_path);
         let b = open(&b_path).unwrap();
 
-        // A and B change the same line differently; B's sync conflicts.
+        // A and B change the same field differently; B's sync can't auto-merge.
         edit(&a, "k", &["title=A2".into()], &[], None).unwrap();
         sync(&a, None).unwrap();
         edit(&b, "k", &["title=B2".into()], &[], None).unwrap();
         assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+        // The aborted merge leaves a clean tree, so B can keep working.
+        assert!(!niutero_sync::conflicted_paths(&b.root)
+            .iter()
+            .any(|p| p == "references.bib"));
+    }
+
+    #[test]
+    fn sync_auto_resolves_a_field_level_merge() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+
+        // A: one entry with field `a`, pushed.
+        let (_da, a) = vault();
+        connect(&a, bare).unwrap();
+        git_identity(&a.root);
+        add(&a, fields("misc", "k", &["a=1"])).unwrap();
+        sync(&a, None).unwrap();
+
+        // B clones it.
+        let dstb = tempfile::tempdir().unwrap();
+        let b_path = dstb.path().join("b");
+        git_clone(bare, &b_path);
+        git_identity(&b_path);
+        let b = open(&b_path).unwrap();
+
+        // A adds field `b`; B adds field `c` — different fields of the SAME entry.
+        // git's line merge conflicts (both insert after `a`), but the structured
+        // entry merge reconciles them.
+        edit(&a, "k", &["b=2".into()], &[], None).unwrap();
+        sync(&a, None).unwrap();
+        edit(&b, "k", &["c=3".into()], &[], None).unwrap();
+
+        assert_eq!(
+            sync(&b, None).unwrap(),
+            SyncStatus::Synced {
+                committed: true,
+                merged: true
+            }
+        );
+        // B's entry now carries all three fields, with no conflict left behind.
+        let view = show(&b, "k").unwrap();
+        assert_eq!(view.fields.get("a").map(String::as_str), Some("1"));
+        assert_eq!(view.fields.get("b").map(String::as_str), Some("2"));
+        assert_eq!(view.fields.get("c").map(String::as_str), Some("3"));
+        assert!(niutero_sync::conflicted_paths(&b.root).is_empty());
+
+        // A pulls B's merge cleanly — the libraries converge.
+        assert!(matches!(sync(&a, None).unwrap(), SyncStatus::Synced { .. }));
+        assert_eq!(show(&a, "k").unwrap().fields.len(), 3);
+    }
+
+    /// Set up a bare remote with `a`'s content pushed, and `b` a fresh clone of
+    /// it (both with a committer identity). Returns the temp dirs to keep alive.
+    fn synced_clones(
+        seed: impl FnOnce(&Vault),
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Vault,
+        tempfile::TempDir,
+        Vault,
+    ) {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]);
+        let bare = remote.path().to_str().unwrap();
+        let (da, a) = vault();
+        connect(&a, bare).unwrap();
+        git_identity(&a.root);
+        seed(&a);
+        sync(&a, None).unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let b_path = db.path().join("b");
+        git_clone(bare, &b_path);
+        git_identity(&b_path);
+        let b = open(&b_path).unwrap();
+        (remote, da, a, db, b)
+    }
+
+    #[test]
+    fn sync_aborts_on_modify_delete_instead_of_dropping_entries() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let (_r, _da, a, _db, b) = synced_clones(|a| {
+            add(a, fields("misc", "k", &["title=K"])).unwrap();
+            add(a, fields("misc", "j", &["title=J"])).unwrap();
+        });
+        // A adds a third entry; B deletes references.bib wholesale.
+        add(&a, fields("misc", "n", &["title=N"])).unwrap();
+        sync(&a, None).unwrap();
+        std::fs::remove_file(b.bib_path()).unwrap();
+
+        // The modify/delete must NOT auto-resolve (that would silently drop k/j).
+        assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn sync_aborts_when_a_string_macro_conflicts() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let base = "@string{acl = {ACL}}\n\n@misc{k,\n  title = {T}\n}\n";
+        let (_r, _da, a, _db, b) = synced_clones(|a| {
+            std::fs::write(a.bib_path(), base).unwrap();
+        });
+        // Both sides edit the SAME @string macro differently — a verbatim conflict
+        // git can't resolve; we must abort, never commit a duplicated macro.
+        std::fs::write(a.bib_path(), base.replace("{ACL}", "{Assoc CL}")).unwrap();
+        sync(&a, None).unwrap();
+        std::fs::write(b.bib_path(), base.replace("{ACL}", "{ACL Org}")).unwrap();
+        assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn sync_aborts_on_a_sidecar_conflict() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let (_r, _da, mut a, _db, b) = synced_clones(|a| {
+            add(a, fields("misc", "k", &["title=T"])).unwrap();
+        });
+        let mut b = b;
+        // Both tag the same entry differently → `.niutero/meta.json` conflicts.
+        // That's not references.bib, so the merge must abort, untouched.
+        set_tags(&mut a, "k", &["topics:ours".into()], &[]).unwrap();
+        sync(&a, None).unwrap();
+        set_tags(&mut b, "k", &["topics:theirs".into()], &[]).unwrap();
+        assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn auto_merge_preserves_a_string_blocks() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let base = "@string{acl = {ACL}}\n\n@misc{k,\n  a = {1}\n}\n";
+        let (_r, _da, a, _db, b) = synced_clones(|a| {
+            std::fs::write(a.bib_path(), base).unwrap();
+        });
+        // Disjoint field edits to `k` (a line conflict), with the @string left
+        // identical on both sides → auto-merges, and the @string must survive once.
+        edit(&a, "k", &["b=2".into()], &[], None).unwrap();
+        sync(&a, None).unwrap();
+        edit(&b, "k", &["c=3".into()], &[], None).unwrap();
+        assert_eq!(
+            sync(&b, None).unwrap(),
+            SyncStatus::Synced {
+                committed: true,
+                merged: true
+            }
+        );
+        let bib = std::fs::read_to_string(b.bib_path()).unwrap();
+        assert_eq!(bib.matches("@string{acl = {ACL}}").count(), 1, "got: {bib}");
+        // the merged file is canonical: re-parsing and re-serializing is a no-op.
+        assert_eq!(niutero_bib::to_bibtex(&parse(&bib)), bib);
+        let view = show(&b, "k").unwrap();
+        assert_eq!(view.fields.get("b").map(String::as_str), Some("2"));
+        assert_eq!(view.fields.get("c").map(String::as_str), Some("3"));
     }
 
     #[test]

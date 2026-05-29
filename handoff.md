@@ -77,10 +77,21 @@ is the explicit spec that W2's offline normalizer was ported from.
     fixes landed (NeurIPS D&B word-order, tightened SIGIR/KDD `acm .*` patterns so
     siblings aren't mislabeled, restored bare-NeurIPS end anchor, discriminating
     CVPR-vs-ICCV test).
+  - **W3c** (**committed, NOT yet pushed**): **structured 3-way merge resolver**.
+    `niutero-core::merge` (base/ours/theirs `&[BibEntry]` → merged + entry/field
+    conflicts; proptest + a model-based proptest). `niutero-sync` no longer
+    auto-aborts on conflict — `pull` leaves the merge in progress; new
+    `conflicted_paths` / `merge_stage(1/2/3)` / `finalize_merge` / `abort_merge`.
+    Engine `sync` calls `try_resolve_merge` on a pull conflict: auto-merges
+    references.bib when safe (commits the merge → `Synced { merged: true }`),
+    else aborts → `Conflict`. **Conservative** (after a 6-finding adversarial
+    review that caught two HIGH silent-data-loss bugs): bails unless all three
+    git stages exist (no whole-file modify/delete), both sides agree on the
+    verbatim/`@string` blocks, and only references.bib conflicted.
 
-- **Git**: `main` is **4 commits ahead of `origin/main`** (W3a + W3b + W-design +
-  W-norm unpushed). Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
-- **Tests**: full `cargo test --workspace` green at W-norm (208 tests); fmt +
+- **Git**: `main` is **5 commits ahead of `origin/main`** (W3a + W3b + W-design +
+  W-norm + W3c unpushed). Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
+- **Tests**: full `cargo test --workspace` green at W3c (224 tests); fmt +
   clippy (`-D warnings`) clean. Re-run the full gate before the next commit.
   Norm has an optional whole-library idempotence test: run with
   `NIUTERO_BIB_FIXTURE=/path/to/library.bib cargo test -p niutero-norm`.
@@ -90,15 +101,12 @@ is the explicit spec that W2's offline normalizer was ported from.
 Routing decision in force: **do the non-external-dependency waves first
 (W2–W4)**; external-service crates are deferred (see below).
 
-- ~~**W3b — per-entry `history` command** (#43)~~ — **DONE** (see above).
-- **W3c — 3-way entry-level merge resolver** (#44): `niutero-core::merge`
-  (base/ours/theirs → merged + conflicts, entry- and field-level), `niutero-sync`
-  reads `:1:/:2:/:3:` stages during a conflict and finalizes-or-aborts, engine
-  attempts a structured merge on pull conflict and auto-commits if clean. Cover
-  with a proptest. This is the biggest single remaining piece.
-- **W4 — medium batch**: keep-updated auto-export (#45), file locking via fs2
-  (#46), duplicate detection & merge (#47), normalize profiles + sync-strategy
-  config (#48).
+- ~~**W3b — per-entry `history` command** (#43)~~ — **DONE**.
+- ~~**W3c — 3-way entry-level merge resolver** (#44)~~ — **DONE** (see above).
+- **W4 — medium batch** (next): keep-updated auto-export (#45), file locking via
+  fs2 (#46), duplicate detection & merge (#47), normalize profiles + sync-strategy
+  config (#48). Plus small gaps: `--json` on mutating commands, top-level repo
+  `README.md`. Then the deferred external/online optional features (see below).
 
 Each wave: tests + `cargo fmt --all --check` + `cargo clippy --workspace
 --all-targets -- -D warnings` + `cargo test --workspace` all green, then commit

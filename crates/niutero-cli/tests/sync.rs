@@ -174,3 +174,80 @@ fn history_without_a_repo_errors() {
         .code(1)
         .stderr(predicate::str::contains("not a git repository"));
 }
+
+#[test]
+fn sync_auto_merges_disjoint_field_edits() {
+    if !git_available() {
+        return;
+    }
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare"]);
+    let bare = remote.path().to_str().unwrap();
+
+    // A: connect, add one entry, push.
+    let a = new_vault();
+    let id = |p: &Path| {
+        git(p, &["config", "user.email", "t@e.com"]);
+        git(p, &["config", "user.name", "T"]);
+        git(p, &["config", "commit.gpgsign", "false"]);
+    };
+    niutero()
+        .arg("connect")
+        .arg(a.path())
+        .arg(bare)
+        .assert()
+        .success();
+    id(a.path());
+    niutero()
+        .arg("add")
+        .arg(a.path())
+        .args(["--type", "misc", "--key", "k", "--field", "a=1"])
+        .assert()
+        .success();
+    niutero().arg("sync").arg(a.path()).assert().success();
+
+    // B: clone it.
+    let dst = tempfile::tempdir().unwrap();
+    let b = dst.path().join("b");
+    Proc::new("git")
+        .args(["clone", bare, b.to_str().unwrap()])
+        .output()
+        .unwrap();
+    id(&b);
+
+    // A adds field `b`; B adds field `c` to the same entry. git's line merge
+    // conflicts, but `sync` auto-resolves it with the structured entry merge.
+    niutero()
+        .arg("edit")
+        .arg(a.path())
+        .arg("k")
+        .args(["--field", "b=2"])
+        .assert()
+        .success();
+    niutero().arg("sync").arg(a.path()).assert().success();
+    niutero()
+        .arg("edit")
+        .arg(&b)
+        .arg("k")
+        .args(["--field", "c=3"])
+        .assert()
+        .success();
+    niutero()
+        .arg("sync")
+        .arg(&b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("auto-merged"));
+
+    // B's entry now has all three fields.
+    niutero()
+        .arg("show")
+        .arg(&b)
+        .arg("k")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"a\""))
+        .stdout(predicate::str::contains("\"b\""))
+        .stdout(predicate::str::contains("\"c\""));
+}

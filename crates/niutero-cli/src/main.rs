@@ -734,8 +734,10 @@ fn cmd_connect(vault: &Path, url: &str) -> Result<(), String> {
 fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
     let v = engine::open(vault)?;
     match engine::sync(&v, message)? {
-        engine::SyncStatus::Synced { committed } => {
-            let what = if committed {
+        engine::SyncStatus::Synced { committed, merged } => {
+            let what = if merged {
+                "auto-merged remote changes"
+            } else if committed {
                 "committed local changes"
             } else {
                 "nothing to commit"
@@ -745,7 +747,8 @@ fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
         }
         engine::SyncStatus::Conflict => {
             eprintln!(
-                "sync hit a merge conflict and was aborted; resolve it with git, then re-run"
+                "sync hit a merge conflict it could not auto-resolve and was aborted; \
+                 resolve it with git, then re-run"
             );
             Ok(ExitCode::from(2))
         }

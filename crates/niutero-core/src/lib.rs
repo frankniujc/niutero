@@ -9,8 +9,10 @@ pub mod citekey;
 mod entry;
 pub mod filter;
 mod library;
+pub mod merge;
 pub mod texscan;
 
 pub use citekey::KeyPattern;
 pub use entry::BibEntry;
 pub use library::Library;
+pub use merge::Merge;
