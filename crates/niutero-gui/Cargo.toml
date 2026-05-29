@@ -26,5 +26,6 @@ niutero-engine = { path = "../niutero-engine" }
 # stderr by env_logger. Tune via RUST_LOG, e.g. `RUST_LOG=niutero=debug`.
 log = "0.4"
 env_logger = "0.11"
+egui_extras = { version = "0.33.3", features = ["svg"] }
 # eframe pinned via `cargo add` to the latest release compatible with the 1.89
 # toolchain; wgpu backend for GPU rendering.

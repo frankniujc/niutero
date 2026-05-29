@@ -388,7 +388,7 @@ fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> 
         rect.left_center() + egui::vec2(26.0, 0.0),
         egui::vec2(20.0, 20.0),
     );
-    icons::paint(ui.painter(), gr, glyph, gcolor);
+    icons::paint_at(ui, gr, glyph, gcolor);
 
     let x = rect.left() + 48.0;
     let title = e
@@ -425,8 +425,8 @@ fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> 
     );
     // PDF clip on the right
     if has_pdf(e) {
-        icons::paint(
-            ui.painter(),
+        icons::paint_at(
+            ui,
             egui::Rect::from_center_size(
                 rect.right_center() - egui::vec2(20.0, 0.0),
                 egui::vec2(16.0, 16.0),
@@ -621,8 +621,12 @@ fn status_stars(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, actions: &mut V
         // stars 1..5
         let cur = e.stars.unwrap_or(0);
         for n in 1..=5u8 {
-            let col = if n <= cur { theme.amber } else { theme.faint };
-            if icon_btn_colored(ui, theme, Glyph::Star, col, false).clicked() {
+            let (glyph, col) = if n <= cur {
+                (Glyph::StarFilled, theme.amber)
+            } else {
+                (Glyph::Star, theme.faint)
+            };
+            if icon_btn_colored(ui, theme, glyph, col, false).clicked() {
                 actions.push(LibAction::SetStars(if cur == n { None } else { Some(n) }));
             }
         }
@@ -802,7 +806,7 @@ fn icon_btn_colored(
             },
         );
     }
-    icons::paint(ui.painter(), rect.shrink(8.0), glyph, color);
+    icons::paint_at(ui, rect.shrink(8.0), glyph, color);
     resp
 }
 

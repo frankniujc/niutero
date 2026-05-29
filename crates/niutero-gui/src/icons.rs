@@ -1,30 +1,14 @@
-//! Painted icons — egui has no SVG, and the three text fonts don't carry symbol
-//! glyphs (a `☾`/`⎇`/`↻` renders as tofu), so the design's simple stroke icons
-//! (`app/shared.jsx`'s `Icon` set) are reproduced here with the `egui::Painter`.
+//! Icons — the design's exact SVG stroke set (`app/shared.jsx`'s `Icon`),
+//! rendered crisply via egui_extras + resvg and tinted to the theme color.
 //!
-//! Each fn paints a 24×24-design-space icon scaled into `rect`, stroked in
-//! `color`. Keep these in step with the design's `Icon` paths.
+//! Each glyph's SVG markup uses the design's literal `d` path data with a white
+//! stroke; `tint(color)` then paints it in the right color (white × tint =
+//! tint). The image loader caches per (uri, size), so this stays cheap.
+//! `install_image_loaders` must be called once at startup.
 
-use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke, Vec2};
+use eframe::egui::{self, Color32, Rect, Vec2};
 
-/// Map a point in the design's 0..24 viewBox into `rect`.
-fn p(rect: Rect, x: f32, y: f32) -> Pos2 {
-    rect.min + Vec2::new(x / 24.0 * rect.width(), y / 24.0 * rect.height())
-}
-
-fn line(painter: &egui::Painter, rect: Rect, color: Color32, w: f32, pts: &[(f32, f32)]) {
-    let stroke = Stroke::new(w, color);
-    let pts: Vec<Pos2> = pts.iter().map(|&(x, y)| p(rect, x, y)).collect();
-    painter.add(Shape::line(pts, stroke));
-}
-
-/// Stroke width scaled to the icon size (design uses ~1.7 at 24px).
-fn sw(rect: Rect) -> f32 {
-    (rect.width() / 24.0 * 1.7).max(1.0)
-}
-
-/// Which glyph to paint. Names mirror the design's `Icon` keys. The full set is
-/// defined here; a few (drawer close, tree chevron) are first used in G3.
+/// Which glyph. Names mirror the design's `Icon` keys.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub enum Glyph {
@@ -42,6 +26,7 @@ pub enum Glyph {
     PanelLeft,
     PanelRight,
     Star,
+    StarFilled,
     Doc,
     Book,
     Attach,
@@ -51,346 +36,124 @@ pub enum Glyph {
     ChevronRight,
 }
 
-/// Paint `glyph` centered in `rect`, stroked in `color`.
-pub fn paint(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
-    let w = sw(rect);
-    let st = Stroke::new(w, color);
-    match glyph {
-        // book + tall slab + tilted spine (≈ the design's library icon)
-        Glyph::Library => {
-            painter.rect_stroke(
-                Rect::from_min_max(p(rect, 4.0, 5.0), p(rect, 9.0, 19.0)),
-                egui::CornerRadius::ZERO,
-                st,
-                egui::StrokeKind::Middle,
-            );
-            painter.rect_stroke(
-                Rect::from_min_max(p(rect, 10.0, 5.0), p(rect, 14.0, 19.0)),
-                egui::CornerRadius::ZERO,
-                st,
-                egui::StrokeKind::Middle,
-            );
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[(16.0, 6.0), (20.0, 7.0), (17.0, 19.0), (13.0, 18.0)],
-            );
-        }
-        // diagonal wand + a 4-point sparkle (auto-tidy)
-        Glyph::Normalize => {
-            line(painter, rect, color, w, &[(3.0, 21.0), (13.5, 10.5)]);
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[
-                    (16.5, 4.2),
-                    (17.5, 6.5),
-                    (19.8, 7.5),
-                    (17.5, 8.5),
-                    (16.5, 10.8),
-                    (15.5, 8.5),
-                    (13.2, 7.5),
-                    (15.5, 6.5),
-                    (16.5, 4.2),
-                ],
-            );
-        }
-        // big + small 4-point stars (AI sparkle)
-        Glyph::Ai => {
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[
-                    (12.0, 3.0),
-                    (13.6, 7.4),
-                    (18.0, 9.0),
-                    (13.6, 10.6),
-                    (12.0, 15.0),
-                    (10.4, 10.6),
-                    (6.0, 9.0),
-                    (10.4, 7.4),
-                    (12.0, 3.0),
-                ],
-            );
-            line(
-                painter,
-                rect,
-                color,
-                w * 0.8,
-                &[
-                    (18.0, 15.0),
-                    (18.8, 17.2),
-                    (21.0, 18.0),
-                    (18.8, 18.8),
-                    (18.0, 21.0),
-                    (17.2, 18.8),
-                    (15.0, 18.0),
-                    (17.2, 17.2),
-                    (18.0, 15.0),
-                ],
-            );
-        }
-        // gear: ring + 8 teeth (approximate the cog)
-        Glyph::Settings => {
-            let c = p(rect, 12.0, 12.0);
-            let r_in = rect.width() / 24.0 * 3.2;
-            let r_out = rect.width() / 24.0 * 8.2;
-            painter.circle_stroke(c, r_in, st);
-            for k in 0..8 {
-                let a = std::f32::consts::TAU * (k as f32) / 8.0;
-                let d = Vec2::new(a.cos(), a.sin());
-                painter.line_segment([c + d * (r_in * 1.5), c + d * r_out], st);
-            }
-        }
-        // two opposing curved arrows ≈ refresh/sync
-        Glyph::Sync => {
-            let c = p(rect, 12.0, 12.0);
-            let r = rect.width() / 24.0 * 7.0;
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: arc(c, r, 0.6, 4.2, 22),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: arc(
-                    c,
-                    r,
-                    0.6 + std::f32::consts::PI,
-                    4.2 + std::f32::consts::PI,
-                    22,
-                ),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-        }
-        // sun: disc + 8 rays
-        Glyph::Sun => {
-            let c = p(rect, 12.0, 12.0);
-            painter.circle_stroke(c, rect.width() / 24.0 * 4.0, st);
-            for k in 0..8 {
-                let a = std::f32::consts::TAU * (k as f32) / 8.0;
-                let d = Vec2::new(a.cos(), a.sin());
-                let r0 = rect.width() / 24.0 * 6.5;
-                let r1 = rect.width() / 24.0 * 9.0;
-                painter.line_segment([c + d * r0, c + d * r1], st);
-            }
-        }
-        // crescent moon
-        Glyph::Moon => {
-            let c = p(rect, 12.0, 12.0);
-            let r = rect.width() / 24.0 * 8.0;
-            let outer = arc(c, r, 1.9, 1.9 + std::f32::consts::PI * 1.25, 20);
-            let c2 = c + Vec2::new(rect.width() / 24.0 * 3.0, -rect.width() / 24.0 * 2.5);
-            let mut inner = arc(c2, r * 0.95, 1.9 + std::f32::consts::PI * 1.25, 1.9, 20);
-            let mut pts = outer;
-            pts.append(&mut inner);
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: pts,
-                closed: true,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-        }
-        // git branch: two nodes + a merge curve
-        Glyph::Branch => {
-            painter.circle_stroke(p(rect, 6.0, 6.0), rect.width() / 24.0 * 2.4, st);
-            painter.circle_stroke(p(rect, 6.0, 18.0), rect.width() / 24.0 * 2.4, st);
-            painter.circle_stroke(p(rect, 18.0, 8.0), rect.width() / 24.0 * 2.4, st);
-            line(painter, rect, color, w, &[(6.0, 8.4), (6.0, 15.6)]);
-            line(painter, rect, color, w, &[(18.0, 10.4), (18.0, 12.0)]);
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[(6.0, 12.0), (15.6, 12.0), (18.0, 11.0)],
-            );
-        }
-        Glyph::Search => {
-            painter.circle_stroke(p(rect, 11.0, 11.0), rect.width() / 24.0 * 7.0, st);
-            line(painter, rect, color, w, &[(20.0, 20.0), (16.5, 16.5)]);
-        }
-        Glyph::Plus => {
-            line(painter, rect, color, w, &[(12.0, 5.0), (12.0, 19.0)]);
-            line(painter, rect, color, w, &[(5.0, 12.0), (19.0, 12.0)]);
-        }
-        Glyph::Link => {
-            line(painter, rect, color, w, &[(10.0, 14.0), (14.0, 10.0)]);
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: arc(p(rect, 8.5, 15.5), rect.width() / 24.0 * 3.5, -0.8, 2.4, 14),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: arc(p(rect, 15.5, 8.5), rect.width() / 24.0 * 3.5, 2.3, 5.5, 14),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-        }
-        Glyph::PanelLeft | Glyph::PanelRight => {
-            painter.rect_stroke(
-                Rect::from_min_max(p(rect, 3.0, 4.0), p(rect, 21.0, 20.0)),
-                egui::CornerRadius::same(2),
-                st,
-                egui::StrokeKind::Middle,
-            );
-            let x = if matches!(glyph, Glyph::PanelLeft) {
-                9.0
-            } else {
-                15.0
-            };
-            line(painter, rect, color, w * 0.9, &[(x, 4.0), (x, 20.0)]);
-        }
-        Glyph::Star => {
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[
-                    (12.0, 4.0),
-                    (14.3, 8.8),
-                    (19.5, 9.5),
-                    (15.7, 13.1),
-                    (16.6, 18.3),
-                    (12.0, 16.6),
-                    (7.4, 18.3),
-                    (8.3, 13.1),
-                    (4.5, 9.5),
-                    (9.7, 8.8),
-                    (12.0, 4.0),
-                ],
-            );
-        }
-        Glyph::Doc => {
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[
-                    (6.0, 3.0),
-                    (14.0, 3.0),
-                    (18.0, 7.0),
-                    (18.0, 21.0),
-                    (6.0, 21.0),
-                    (6.0, 3.0),
-                ],
-            );
-            line(
-                painter,
-                rect,
-                color,
-                w * 0.8,
-                &[(14.0, 3.0), (14.0, 7.0), (18.0, 7.0)],
-            );
-        }
-        Glyph::Book => {
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[(4.0, 5.0), (12.0, 5.0), (12.0, 19.0), (6.0, 19.0)],
-            );
-            line(painter, rect, color, w, &[(20.0, 5.0), (12.0, 5.0)]);
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[(20.0, 5.0), (20.0, 19.0), (12.0, 19.0)],
-            );
-        }
-        Glyph::Attach => {
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: vec![p(rect, 18.0, 8.0), p(rect, 9.0, 17.0)],
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-            line(painter, rect, color, w, &[(18.0, 8.0), (11.0, 15.0)]);
-            painter.add(Shape::Path(egui::epaint::PathShape {
-                points: arc(p(rect, 12.0, 12.0), rect.width() / 24.0 * 6.0, 2.0, 5.6, 16),
-                closed: false,
-                fill: Color32::TRANSPARENT,
-                stroke: st.into(),
-            }));
-        }
-        Glyph::Lock | Glyph::Unlock => {
-            painter.rect_stroke(
-                Rect::from_min_max(p(rect, 5.0, 11.0), p(rect, 19.0, 20.0)),
-                egui::CornerRadius::same(2),
-                st,
-                egui::StrokeKind::Middle,
-            );
-            if matches!(glyph, Glyph::Lock) {
-                painter.add(Shape::Path(egui::epaint::PathShape {
-                    points: arc(
-                        p(rect, 12.0, 11.0),
-                        rect.width() / 24.0 * 4.0,
-                        std::f32::consts::PI,
-                        std::f32::consts::TAU,
-                        12,
-                    ),
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: st.into(),
-                }));
-            } else {
-                painter.add(Shape::Path(egui::epaint::PathShape {
-                    points: arc(
-                        p(rect, 12.0, 11.0),
-                        rect.width() / 24.0 * 4.0,
-                        std::f32::consts::PI,
-                        std::f32::consts::PI * 1.6,
-                        10,
-                    ),
-                    closed: false,
-                    fill: Color32::TRANSPARENT,
-                    stroke: st.into(),
-                }));
-            }
-        }
-        Glyph::Close => {
-            line(painter, rect, color, w, &[(6.0, 6.0), (18.0, 18.0)]);
-            line(painter, rect, color, w, &[(18.0, 6.0), (6.0, 18.0)]);
-        }
-        Glyph::ChevronRight => {
-            line(
-                painter,
-                rect,
-                color,
-                w,
-                &[(9.0, 6.0), (15.0, 12.0), (9.0, 18.0)],
-            );
-        }
+// Wrap design `d`/element markup into a full SVG with a white stroke (round
+// caps/joins, 1.7px — the design's defaults). `concat!` keeps these `&'static`.
+macro_rules! svg {
+    ($($inner:literal),+ $(,)?) => {
+        concat!(
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' ",
+            "stroke='#ffffff' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>",
+            $($inner),+,
+            "</svg>"
+        )
+    };
+}
+
+const LIBRARY: &str = svg!("<path d='M4 5h5v14H4zM10 5h4v14h-4zM16 6l4 1-3 12-4-1z'/>");
+const NORMALIZE: &str = svg!(
+    "<path d='M3 21l10.5-10.5'/>",
+    "<path d='M16.5 4.2L17.5 6.5L19.8 7.5L17.5 8.5L16.5 10.8L15.5 8.5L13.2 7.5L15.5 6.5Z'/>",
+    "<path d='M6.4 4.5v2.2M5.3 5.6h2.2' stroke-width='1.3'/>",
+);
+const AI: &str = svg!(
+    "<path d='M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6z'/>",
+    "<path d='M18 15l.8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8z' stroke-width='1.3'/>",
+);
+const SETTINGS: &str = svg!(
+    "<circle cx='12' cy='12' r='3'/>",
+    "<path d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'/>",
+);
+const SYNC: &str =
+    svg!("<path d='M4 11a8 8 0 0 1 14-4.5L20 8M20 13a8 8 0 0 1-14 4.5L4 16M20 4v4h-4M4 20v-4h4'/>");
+const SUN: &str = svg!(
+    "<circle cx='12' cy='12' r='4'/>",
+    "<path d='M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19'/>",
+);
+const MOON: &str = svg!("<path d='M20 14.5A8 8 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z'/>");
+const BRANCH: &str = svg!(
+    "<circle cx='6' cy='6' r='2.4'/><circle cx='6' cy='18' r='2.4'/><circle cx='18' cy='8' r='2.4'/>",
+    "<path d='M6 8.4v7.2M18 10.4c0 3-3 3.6-6 3.6'/>",
+);
+const SEARCH: &str = svg!("<circle cx='11' cy='11' r='7'/><path d='M20 20l-3.5-3.5'/>");
+const PLUS: &str = svg!("<path d='M12 5v14M5 12h14'/>");
+const LINK: &str = svg!(
+    "<path d='M10 14a4 4 0 0 0 6 .4l2-2a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-6-.4l-2 2a4 4 0 0 0 5.7 5.7l1-1'/>",
+);
+const PANEL_LEFT: &str =
+    svg!("<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M9 4v16' stroke-width='1.5'/>");
+const PANEL_RIGHT: &str = svg!(
+    "<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M15 4v16' stroke-width='1.5'/>"
+);
+const STAR: &str =
+    svg!("<path d='M12 4l2.3 4.8 5.2.7-3.8 3.6.9 5.2L12 16.6 7.4 18.3l.9-5.2L4.5 9.5l5.2-.7z'/>");
+// Filled star (rating "on"): same outline but filled.
+const STAR_FILLED: &str = concat!(
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='#ffffff' stroke='#ffffff' ",
+    "stroke-width='1.0' stroke-linejoin='round'>",
+    "<path d='M12 4l2.3 4.8 5.2.7-3.8 3.6.9 5.2L12 16.6 7.4 18.3l.9-5.2L4.5 9.5l5.2-.7z'/>",
+    "</svg>"
+);
+const DOC: &str = svg!(
+    "<path d='M6 3h8l4 4v14H6z'/>",
+    "<path d='M14 3v4h4M9 13h6M9 17h6' stroke-width='1.3'/>"
+);
+const BOOK: &str = svg!(
+    "<path d='M4 5a2 2 0 0 1 2-2h6v16H6a2 2 0 0 0-2 2zM20 5a2 2 0 0 0-2-2h-6v16h6a2 2 0 0 1 2 2z'/>",
+);
+const ATTACH: &str = svg!(
+    "<path d='M21 9.5l-8.5 8.5a4 4 0 0 1-5.7-5.7l8.5-8.5a2.7 2.7 0 0 1 3.8 3.8l-8.5 8.5a1.3 1.3 0 0 1-1.9-1.9l7.8-7.8'/>",
+);
+const LOCK: &str =
+    svg!("<rect x='5' y='11' width='14' height='9' rx='2'/><path d='M8 11V8a4 4 0 0 1 8 0v3'/>");
+const UNLOCK: &str =
+    svg!("<rect x='5' y='11' width='14' height='9' rx='2'/><path d='M8 11V8a4 4 0 0 1 7.5-2'/>");
+const CLOSE: &str = svg!("<path d='M6 6l12 12M18 6L6 18'/>");
+const CHEVRON_RIGHT: &str = svg!("<path d='M9 6l6 6-6 6'/>");
+
+/// (stable cache uri, SVG markup) for a glyph.
+fn source(g: Glyph) -> (&'static str, &'static str) {
+    match g {
+        Glyph::Library => ("bytes://niu-library.svg", LIBRARY),
+        Glyph::Normalize => ("bytes://niu-normalize.svg", NORMALIZE),
+        Glyph::Ai => ("bytes://niu-ai.svg", AI),
+        Glyph::Settings => ("bytes://niu-settings.svg", SETTINGS),
+        Glyph::Sync => ("bytes://niu-sync.svg", SYNC),
+        Glyph::Sun => ("bytes://niu-sun.svg", SUN),
+        Glyph::Moon => ("bytes://niu-moon.svg", MOON),
+        Glyph::Branch => ("bytes://niu-branch.svg", BRANCH),
+        Glyph::Search => ("bytes://niu-search.svg", SEARCH),
+        Glyph::Plus => ("bytes://niu-plus.svg", PLUS),
+        Glyph::Link => ("bytes://niu-link.svg", LINK),
+        Glyph::PanelLeft => ("bytes://niu-panel-left.svg", PANEL_LEFT),
+        Glyph::PanelRight => ("bytes://niu-panel-right.svg", PANEL_RIGHT),
+        Glyph::Star => ("bytes://niu-star.svg", STAR),
+        Glyph::StarFilled => ("bytes://niu-star-filled.svg", STAR_FILLED),
+        Glyph::Doc => ("bytes://niu-doc.svg", DOC),
+        Glyph::Book => ("bytes://niu-book.svg", BOOK),
+        Glyph::Attach => ("bytes://niu-attach.svg", ATTACH),
+        Glyph::Lock => ("bytes://niu-lock.svg", LOCK),
+        Glyph::Unlock => ("bytes://niu-unlock.svg", UNLOCK),
+        Glyph::Close => ("bytes://niu-close.svg", CLOSE),
+        Glyph::ChevronRight => ("bytes://niu-chevron-right.svg", CHEVRON_RIGHT),
     }
 }
 
-/// Polyline approximating a circular arc from `a0` to `a1` radians.
-fn arc(center: Pos2, radius: f32, a0: f32, a1: f32, segs: usize) -> Vec<Pos2> {
-    (0..=segs)
-        .map(|i| {
-            let t = a0 + (a1 - a0) * (i as f32) / (segs as f32);
-            center + Vec2::new(t.cos() * radius, t.sin() * radius)
-        })
-        .collect()
+/// An `Image` for `glyph`, tinted to `color` (the white SVG × tint = color).
+pub fn image(glyph: Glyph, color: Color32) -> egui::Image<'static> {
+    let (uri, markup) = source(glyph);
+    egui::Image::new(egui::ImageSource::Bytes {
+        uri: uri.into(),
+        bytes: markup.as_bytes().into(),
+    })
+    .tint(color)
 }
 
-/// Allocate a `size`×`size` cell and paint `glyph` in it (no interaction).
+/// Add a `size`×`size` icon inline (returns its `Response`).
 pub fn show(ui: &mut egui::Ui, glyph: Glyph, size: f32, color: Color32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-    paint(ui.painter(), rect.shrink(size * 0.08), glyph, color);
-    resp
+    ui.add(image(glyph, color).fit_to_exact_size(Vec2::splat(size)))
+}
+
+/// Paint a glyph into an explicit `rect` (for hand-laid rows/buttons).
+pub fn paint_at(ui: &egui::Ui, rect: Rect, glyph: Glyph, color: Color32) {
+    image(glyph, color).paint_at(ui, rect);
 }

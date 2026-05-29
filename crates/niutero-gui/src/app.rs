@@ -81,6 +81,8 @@ impl NiuteroApp {
         // families: `set_fonts` only takes effect on the *next* frame, so doing
         // it here (not in `update`) avoids a "family not bound" panic on frame 1.
         theme::install_fonts(&cc.egui_ctx);
+        // Enable the SVG image loader (egui_extras + resvg) for the icon set.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // Boot a library: an explicit path arg wins, else the most-recently
         // opened vault from the machine-local registry.
@@ -523,7 +525,7 @@ fn rail_button(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph, on: bool) -> egui
             .rect_filled(m, egui::CornerRadius::same(2), theme.accent);
     }
     let color = if on { theme.accent } else { theme.muted };
-    icons::paint(ui.painter(), rect.shrink(10.0), glyph, color);
+    icons::paint_at(ui, rect.shrink(10.0), glyph, color);
     resp
 }
 
@@ -534,7 +536,7 @@ fn icbtn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(8), theme.surface_2);
     }
-    icons::paint(ui.painter(), rect.shrink(8.0), glyph, theme.muted);
+    icons::paint_at(ui, rect.shrink(8.0), glyph, theme.muted);
     resp
 }
 
