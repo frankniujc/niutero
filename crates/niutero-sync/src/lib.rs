@@ -84,6 +84,18 @@ pub fn push(dir: &Path) -> Result<(), String> {
     ok(dir, &["push", "-u", "origin", "HEAD"]).map(|_| ())
 }
 
+/// Set a *local* (repo-scoped) git config value. Never touches global config.
+pub fn set_config(dir: &Path, key: &str, value: &str) -> Result<(), String> {
+    ok(dir, &["config", "--local", key, value]).map(|_| ())
+}
+
+/// Contents of `path` as of the current `HEAD` commit, or `None` if there is no
+/// `HEAD` (no commits yet) or the file isn't tracked there. Used to diff the
+/// working tree against the last commit for stats-aware commit messages.
+pub fn file_at_head(dir: &Path, path: &str) -> Option<String> {
+    ok(dir, &["show", &format!("HEAD:{path}")]).ok()
+}
+
 // ----------------------------------------------------------------- helpers
 
 fn run(dir: &Path, args: &[&str]) -> Result<Output, String> {

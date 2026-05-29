@@ -407,13 +407,34 @@ pub enum SyncStatus {
     Conflict,
 }
 
-/// Initialize git in the vault (if needed) and point `origin` at `url`.
+/// Initialize git in the vault (if needed), point `origin` at `url`, and pin
+/// the repo's line-ending behavior so `references.bib` stays byte-identical
+/// across platforms (the source-of-truth invariant).
 pub fn connect(v: &Vault, url: &str) -> Result<(), String> {
     if !git::is_repo(&v.root) {
         git::init(&v.root)?;
     }
-    git::set_remote(&v.root, "origin", url)
+    git::set_remote(&v.root, "origin", url)?;
+    ensure_repo_hygiene(v)
 }
+
+/// What every niutero repo needs to keep the `.bib` byte-stable: a
+/// `.gitattributes` forcing LF, and `core.autocrlf=false` locally. Idempotent
+/// and safe to call on every sync.
+fn ensure_repo_hygiene(v: &Vault) -> Result<(), String> {
+    let path = v.root.join(".gitattributes");
+    if !path.exists() {
+        std::fs::write(path, GITATTRIBUTES).map_err(|e| format!("write .gitattributes: {e}"))?;
+    }
+    // gitattributes is the real guarantee; autocrlf is belt-and-suspenders, so
+    // don't fail the whole operation if this one config write hiccups.
+    let _ = git::set_config(&v.root, "core.autocrlf", "false");
+    Ok(())
+}
+
+/// `references.bib` (and everything else) is committed with LF endings on every
+/// platform, so the source of truth never churns on a Windows checkout.
+const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
 
 /// Commit local changes, pull, then push. Requires a git repo with an `origin`
 /// remote (set up via [`connect`]). A pull conflict aborts and returns
@@ -425,13 +446,69 @@ pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
     if git::remote_url(&v.root, "origin").is_none() {
         return Err("no 'origin' remote — run `niutero connect <url>` first".into());
     }
-    let message = message.unwrap_or_else(|| "niutero: sync".to_string());
+    ensure_repo_hygiene(v)?;
+    let message = message.unwrap_or_else(|| auto_commit_message(v));
     let committed = git::commit_all(&v.root, &message)?;
     if git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict {
         return Ok(SyncStatus::Conflict);
     }
     git::push(&v.root)?;
     Ok(SyncStatus::Synced { committed })
+}
+
+/// A commit message describing what changed in `references.bib` since `HEAD`,
+/// at the granularity of entries (e.g. `niutero: 3 added, 1 changed`).
+fn auto_commit_message(v: &Vault) -> String {
+    let working = std::fs::read_to_string(v.bib_path()).unwrap_or_default();
+    match git::file_at_head(&v.root, "references.bib") {
+        None => "niutero: initial import".to_string(),
+        Some(head) => entry_diff(&head, &working).message(),
+    }
+}
+
+/// Entry-level delta between two `.bib` texts (by cite key + content equality).
+struct EntryDiff {
+    added: usize,
+    changed: usize,
+    removed: usize,
+}
+
+impl EntryDiff {
+    fn message(&self) -> String {
+        let mut parts = Vec::new();
+        if self.added > 0 {
+            parts.push(format!("{} added", self.added));
+        }
+        if self.changed > 0 {
+            parts.push(format!("{} changed", self.changed));
+        }
+        if self.removed > 0 {
+            parts.push(format!("{} removed", self.removed));
+        }
+        if parts.is_empty() {
+            // entries unchanged — only sidecar (tags/notes) or formatting moved
+            "niutero: update metadata".to_string()
+        } else {
+            format!("niutero: {}", parts.join(", "))
+        }
+    }
+}
+
+fn entry_diff(old: &str, new: &str) -> EntryDiff {
+    fn by_key(s: &str) -> std::collections::HashMap<String, BibEntry> {
+        entries(&parse(s))
+            .map(|e| (e.citekey.clone(), e.clone()))
+            .collect()
+    }
+    let (o, n) = (by_key(old), by_key(new));
+    EntryDiff {
+        added: n.keys().filter(|k| !o.contains_key(*k)).count(),
+        removed: o.keys().filter(|k| !n.contains_key(*k)).count(),
+        changed: n
+            .iter()
+            .filter(|(k, v)| o.get(*k).is_some_and(|ov| ov != *v))
+            .count(),
+    }
 }
 
 // -------------------------------------------------------------- normalize
@@ -977,6 +1054,33 @@ mod tests {
         sync(&a, None).unwrap();
         edit(&b, "k", &["title=B2".into()], &[], None).unwrap();
         assert_eq!(sync(&b, None).unwrap(), SyncStatus::Conflict);
+    }
+
+    #[test]
+    fn entry_diff_counts_add_change_remove() {
+        let old = "@misc{a, title={A}}\n@misc{b, title={B}}\n";
+        let new = "@misc{a, title={A2}}\n@misc{c, title={C}}\n"; // a changed, b gone, c new
+        let d = entry_diff(old, new);
+        assert_eq!((d.added, d.changed, d.removed), (1, 1, 1));
+        assert_eq!(d.message(), "niutero: 1 added, 1 changed, 1 removed");
+    }
+
+    #[test]
+    fn entry_diff_message_when_only_metadata_moved() {
+        let same = "@misc{a, title={A}}\n";
+        assert_eq!(entry_diff(same, same).message(), "niutero: update metadata");
+    }
+
+    #[test]
+    fn connect_writes_gitattributes_and_pins_endings() {
+        if !niutero_sync::git_available() {
+            return;
+        }
+        let (_d, v) = vault();
+        connect(&v, "https://example.com/r.git").unwrap();
+        let ga = std::fs::read_to_string(v.root.join(".gitattributes")).unwrap();
+        assert!(ga.contains("eol=lf"), "got: {ga}");
+        assert!(niutero_sync::is_repo(&v.root));
     }
 
     #[test]
