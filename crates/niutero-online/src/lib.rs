@@ -32,6 +32,12 @@ pub fn fetch_doi_bibtex(doi: &str) -> Result<String, String> {
     Ok(body)
 }
 
+/// Download `url` to `dest` (following redirects). Needs network access.
+pub fn fetch_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let dest = dest.to_str().ok_or("destination path is not valid UTF-8")?;
+    ok(&["-fsSL", "--max-time", "120", "-o", dest, url]).map(|_| ())
+}
+
 /// Normalize a DOI — a bare DOI, a `doi:`-prefixed one, or a doi.org URL — to a
 /// canonical `https://doi.org/<doi>` URL. A non-doi.org `http(s)` URL is kept
 /// as-is (so a direct BibTeX URL also works).

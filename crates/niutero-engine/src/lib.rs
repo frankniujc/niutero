@@ -474,6 +474,87 @@ pub fn capture(v: &Vault, bibtex: &str) -> Result<ImportReport, String> {
     merge_incoming(v, incoming, DupPolicy::Skip)
 }
 
+// ------------------------------------------------------------------- PDFs
+
+/// Where an entry's attached PDF lives: `<vault>/pdfs/<key>.pdf` (the key
+/// sanitized to a filesystem-safe stem). The binary stays out of the `.bib` and
+/// `pdfs/` is git-ignored, so it never enters the source of truth.
+pub fn pdf_path(v: &Vault, citekey: &str) -> PathBuf {
+    v.root
+        .join("pdfs")
+        .join(format!("{}.pdf", pdf_stem(citekey)))
+}
+
+/// Attach an existing PDF file to an entry by copying it into `<vault>/pdfs/`.
+/// The entry must exist; `pdfs/` is created and git-ignored.
+pub fn attach_pdf(v: &Vault, citekey: &str, src: &Path) -> Result<PathBuf, String> {
+    let _lock = lock_vault(v)?;
+    entry_exists(v, citekey)?;
+    let dest = prepare_pdf_dir(v, citekey)?;
+    std::fs::copy(src, &dest).map_err(|e| format!("copy {}: {e}", src.display()))?;
+    Ok(dest)
+}
+
+/// **Online.** Download an entry's PDF from its `url` field into `<vault>/pdfs/`.
+pub fn fetch_pdf(v: &Vault, citekey: &str) -> Result<PathBuf, String> {
+    let _lock = lock_vault(v)?;
+    let view = show(v, citekey)?; // errors if the entry is absent
+    let url = view
+        .fields
+        .get("url")
+        .map(String::as_str)
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| format!("'{citekey}' has no url to fetch a PDF from"))?
+        .to_string();
+    let dest = prepare_pdf_dir(v, citekey)?;
+    niutero_online::fetch_to_file(&url, &dest)?;
+    Ok(dest)
+}
+
+/// Create `pdfs/`, ensure it's git-ignored, and return the entry's PDF path.
+fn prepare_pdf_dir(v: &Vault, citekey: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(v.root.join("pdfs")).map_err(|e| format!("create pdfs/: {e}"))?;
+    ensure_pdfs_gitignored(v)?;
+    Ok(pdf_path(v, citekey))
+}
+
+/// A filesystem-safe stem for a cite key (cite keys may contain `:` or `/`,
+/// which are unsafe in file names): keep `[A-Za-z0-9._-]`, replace the rest with
+/// `_`, and never let it be empty or a `.`/`..` traversal.
+fn pdf_stem(citekey: &str) -> String {
+    let stem: String = citekey
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if stem.is_empty() || stem.trim_matches('.').is_empty() {
+        "ref".to_string()
+    } else {
+        stem
+    }
+}
+
+/// Ensure the vault's `.gitignore` excludes `pdfs/` (append the line if absent),
+/// so attached binaries are never committed.
+fn ensure_pdfs_gitignored(v: &Vault) -> Result<(), String> {
+    let path = v.root.join(".gitignore");
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    if current.lines().any(|l| l.trim() == "pdfs/") {
+        return Ok(());
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str("pdfs/\n");
+    std::fs::write(&path, next).map_err(|e| format!("write .gitignore: {e}"))
+}
+
 /// Write the entries matching `filter` to a standalone `.bib` at `out`.
 /// Returns the number of entries written.
 pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
@@ -2557,6 +2638,47 @@ mod tests {
         assert!(
             !by("venues").contains(&"d".to_string()) && !by("venues").contains(&"e".to_string())
         );
+    }
+
+    // ----------------------------------------------------------------- PDFs
+
+    #[test]
+    fn pdf_stem_is_filesystem_safe() {
+        assert_eq!(pdf_stem("vaswani2017"), "vaswani2017");
+        assert_eq!(pdf_stem("niu:2025"), "niu_2025"); // ':' is unsafe on Windows
+                                                      // path separators are neutralized (no traversal), dots kept but never bare
+        assert_eq!(pdf_stem("../evil"), ".._evil");
+        assert_eq!(pdf_stem("a/b"), "a_b");
+        assert_eq!(pdf_stem(".."), "ref"); // never a bare dot-dir
+        assert!(!pdf_stem("../../x").contains('/'));
+    }
+
+    #[test]
+    fn attach_pdf_copies_into_pdfs_and_gitignores_it() {
+        let (d, v) = vault();
+        add(&v, fields("article", "k", &["title=T"])).unwrap();
+        let src = d.path().join("paper.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        let dest = attach_pdf(&v, "k", &src).unwrap();
+        assert_eq!(dest, v.root.join("pdfs").join("k.pdf"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"%PDF-1.4 fake");
+        // pdfs/ is git-ignored so the binary never enters the .bib repo
+        let gi = std::fs::read_to_string(v.root.join(".gitignore")).unwrap();
+        assert!(gi.lines().any(|l| l.trim() == "pdfs/"), "got: {gi}");
+        // attaching to a missing entry errors
+        assert!(attach_pdf(&v, "ghost", &src)
+            .unwrap_err()
+            .contains("no entry with cite key 'ghost'"));
+    }
+
+    #[test]
+    fn fetch_pdf_without_a_url_errors_before_the_network() {
+        let (_d, v) = vault();
+        add(&v, fields("article", "k", &["title=T"])).unwrap(); // no url
+        assert!(fetch_pdf(&v, "k")
+            .unwrap_err()
+            .contains("no url to fetch a PDF from"));
     }
 
     // -------------------------------------------------- online enrich (pure parts)

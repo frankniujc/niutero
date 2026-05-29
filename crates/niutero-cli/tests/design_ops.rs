@@ -313,3 +313,37 @@ fn import_requires_a_file_or_doi() {
         .failure()
         .stderr(predicate::str::contains("specify a .bib file or --doi"));
 }
+
+#[test]
+fn pdf_attach_then_show_path() {
+    let d = new_vault();
+    fs::write(
+        d.path().join("references.bib"),
+        "@misc{k,\n  title = {T}\n}\n",
+    )
+    .unwrap();
+    let pdf = d.path().join("paper.pdf");
+    fs::write(&pdf, b"%PDF-1.4").unwrap();
+
+    niutero()
+        .arg("pdf")
+        .arg(d.path())
+        .arg("k")
+        .args(["--attach", pdf.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Attached"));
+    assert!(d.path().join("pdfs").join("k.pdf").exists());
+    // pdfs/ is git-ignored; references.bib untouched
+    assert!(fs::read_to_string(d.path().join(".gitignore"))
+        .unwrap()
+        .contains("pdfs/"));
+
+    niutero()
+        .arg("pdf")
+        .arg(d.path())
+        .arg("k")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("present"));
+}

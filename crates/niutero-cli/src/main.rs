@@ -288,6 +288,21 @@ enum Cmd {
         #[arg(long, default_value_t = 23510)]
         port: u16,
     },
+    /// Manage an entry's attached PDF: show its path, --attach a file, or
+    /// --fetch it from the entry's url (online). Binaries live in `pdfs/`
+    /// (git-ignored), never in the .bib.
+    Pdf {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+        /// Copy this PDF file in and attach it to the entry.
+        #[arg(long)]
+        attach: Option<PathBuf>,
+        /// Online: download the PDF from the entry's url.
+        #[arg(long)]
+        fetch: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -448,6 +463,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
         Cmd::Enrich { vault, citekey } => cmd_enrich(&vault, &citekey).map(ok),
         Cmd::Connector { vault, port } => cmd_connector(&vault, port).map(ok),
+        Cmd::Pdf {
+            vault,
+            citekey,
+            attach,
+            fetch,
+        } => cmd_pdf(&vault, &citekey, attach, fetch).map(ok),
     }
 }
 
@@ -724,6 +745,34 @@ fn cmd_connector(vault: &Path, port: u16) -> Result<(), String> {
     let v = engine::open(vault)?;
     println!("Browser connector listening on http://127.0.0.1:{port}  (POST BibTeX to /capture; Ctrl-C to stop)");
     engine::serve_connector(&v, port)
+}
+
+fn cmd_pdf(
+    vault: &Path,
+    citekey: &str,
+    attach: Option<PathBuf>,
+    fetch: bool,
+) -> Result<(), String> {
+    if attach.is_some() && fetch {
+        return Err("use either --attach or --fetch, not both".into());
+    }
+    let v = engine::open(vault)?;
+    if let Some(src) = attach {
+        let dest = engine::attach_pdf(&v, citekey, &src)?;
+        println!("Attached {} -> {}", src.display(), dest.display());
+    } else if fetch {
+        let dest = engine::fetch_pdf(&v, citekey)?;
+        println!("Downloaded PDF -> {}", dest.display());
+    } else {
+        let path = engine::pdf_path(&v, citekey);
+        let status = if path.exists() {
+            "present"
+        } else {
+            "not attached"
+        };
+        println!("{} ({status})", path.display());
+    }
+    Ok(())
 }
 
 fn cmd_export(
