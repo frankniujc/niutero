@@ -9,3 +9,7 @@ niutero-core = { path = "../niutero-core" }
 serde = { workspace = true }
 toml = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+# Parse real `.bib` text in the integration tests (no cycle: bib doesn't use norm).
+niutero-bib = { path = "../niutero-bib" }

@@ -63,11 +63,27 @@ is the explicit spec that W2's offline normalizer was ported from.
     fixes landed (rekey idempotence on disambiguated keys, preview validates like
     `--write`, sidecar-write rollback, `is_empty` folds defaults, `is_odd_title`
     spares acronyms, stale-meta comment, help text).
+  - **W-norm** (**committed, NOT yet pushed**): **default AI/ML venue-canonicalization
+    ruleset** for `niutero-norm`. New `canonicalize_venues` config (default on)
+    collapses every ordinal/year/"Proceedings of the …" variant of a recognized
+    conference/journal to one canonical `Full Name (ACRONYM)` string (unified
+    `CONFERENCE_RULES` → `CANONICAL_VENUE` tables; ACL-anthology id authoritative;
+    bare acronym + "Proc. of X" handled). Covers the major ML/NLP/CV/IR venues;
+    non-AI venues left alone. Each canonical is a fixed point (guarded by a unit
+    test over the whole table) so it stays idempotent. Tested against the real
+    `~/Desktop/all.bib` (1153 entries, idempotent; 305→164 distinct booktitles)
+    via the optional `NIUTERO_BIB_FIXTURE` env-var test, plus Google-Scholar-style
+    messy fixtures. Reviewed by a 3-lens adversarial workflow (5 findings);
+    fixes landed (NeurIPS D&B word-order, tightened SIGIR/KDD `acm .*` patterns so
+    siblings aren't mislabeled, restored bare-NeurIPS end anchor, discriminating
+    CVPR-vs-ICCV test).
 
-- **Git**: `main` is **3 commits ahead of `origin/main`** (W3a + W3b + W-design
-  unpushed). Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
-- **Tests**: full `cargo test --workspace` green at W-design (197 tests); fmt +
+- **Git**: `main` is **4 commits ahead of `origin/main`** (W3a + W3b + W-design +
+  W-norm unpushed). Working tree clean. Remote: `git@github.com:frankniujc/niutero_2.git`.
+- **Tests**: full `cargo test --workspace` green at W-norm (208 tests); fmt +
   clippy (`-D warnings`) clean. Re-run the full gate before the next commit.
+  Norm has an optional whole-library idempotence test: run with
+  `NIUTERO_BIB_FIXTURE=/path/to/library.bib cargo test -p niutero-norm`.
 
 ## Remaining work (tracked as tasks #43–#48)
 

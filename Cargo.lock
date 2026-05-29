@@ -403,6 +403,7 @@ dependencies = [
 name = "niutero-norm"
 version = "0.1.0"
 dependencies = [
+ "niutero-bib",
  "niutero-core",
  "regex",
  "serde",
