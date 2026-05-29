@@ -8,7 +8,17 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn niutero() -> Command {
+    isolate_registry();
     Command::cargo_bin("niutero").expect("binary built")
+}
+
+/// Point the machine-local registry at a per-binary temp file (inherited by the
+/// spawned process) so tests never touch — or race on — the real machine one.
+fn isolate_registry() {
+    use std::sync::OnceLock;
+    static REG: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = REG.get_or_init(|| tempfile::tempdir().expect("registry tempdir"));
+    std::env::set_var("NIUTERO_REGISTRY", dir.path().join("vaults.toml"));
 }
 
 fn vault_with(contents: &str) -> TempDir {
@@ -100,6 +110,30 @@ fn json_shape() {
     assert_eq!(v["used"], serde_json::json!(["a"]));
     assert_eq!(v["missing"], serde_json::json!(["z"]));
     assert_eq!(v["unused"], serde_json::json!(["b"]));
+}
+
+#[test]
+fn out_with_json_keeps_stdout_pure_json() {
+    // --out prints a "Wrote N cited..." notice; with --json it must go to stderr
+    // so a machine consumer can parse the whole of stdout as one JSON value.
+    let d = vault_with("@article{a, title={Apple}}\n@misc{b, title={Banana}}\n");
+    let tex = write_tex(&d, "p.tex", r"\cite{a}");
+    let out = d.path().join("pruned.bib");
+    let assert = niutero()
+        .arg("tex-scan")
+        .arg(d.path())
+        .arg(&tex)
+        .arg("--out")
+        .arg(&out)
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // The entire stdout parses as a single JSON value (no trailing "Wrote ..." line).
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["used"], serde_json::json!(["a"]));
+    // The pruned file was still written.
+    assert!(fs::read_to_string(&out).unwrap().contains("@article{a,"));
 }
 
 #[test]

@@ -57,14 +57,44 @@ fn route(v: &Vault, req: &Request) -> (&'static str, String) {
         // CORS preflight.
         ("OPTIONS", _) => ("204 No Content", String::new()),
         ("POST", "/capture") => match crate::capture(v, &req.body) {
-            Ok(r) => (
-                "200 OK",
-                format!("{{\"added\":{},\"skipped\":{}}}", r.added, r.skipped),
-            ),
+            Ok(r) => {
+                // A capture mutates references.bib, but it happens inside this
+                // server loop — never on the CLI's run()-level path — so the
+                // keep-updated export (#45) won't fire there. Trigger it here,
+                // best-effort: a stale mirror shouldn't fail the capture. Notes
+                // go to stderr (the HTTP body is the capture's machine output).
+                if r.added > 0 {
+                    refresh_after_capture(v);
+                }
+                (
+                    "200 OK",
+                    format!("{{\"added\":{},\"skipped\":{}}}", r.added, r.skipped),
+                )
+            }
             Err(e) => ("400 Bad Request", json_error(&e)),
         },
         ("GET", "/" | "/health") => ("200 OK", "{\"service\":\"niutero-connector\"}".into()),
         _ => ("404 Not Found", json_error("unknown endpoint")),
+    }
+}
+
+/// Re-export keep-updated targets after a capture (best-effort; stderr only).
+fn refresh_after_capture(v: &Vault) {
+    match crate::refresh_exports(v) {
+        Ok(outcomes) => {
+            for o in outcomes {
+                match o.error {
+                    None => eprintln!("  ↻ {} entr(ies) → {}", o.count, o.out.display()),
+                    Some(e) => {
+                        eprintln!(
+                            "warning: keep-updated export to {} failed: {e}",
+                            o.out.display()
+                        )
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("warning: keep-updated export skipped: {e}"),
     }
 }
 
@@ -142,6 +172,23 @@ mod tests {
     use super::*;
     use std::thread;
 
+    /// Hold the crate-wide env lock and point `$NIUTERO_REGISTRY` at a fresh
+    /// temp file, so a capture's keep-updated refresh reads an isolated registry
+    /// instead of the real machine one.
+    struct RegistryEnv {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    fn isolated_registry() -> RegistryEnv {
+        let guard = crate::test_registry_env::lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("NIUTERO_REGISTRY", dir.path().join("vaults.toml"));
+        RegistryEnv {
+            _dir: dir,
+            _guard: guard,
+        }
+    }
+
     #[test]
     fn parses_request_line_and_content_length() {
         let head = "POST /capture HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\n";
@@ -154,6 +201,7 @@ mod tests {
 
     #[test]
     fn capture_over_a_loopback_socket_adds_the_entry() {
+        let _env = isolated_registry();
         let dir = tempfile::tempdir().unwrap();
         let v = crate::init(dir.path()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -180,5 +228,38 @@ mod tests {
         // The captured entry is really in the vault.
         let reopened = crate::open(dir.path()).unwrap();
         assert!(crate::show(&reopened, "cap").is_ok());
+    }
+
+    #[test]
+    fn capture_refreshes_keep_updated_export_targets() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let v = crate::init(dir.path()).unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let mirror = mirror_dir.path().join("mirror.bib");
+        crate::export_target_add(&v, &mirror, None).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || serve_loop(&v, &listener, true));
+
+        let body = "@article{cap, title={Captured}, year={2024}}";
+        let mut client = TcpStream::connect(addr).unwrap();
+        let request = format!(
+            "POST /capture HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        handle.join().unwrap().unwrap();
+
+        // The capture happens inside the server loop (never the CLI run()-level
+        // path), so the connector itself must refresh the mirror — verify it did.
+        let mirrored = std::fs::read_to_string(&mirror).unwrap();
+        assert!(
+            mirrored.contains("@article{cap"),
+            "mirror stale: {mirrored}"
+        );
     }
 }

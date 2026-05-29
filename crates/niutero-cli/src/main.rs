@@ -73,6 +73,9 @@ enum Cmd {
         /// Field as NAME=VALUE (repeatable; flag-built entry).
         #[arg(long = "field", value_name = "NAME=VALUE")]
         field: Vec<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Edit an existing entry's fields or type.
     Edit {
@@ -89,6 +92,9 @@ enum Cmd {
         /// Change the entry type.
         #[arg(long = "type")]
         type_: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove an entry (and its sidecar metadata).
     Rm {
@@ -96,6 +102,9 @@ enum Cmd {
         vault: PathBuf,
         /// Cite key to remove.
         citekey: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Add/remove tags on an entry (no flags = show current tags).
     Tag {
@@ -109,6 +118,9 @@ enum Cmd {
         /// Tag to remove (repeatable).
         #[arg(long = "remove", value_name = "TAG")]
         remove: Vec<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Set, clear, or show an entry's note.
     Note {
@@ -122,6 +134,9 @@ enum Cmd {
         /// Clear the note.
         #[arg(long)]
         clear: bool,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage saved filter views.
     View {
@@ -142,6 +157,9 @@ enum Cmd {
         /// What to do when a cite key already exists.
         #[arg(long = "on-dup", value_enum, default_value_t = OnDup::Skip)]
         on_dup: OnDup,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Export the (optionally filtered) library to a standalone .bib file.
     Export {
@@ -156,6 +174,9 @@ enum Cmd {
         /// Use a saved view's query (mutually exclusive with --query).
         #[arg(long)]
         view: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Scan .tex/.aux files and report used / missing / unused cite keys.
     TexScan {
@@ -243,6 +264,9 @@ enum Cmd {
         /// Set the status (omit to show the current one).
         #[arg(long, value_enum)]
         set: Option<StatusArg>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Show or set an entry's star rating (0–5; 0 clears it).
     Stars {
@@ -253,6 +277,9 @@ enum Cmd {
         /// Set the rating (omit to show the current one).
         #[arg(long)]
         set: Option<u8>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Scan the library for offline hygiene issues (a health report).
     Analyze {
@@ -310,6 +337,65 @@ enum Cmd {
         vault: PathBuf,
         /// Cite key.
         citekey: String,
+    },
+    /// List the vaults this machine has opened, most-recent first (machine-local
+    /// registry — never synced with any vault).
+    Recent {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop a vault from this machine's recent list (leaves the vault untouched).
+    Forget {
+        /// Vault folder to forget.
+        vault: PathBuf,
+    },
+    /// Manage keep-updated export targets: external `.bib` files this machine
+    /// re-writes on every change (machine-local; e.g. an Overleaf checkout).
+    ExportTarget {
+        /// Vault folder.
+        vault: PathBuf,
+        #[command(subcommand)]
+        action: ExportTargetAction,
+    },
+    /// Show or set this machine's sync strategy for a vault (pull/push toggles;
+    /// machine-local, so each machine can sync differently).
+    SyncConfig {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Pull (and merge) from origin before pushing.
+        #[arg(long)]
+        pull: Option<bool>,
+        /// Push to origin after committing/merging.
+        #[arg(long)]
+        push: Option<bool>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportTargetAction {
+    /// List registered export targets.
+    List {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register (or update) a target `.bib`, optionally filtered by a query.
+    /// Exports immediately and re-exports on every later change.
+    Add {
+        /// Path of the `.bib` to keep updated.
+        out: PathBuf,
+        /// Filter query (free text + `tag:`/`status:`/`stars:`); omit for all.
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// Unregister a target (the external file is left on disk).
+    Rm {
+        /// Path of the registered `.bib`.
+        out: PathBuf,
     },
 }
 
@@ -375,8 +461,99 @@ fn ok(_: ()) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Open a vault and record it in the machine-local recent-vaults registry
+/// (best-effort — recording never fails an open). Every command opens through
+/// here so the "recent libraries" list stays current.
+fn open_vault(vault: &Path) -> Result<engine::Vault, String> {
+    let v = engine::open(vault)?;
+    engine::record_open(&v.root);
+    Ok(v)
+}
+
+/// Print a JSON value as pretty stdout (the machine-readable `--json` contract).
+fn emit(value: serde_json::Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<ExitCode, String> {
-    match cli.cmd {
+    // A command that changes the library's exportable state triggers a refresh
+    // of any keep-updated export targets afterwards (#45). Captured before the
+    // match moves `cli.cmd`.
+    let exportable_change = mutated_vault(&cli.cmd);
+    let result = dispatch(cli.cmd);
+    if let (Ok(_), Some(vault)) = (&result, &exportable_change) {
+        refresh_keep_updated(vault);
+    }
+    result
+}
+
+/// The vault whose exportable state a command changes, or `None` for read-only
+/// / registry-only commands. Drives the post-mutation keep-updated export.
+fn mutated_vault(cmd: &Cmd) -> Option<PathBuf> {
+    match cmd {
+        Cmd::Add { vault, .. }
+        | Cmd::Edit { vault, .. }
+        | Cmd::Rm { vault, .. }
+        | Cmd::Import { vault, .. }
+        | Cmd::Enrich { vault, .. }
+        | Cmd::Sync { vault, .. } => Some(vault.clone()),
+        // Tag/status/stars change facets that `tag:`/`status:`/`stars:` filtered
+        // targets select on, so they count as exportable changes too.
+        Cmd::Tag {
+            vault, add, remove, ..
+        } if !add.is_empty() || !remove.is_empty() => Some(vault.clone()),
+        Cmd::Status {
+            vault,
+            set: Some(_),
+            ..
+        } => Some(vault.clone()),
+        Cmd::Stars {
+            vault,
+            set: Some(_),
+            ..
+        } => Some(vault.clone()),
+        Cmd::Rekey {
+            vault, write: true, ..
+        } => Some(vault.clone()),
+        Cmd::Dedupe {
+            vault, merge: true, ..
+        } => Some(vault.clone()),
+        Cmd::Normalize {
+            vault, write: true, ..
+        } => Some(vault.clone()),
+        _ => None,
+    }
+}
+
+/// Re-export every keep-updated target after a successful mutation. Best-effort:
+/// the primary operation already succeeded, so a failed mirror is a warning, not
+/// an error (it must not change the command's exit code). All notes go to
+/// **stderr** so they never corrupt a command's `--json` stdout for a machine
+/// consumer.
+fn refresh_keep_updated(vault: &Path) {
+    let Ok(v) = engine::open(vault) else { return };
+    match engine::refresh_exports(&v) {
+        Ok(outcomes) => {
+            for o in outcomes {
+                match o.error {
+                    None => eprintln!("  ↻ {} entr(ies) → {}", o.count, o.out.display()),
+                    Some(e) => eprintln!(
+                        "warning: keep-updated export to {} failed: {e}",
+                        o.out.display()
+                    ),
+                }
+            }
+        }
+        Err(e) => eprintln!("warning: keep-updated export skipped: {e}"),
+    }
+}
+
+fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
+    match cmd {
         Cmd::Init { path } => cmd_init(&path).map(ok),
         Cmd::List {
             vault,
@@ -396,40 +573,50 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             type_,
             key,
             field,
-        } => cmd_add(&vault, bibtex, from, type_, key, field).map(ok),
+            json,
+        } => cmd_add(&vault, bibtex, from, type_, key, field, json).map(ok),
         Cmd::Edit {
             vault,
             citekey,
             field,
             unset,
             type_,
-        } => cmd_edit(&vault, &citekey, field, unset, type_).map(ok),
-        Cmd::Rm { vault, citekey } => cmd_rm(&vault, &citekey).map(ok),
+            json,
+        } => cmd_edit(&vault, &citekey, field, unset, type_, json).map(ok),
+        Cmd::Rm {
+            vault,
+            citekey,
+            json,
+        } => cmd_rm(&vault, &citekey, json).map(ok),
         Cmd::Tag {
             vault,
             citekey,
             add,
             remove,
-        } => cmd_tag(&vault, &citekey, add, remove).map(ok),
+            json,
+        } => cmd_tag(&vault, &citekey, add, remove, json).map(ok),
         Cmd::Note {
             vault,
             citekey,
             set,
             clear,
-        } => cmd_note(&vault, &citekey, set, clear).map(ok),
+            json,
+        } => cmd_note(&vault, &citekey, set, clear, json).map(ok),
         Cmd::View { vault, action } => cmd_view(&vault, action).map(ok),
         Cmd::Import {
             vault,
             file,
             doi,
             on_dup,
-        } => cmd_import(&vault, file, doi, on_dup).map(ok),
+            json,
+        } => cmd_import(&vault, file, doi, on_dup, json).map(ok),
         Cmd::Export {
             vault,
             out,
             query,
             view,
-        } => cmd_export(&vault, &out, query, view).map(ok),
+            json,
+        } => cmd_export(&vault, &out, query, view, json).map(ok),
         Cmd::TexScan {
             vault,
             tex,
@@ -461,12 +648,14 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             vault,
             citekey,
             set,
-        } => cmd_status(&vault, &citekey, set).map(ok),
+            json,
+        } => cmd_status(&vault, &citekey, set, json).map(ok),
         Cmd::Stars {
             vault,
             citekey,
             set,
-        } => cmd_stars(&vault, &citekey, set).map(ok),
+            json,
+        } => cmd_stars(&vault, &citekey, set, json).map(ok),
         Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
         Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
         Cmd::Enrich { vault, citekey } => cmd_enrich(&vault, &citekey).map(ok),
@@ -478,6 +667,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             fetch,
         } => cmd_pdf(&vault, &citekey, attach, fetch).map(ok),
         Cmd::SuggestTags { vault, citekey } => cmd_suggest_tags(&vault, &citekey).map(ok),
+        Cmd::Recent { json } => cmd_recent(json).map(ok),
+        Cmd::Forget { vault } => cmd_forget(&vault).map(ok),
+        Cmd::ExportTarget { vault, action } => cmd_export_target(&vault, action).map(ok),
+        Cmd::SyncConfig {
+            vault,
+            pull,
+            push,
+            json,
+        } => cmd_sync_config(&vault, pull, push, json).map(ok),
     }
 }
 
@@ -493,6 +691,7 @@ fn filter_from(query: Option<String>, view: Option<String>) -> Result<Filter, St
 
 fn cmd_init(path: &Path) -> Result<(), String> {
     let v = engine::init(path)?;
+    engine::record_open(&v.root);
     println!(
         "Initialized vault '{}' at {}",
         v.config.name,
@@ -507,7 +706,7 @@ fn cmd_list(
     view: Option<String>,
     json: bool,
 ) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let views = engine::list(&v, filter_from(query, view)?)?;
     if json {
         println!(
@@ -525,7 +724,7 @@ fn cmd_list(
 }
 
 fn cmd_show(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let view = engine::show(&v, citekey)?;
     if json {
         println!(
@@ -561,11 +760,16 @@ fn cmd_add(
     type_: Option<String>,
     key: Option<String>,
     field: Vec<String>,
+    json: bool,
 ) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let source = add_source(bibtex, from, type_, key, field)?;
     let keys = engine::add(&v, source)?;
-    println!("Added {}: {}", keys.len(), keys.join(", "));
+    if json {
+        emit(serde_json::json!({ "added": keys }))?;
+    } else {
+        println!("Added {}: {}", keys.len(), keys.join(", "));
+    }
     Ok(())
 }
 
@@ -612,20 +816,29 @@ fn cmd_edit(
     field: Vec<String>,
     unset: Vec<String>,
     type_: Option<String>,
+    json: bool,
 ) -> Result<(), String> {
     if field.is_empty() && unset.is_empty() && type_.is_none() {
         return Err("specify at least one of --field, --unset, or --type".into());
     }
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     engine::edit(&v, citekey, &field, &unset, type_)?;
-    println!("Updated {citekey}");
+    if json {
+        emit(serde_json::json!({ "updated": citekey }))?;
+    } else {
+        println!("Updated {citekey}");
+    }
     Ok(())
 }
 
-fn cmd_rm(vault: &Path, citekey: &str) -> Result<(), String> {
-    let mut v = engine::open(vault)?;
+fn cmd_rm(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
+    let mut v = open_vault(vault)?;
     engine::rm(&mut v, citekey)?;
-    println!("Removed {citekey}");
+    if json {
+        emit(serde_json::json!({ "removed": citekey }))?;
+    } else {
+        println!("Removed {citekey}");
+    }
     Ok(())
 }
 
@@ -634,14 +847,17 @@ fn cmd_tag(
     citekey: &str,
     add: Vec<String>,
     remove: Vec<String>,
+    json: bool,
 ) -> Result<(), String> {
     let tags = if add.is_empty() && remove.is_empty() {
-        engine::current_tags(&engine::open(vault)?, citekey)?
+        engine::current_tags(&open_vault(vault)?, citekey)?
     } else {
-        let mut v = engine::open(vault)?;
+        let mut v = open_vault(vault)?;
         engine::set_tags(&mut v, citekey, &add, &remove)?
     };
-    if tags.is_empty() {
+    if json {
+        emit(serde_json::json!({ "tags": tags }))?;
+    } else if tags.is_empty() {
         println!("(no tags)");
     } else {
         println!("tags: {}", tags.join(", "));
@@ -649,24 +865,39 @@ fn cmd_tag(
     Ok(())
 }
 
-fn cmd_note(vault: &Path, citekey: &str, set: Option<String>, clear: bool) -> Result<(), String> {
+fn cmd_note(
+    vault: &Path,
+    citekey: &str,
+    set: Option<String>,
+    clear: bool,
+    json: bool,
+) -> Result<(), String> {
     if set.is_some() && clear {
         return Err("use either --set or --clear, not both".into());
     }
-    if let Some(text) = set {
-        let mut v = engine::open(vault)?;
-        engine::set_note(&mut v, citekey, Some(text))?;
-        println!("Set note for {citekey}");
+    // (action label for text output, resulting note for JSON output)
+    let (action, note): (&str, Option<String>) = if let Some(text) = set {
+        let mut v = open_vault(vault)?;
+        engine::set_note(&mut v, citekey, Some(text.clone()))?;
+        ("set", Some(text))
     } else if clear {
-        let mut v = engine::open(vault)?;
+        let mut v = open_vault(vault)?;
         engine::set_note(&mut v, citekey, None)?;
-        println!("Cleared note for {citekey}");
+        ("cleared", None)
     } else {
-        let note = engine::current_note(&engine::open(vault)?, citekey)?;
-        if note.is_empty() {
-            println!("(no note)");
-        } else {
-            println!("{note}");
+        let n = engine::current_note(&open_vault(vault)?, citekey)?;
+        ("show", (!n.is_empty()).then_some(n))
+    };
+    if json {
+        emit(serde_json::json!({ "note": note }))?;
+    } else {
+        match action {
+            "set" => println!("Set note for {citekey}"),
+            "cleared" => println!("Cleared note for {citekey}"),
+            _ => match &note {
+                Some(n) => println!("{n}"),
+                None => println!("(no note)"),
+            },
         }
     }
     Ok(())
@@ -675,7 +906,7 @@ fn cmd_note(vault: &Path, citekey: &str, set: Option<String>, clear: bool) -> Re
 fn cmd_view(vault: &Path, action: ViewAction) -> Result<(), String> {
     match action {
         ViewAction::List { json } => {
-            let v = engine::open(vault)?;
+            let v = open_vault(vault)?;
             let views = engine::views(&v);
             if json {
                 println!(
@@ -691,12 +922,12 @@ fn cmd_view(vault: &Path, action: ViewAction) -> Result<(), String> {
             }
         }
         ViewAction::Add { name, query } => {
-            let mut v = engine::open(vault)?;
+            let mut v = open_vault(vault)?;
             engine::add_view(&mut v, name.clone(), query)?;
             println!("Added view '{name}'");
         }
         ViewAction::Rm { name } => {
-            let mut v = engine::open(vault)?;
+            let mut v = open_vault(vault)?;
             engine::remove_view(&mut v, &name)?;
             println!("Removed view '{name}'");
         }
@@ -709,8 +940,9 @@ fn cmd_import(
     file: Option<PathBuf>,
     doi: Option<String>,
     on_dup: OnDup,
+    json: bool,
 ) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let policy = match on_dup {
         OnDup::Skip => DupPolicy::Skip,
         OnDup::Overwrite => DupPolicy::Overwrite,
@@ -722,6 +954,13 @@ fn cmd_import(
         (None, Some(d)) => engine::import_doi(&v, &d, policy)?,
         (None, None) => return Err("specify a .bib file or --doi".into()),
     };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     let mut parts = vec![format!("{} added", r.added)];
     if r.overwritten > 0 {
         parts.push(format!("{} overwritten", r.overwritten));
@@ -740,7 +979,7 @@ fn cmd_import(
 }
 
 fn cmd_enrich(vault: &Path, citekey: &str) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let filled = engine::enrich(&v, citekey)?;
     if filled.is_empty() {
         println!("{citekey}: already complete (nothing to fill).");
@@ -751,7 +990,7 @@ fn cmd_enrich(vault: &Path, citekey: &str) -> Result<(), String> {
 }
 
 fn cmd_connector(vault: &Path, port: u16) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     println!("Browser connector listening on http://127.0.0.1:{port}  (POST BibTeX to /capture; Ctrl-C to stop)");
     engine::serve_connector(&v, port)
 }
@@ -765,7 +1004,7 @@ fn cmd_pdf(
     if attach.is_some() && fetch {
         return Err("use either --attach or --fetch, not both".into());
     }
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     if let Some(src) = attach {
         let dest = engine::attach_pdf(&v, citekey, &src)?;
         println!("Attached {} -> {}", src.display(), dest.display());
@@ -785,7 +1024,7 @@ fn cmd_pdf(
 }
 
 fn cmd_suggest_tags(vault: &Path, citekey: &str) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let tags = engine::suggest_tags(&v, citekey)?;
     if tags.is_empty() {
         println!("(no suggestions)");
@@ -804,10 +1043,15 @@ fn cmd_export(
     out: &Path,
     query: Option<String>,
     view: Option<String>,
+    json: bool,
 ) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let n = engine::export(&v, filter_from(query, view)?, out)?;
-    println!("Exported {n} entr(ies) to {}", out.display());
+    if json {
+        emit(serde_json::json!({ "exported": n, "out": out.display().to_string() }))?;
+    } else {
+        println!("Exported {n} entr(ies) to {}", out.display());
+    }
     Ok(())
 }
 
@@ -817,7 +1061,7 @@ fn cmd_tex_scan(
     out: Option<PathBuf>,
     json: bool,
 ) -> Result<ExitCode, String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let report = engine::tex_scan(&v, tex)?;
     if json {
         println!(
@@ -851,7 +1095,13 @@ fn cmd_tex_scan(
     }
     if let Some(out) = out {
         let n = engine::export_keys(&v, &report.used, &out)?;
-        println!("Wrote {n} cited entr(ies) to {}", out.display());
+        // In --json mode the report JSON is the stdout payload; this notice goes
+        // to stderr so it doesn't corrupt the stream for a machine consumer.
+        if json {
+            eprintln!("Wrote {n} cited entr(ies) to {}", out.display());
+        } else {
+            println!("Wrote {n} cited entr(ies) to {}", out.display());
+        }
     }
     // CI gate: undefined references are actionable.
     Ok(if report.missing.is_empty() {
@@ -862,14 +1112,14 @@ fn cmd_tex_scan(
 }
 
 fn cmd_connect(vault: &Path, url: &str) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     engine::connect(&v, url)?;
     println!("Connected {} to {url}", v.root.display());
     Ok(())
 }
 
 fn cmd_sync(vault: &Path, message: Option<String>) -> Result<ExitCode, String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     match engine::sync(&v, message)? {
         engine::SyncStatus::Synced { committed, merged } => {
             let what = if merged {
@@ -902,7 +1152,7 @@ fn cmd_normalize(
     if write && check {
         return Err("use either --write or --check, not both".into());
     }
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let changes = if write {
         engine::normalize_apply(&v, profile.as_deref())?
     } else {
@@ -942,13 +1192,13 @@ fn cmd_normalize(
 }
 
 fn cmd_cite(vault: &Path, citekey: &str) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     println!("{}", engine::cite(&v, citekey)?);
     Ok(())
 }
 
 fn cmd_history(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let commits = engine::history(&v, citekey)?;
     if json {
         println!(
@@ -970,10 +1220,10 @@ fn cmd_history(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
 
 fn cmd_rekey(vault: &Path, write: bool, pattern: Option<String>, json: bool) -> Result<(), String> {
     let changes = if write {
-        let mut v = engine::open(vault)?;
+        let mut v = open_vault(vault)?;
         engine::rekey_apply(&mut v, pattern.as_deref())?
     } else {
-        let v = engine::open(vault)?;
+        let v = open_vault(vault)?;
         engine::rekey_preview(&v, pattern.as_deref())?
     };
     if json {
@@ -1003,30 +1253,49 @@ fn cmd_rekey(vault: &Path, write: bool, pattern: Option<String>, json: bool) -> 
     Ok(())
 }
 
-fn cmd_status(vault: &Path, citekey: &str, set: Option<StatusArg>) -> Result<(), String> {
-    if let Some(s) = set {
-        let mut v = engine::open(vault)?;
+fn cmd_status(
+    vault: &Path,
+    citekey: &str,
+    set: Option<StatusArg>,
+    json: bool,
+) -> Result<(), String> {
+    let status = if let Some(s) = set {
+        let mut v = open_vault(vault)?;
         let status = engine::Status::from(s);
         engine::set_status(&mut v, citekey, status)?;
-        println!("Set status of {citekey} to {}", status.as_str());
+        status.as_str().to_string()
     } else {
-        let view = engine::show(&engine::open(vault)?, citekey)?;
-        println!("{}", view.status);
+        engine::show(&open_vault(vault)?, citekey)?.status
+    };
+    if json {
+        emit(serde_json::json!({ "status": status }))?;
+    } else if set.is_some() {
+        println!("Set status of {citekey} to {status}");
+    } else {
+        println!("{status}");
     }
     Ok(())
 }
 
-fn cmd_stars(vault: &Path, citekey: &str, set: Option<u8>) -> Result<(), String> {
-    if let Some(n) = set {
-        let mut v = engine::open(vault)?;
+fn cmd_stars(vault: &Path, citekey: &str, set: Option<u8>, json: bool) -> Result<(), String> {
+    // Resulting rating: 0 (or cleared) is represented as `None`.
+    let stars: Option<u8> = if let Some(n) = set {
+        let mut v = open_vault(vault)?;
         engine::set_stars(&mut v, citekey, Some(n))?;
+        (n != 0).then_some(n)
+    } else {
+        engine::show(&open_vault(vault)?, citekey)?.stars
+    };
+    if json {
+        emit(serde_json::json!({ "stars": stars }))?;
+    } else if let Some(n) = set {
         if n == 0 {
             println!("Cleared rating of {citekey}");
         } else {
             println!("Set {citekey} to {n} star(s)");
         }
     } else {
-        match engine::show(&engine::open(vault)?, citekey)?.stars {
+        match stars {
             Some(n) => println!("{n}"),
             None => println!("(unrated)"),
         }
@@ -1035,7 +1304,7 @@ fn cmd_stars(vault: &Path, citekey: &str, set: Option<u8>) -> Result<(), String>
 }
 
 fn cmd_analyze(vault: &Path, json: bool) -> Result<(), String> {
-    let v = engine::open(vault)?;
+    let v = open_vault(vault)?;
     let report = engine::analyze(&v)?;
     if json {
         println!(
@@ -1055,7 +1324,7 @@ fn cmd_analyze(vault: &Path, json: bool) -> Result<(), String> {
 
 fn cmd_dedupe(vault: &Path, merge: bool, json: bool) -> Result<(), String> {
     if merge {
-        let mut v = engine::open(vault)?;
+        let mut v = open_vault(vault)?;
         let merges = engine::dedupe_merge(&mut v)?;
         if json {
             println!(
@@ -1071,7 +1340,7 @@ fn cmd_dedupe(vault: &Path, merge: bool, json: bool) -> Result<(), String> {
             }
         }
     } else {
-        let v = engine::open(vault)?;
+        let v = open_vault(vault)?;
         let groups = engine::dedupe_preview(&v)?;
         if json {
             println!(
@@ -1087,6 +1356,94 @@ fn cmd_dedupe(vault: &Path, merge: bool, json: bool) -> Result<(), String> {
             }
             println!("(re-run with --merge to fold each cluster into its first entry)");
         }
+    }
+    Ok(())
+}
+
+fn cmd_recent(json: bool) -> Result<(), String> {
+    let recent = engine::recent_vaults()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&recent).map_err(|e| e.to_string())?
+        );
+    } else if recent.is_empty() {
+        println!("(no recent vaults)");
+    } else {
+        for r in &recent {
+            println!("{}", r.path.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_forget(vault: &Path) -> Result<(), String> {
+    if engine::forget_vault(vault)? {
+        println!("Forgot {}", vault.display());
+    } else {
+        println!("{} was not in the recent list", vault.display());
+    }
+    Ok(())
+}
+
+fn cmd_export_target(vault: &Path, action: ExportTargetAction) -> Result<(), String> {
+    let v = open_vault(vault)?;
+    match action {
+        ExportTargetAction::List { json } => {
+            let targets = engine::export_targets(&v)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&targets).map_err(|e| e.to_string())?
+                );
+            } else if targets.is_empty() {
+                println!("(no keep-updated export targets)");
+            } else {
+                for t in &targets {
+                    match &t.query {
+                        Some(q) => println!("{}  [filter: {q}]", t.out.display()),
+                        None => println!("{}", t.out.display()),
+                    }
+                }
+            }
+        }
+        ExportTargetAction::Add { out, query } => {
+            engine::export_target_add(&v, &out, query.clone())?;
+            match query {
+                Some(q) => println!("Keeping {} updated (filter: {q})", out.display()),
+                None => println!("Keeping {} updated", out.display()),
+            }
+        }
+        ExportTargetAction::Rm { out } => {
+            if engine::export_target_remove(&v, &out)? {
+                println!("Stopped keeping {} updated", out.display());
+            } else {
+                println!("{} was not a registered target", out.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_sync_config(
+    vault: &Path,
+    pull: Option<bool>,
+    push: Option<bool>,
+    json: bool,
+) -> Result<(), String> {
+    let v = open_vault(vault)?;
+    let prefs = if pull.is_some() || push.is_some() {
+        engine::set_sync_prefs(&v, pull, push)?
+    } else {
+        engine::sync_prefs(&v)?
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("sync strategy: pull={}, push={}", prefs.pull, prefs.push);
     }
     Ok(())
 }

@@ -28,6 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use niutero_bib::{parse, to_bibtex, BibItem};
 use serde::{Deserialize, Serialize};
 
+pub mod registry;
+pub use registry::{ExportTarget, Registry, SyncPrefs, VaultRecord};
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 fn default_schema() -> u32 {
@@ -316,6 +319,13 @@ fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
         let _ = fs::remove_file(&tmp); // best-effort cleanup
     }
     result
+}
+
+/// Atomically write `contents` to `path` (temp + fsync + rename), the same
+/// crash-safe primitive the vault uses for `references.bib`. Exposed so the
+/// engine can give keep-updated export mirrors the same guarantee.
+pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    atomic_write(path, contents)
 }
 
 fn folder_name(root: &Path) -> String {

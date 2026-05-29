@@ -11,6 +11,19 @@ use std::path::{Path, PathBuf};
 mod connector;
 pub use connector::serve_connector;
 
+/// Test-only: one process-wide lock guarding the `$NIUTERO_REGISTRY` env var, so
+/// every registry-touching test in this crate (the engine tests *and* the
+/// connector tests, which run in the same binary) serializes on a single mutex
+/// and never races the env var or reads the real machine registry.
+#[cfg(test)]
+pub(crate) mod test_registry_env {
+    use std::sync::{Mutex, MutexGuard};
+    static LOCK: Mutex<()> = Mutex::new(());
+    pub fn lock() -> MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 use indexmap::IndexMap;
 use niutero_bib::{entries, entry_line_span, parse, to_bibtex_entries, BibItem};
 use niutero_core::filter::Facets;
@@ -20,7 +33,7 @@ use niutero_sync as git;
 use serde::{Deserialize, Serialize};
 
 pub use niutero_core::texscan::TexReport;
-pub use niutero_vault::{EntryMeta, Status, Vault, View};
+pub use niutero_vault::{EntryMeta, ExportTarget, Registry, Status, SyncPrefs, Vault, View};
 
 /// An owned, serializable view of an entry plus its sidecar tags/notes — the
 /// stable shape the CLI's `--json` emits and a GUI consumes.
@@ -633,7 +646,9 @@ pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
         .filter(|e| filter::entry_matches(&query, e, &facets_of(v, &e.citekey)))
         .cloned()
         .collect();
-    std::fs::write(out, to_bibtex_entries(&selected))
+    // Atomic (temp + rename), the same guarantee references.bib gets — a crash
+    // mid-write must not truncate a keep-updated mirror the user builds against.
+    niutero_vault::write_atomic(out, &to_bibtex_entries(&selected))
         .map_err(|e| format!("write {}: {e}", out.display()))?;
     Ok(selected.len())
 }
@@ -665,7 +680,7 @@ pub fn export_keys(v: &Vault, keys: &[String], out: &Path) -> Result<usize, Stri
         .filter(|e| wanted.contains(e.citekey.as_str()))
         .cloned()
         .collect();
-    std::fs::write(out, to_bibtex_entries(&selected))
+    niutero_vault::write_atomic(out, &to_bibtex_entries(&selected))
         .map_err(|e| format!("write {}: {e}", out.display()))?;
     Ok(selected.len())
 }
@@ -674,6 +689,238 @@ pub fn export_keys(v: &Vault, keys: &[String], out: &Path) -> Result<usize, Stri
 pub fn cite(v: &Vault, citekey: &str) -> Result<String, String> {
     entry_exists(v, citekey)?;
     Ok(format!("\\cite{{{citekey}}}"))
+}
+
+// ------------------------------------------------ machine-local registry
+
+/// A vault this machine has opened, for a "recent libraries" listing. The
+/// registry is **machine-local** (never synced into the vault), so this and the
+/// export/sync prefs below all live outside `.niutero/`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentVault {
+    pub path: PathBuf,
+    /// Unix-epoch seconds of the last open (recency ordering).
+    pub last_opened: Option<u64>,
+}
+
+/// The vaults this machine has opened, most-recently-opened first.
+pub fn recent_vaults() -> Result<Vec<RecentVault>, String> {
+    let reg = Registry::load().map_err(|e| format!("read registry: {e}"))?;
+    Ok(reg
+        .vaults
+        .into_iter()
+        .map(|r| RecentVault {
+            path: r.path,
+            last_opened: r.last_opened,
+        })
+        .collect())
+}
+
+/// Record that a vault was just opened. **Best-effort**: a machine with no
+/// resolvable config dir, or an unwritable registry, must never make `open`
+/// fail — recency tracking is a convenience, not part of the data path. The CLI
+/// (and a future GUI) call this right after a successful [`open`].
+pub fn record_open(root: &Path) {
+    // Locked read-modify-save so a concurrent process can't clobber it; failures
+    // are swallowed because recency tracking must never break an open.
+    let _ = niutero_vault::registry::with_registry_mut(|reg| {
+        reg.record_open(root, niutero_vault::registry::now_epoch());
+    });
+}
+
+/// Forget a vault from the recent list. Returns whether one was present.
+pub fn forget_vault(root: &Path) -> Result<bool, String> {
+    niutero_vault::registry::with_registry_mut(|reg| reg.forget(root))
+        .map_err(|e| format!("update registry: {e}"))
+}
+
+// ----------------------------------------- keep-updated export targets (#45)
+
+/// Outcome of refreshing one keep-updated export target.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportOutcome {
+    pub out: PathBuf,
+    pub count: usize,
+    /// Set when *this* target failed to write; the others (and the primary
+    /// write that triggered the refresh) still succeeded.
+    pub error: Option<String>,
+}
+
+/// The keep-updated export targets registered for this vault on this machine.
+pub fn export_targets(v: &Vault) -> Result<Vec<ExportTarget>, String> {
+    let reg = Registry::load().map_err(|e| format!("read registry: {e}"))?;
+    Ok(reg
+        .get(&v.root)
+        .map(|r| r.exports.clone())
+        .unwrap_or_default())
+}
+
+/// Register (or update) a keep-updated export target (#45): an external `.bib`
+/// re-written on every change, optionally filtered by `query`. Re-registering
+/// the same path replaces its query. Performs an initial export immediately so
+/// the target is correct right away. Refuses to target the vault's own
+/// `references.bib` or anything inside `.niutero/` (that would corrupt the
+/// source of truth / sidecar).
+pub fn export_target_add(v: &Vault, out: &Path, query: Option<String>) -> Result<(), String> {
+    let out = resolve_export_out(v, out)?;
+    let stored = out.clone();
+    let q = query.clone();
+    // Locked so a concurrent open's record can't drop the just-added target.
+    niutero_vault::registry::with_registry_mut(move |reg| {
+        let rec = reg.entry_mut(&v.root);
+        rec.exports.retain(|t| t.out != stored);
+        rec.exports.push(ExportTarget {
+            out: stored,
+            query: q,
+        });
+    })
+    .map_err(|e| format!("update registry: {e}"))?;
+    // Initial export (outside the registry lock — it touches the vault, not the
+    // registry) so the registered file is immediately in sync.
+    let filter = query.map(Filter::Query).unwrap_or(Filter::All);
+    export(v, filter, &out)?;
+    Ok(())
+}
+
+/// Unregister a keep-updated export target. Returns whether one was present.
+/// (The external file itself is left on disk.)
+pub fn export_target_remove(v: &Vault, out: &Path) -> Result<bool, String> {
+    let out = resolve_export_out(v, out)?;
+    niutero_vault::registry::with_registry_mut(|reg| {
+        let Some(rec) = reg
+            .vaults
+            .iter_mut()
+            .find(|r| r.path == registry_key(&v.root))
+        else {
+            return false;
+        };
+        let before = rec.exports.len();
+        rec.exports.retain(|t| t.out != out);
+        rec.exports.len() != before
+    })
+    .map_err(|e| format!("update registry: {e}"))
+}
+
+/// Re-export every keep-updated target for this vault (#45). Called after a
+/// mutating operation completes. The primary write already succeeded, so a
+/// failing target (e.g. an unplugged drive) is reported *per target* rather than
+/// failing the whole command. Returns an empty vec when nothing is registered.
+pub fn refresh_exports(v: &Vault) -> Result<Vec<ExportOutcome>, String> {
+    let targets = export_targets(v)?;
+    Ok(targets
+        .into_iter()
+        .map(|t| {
+            let filter = t.query.clone().map(Filter::Query).unwrap_or(Filter::All);
+            match export(v, filter, &t.out) {
+                Ok(count) => ExportOutcome {
+                    out: t.out,
+                    count,
+                    error: None,
+                },
+                Err(e) => ExportOutcome {
+                    out: t.out,
+                    count: 0,
+                    error: Some(e),
+                },
+            }
+        })
+        .collect())
+}
+
+/// Resolve an export-target path to a stable absolute form and reject the unsafe
+/// ones (the vault's own `references.bib`, or anything under `.niutero/`).
+///
+/// The source-of-truth guard must hold on **case-insensitive** filesystems
+/// (NTFS, APFS — this project's platforms), where `References.bib`, an 8.3 short
+/// name, or a trailing-dot spelling all name the *same* on-disk file as
+/// `references.bib`. So when the target already exists we canonicalize its
+/// **full** path (not just the parent): an alias spelling of `references.bib`
+/// resolves to the real `references.bib`, making the equality check catch it
+/// instead of being fooled by a literal-name string compare.
+fn resolve_export_out(v: &Vault, out: &Path) -> Result<PathBuf, String> {
+    let resolved = resolve_path(out)?;
+    let bib = resolve_path(&v.bib_path())?;
+    if resolved == bib {
+        return Err("refusing to use the vault's own references.bib as an export target".into());
+    }
+    if let Ok(niutero) = v.niutero_dir().canonicalize() {
+        if resolved.starts_with(strip_extended(&niutero)) {
+            return Err("refusing to write an export target inside .niutero/".into());
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolve a path to a stable absolute form for comparison/storage. If it
+/// already exists, canonicalize the **whole** path (collapsing case/short-name/
+/// symlink aliases to the real file). If not (the common case — the target
+/// hasn't been written yet), canonicalize the parent dir (which must exist) and
+/// re-attach the literal file name, so `..`/symlinks in the dir still resolve.
+fn resolve_path(p: &Path) -> Result<PathBuf, String> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("resolve current dir: {e}"))?
+            .join(p)
+    };
+    if let Ok(real) = abs.canonicalize() {
+        return Ok(strip_extended(&real));
+    }
+    let parent = abs
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", abs.display()))?;
+    let name = abs
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", abs.display()))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| format!("export target directory {}: {e}", parent.display()))?;
+    Ok(strip_extended(&parent).join(name))
+}
+
+/// Strip Windows' `\\?\` extended-length prefix so paths stay readable/compare
+/// consistently with registry keys.
+fn strip_extended(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => p.to_path_buf(),
+    }
+}
+
+/// The registry key for a vault root (canonical, prefix-stripped) — matches how
+/// [`Registry`] stores it, for the in-place lookup in `export_target_remove`.
+fn registry_key(root: &Path) -> PathBuf {
+    strip_extended(&root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
+}
+
+// --------------------------------------------- sync-strategy prefs (#48)
+
+/// This machine's sync strategy for the vault (pull/push toggles).
+pub fn sync_prefs(v: &Vault) -> Result<SyncPrefs, String> {
+    let reg = Registry::load().map_err(|e| format!("read registry: {e}"))?;
+    Ok(reg.get(&v.root).map(|r| r.sync.clone()).unwrap_or_default())
+}
+
+/// Update this machine's sync strategy for the vault; `None` leaves a field
+/// unchanged. Returns the resulting prefs.
+pub fn set_sync_prefs(
+    v: &Vault,
+    pull: Option<bool>,
+    push: Option<bool>,
+) -> Result<SyncPrefs, String> {
+    niutero_vault::registry::with_registry_mut(|reg| {
+        let rec = reg.entry_mut(&v.root);
+        if let Some(p) = pull {
+            rec.sync.pull = p;
+        }
+        if let Some(p) = push {
+            rec.sync.push = p;
+        }
+        rec.sync.clone()
+    })
+    .map_err(|e| format!("update registry: {e}"))
 }
 
 // ------------------------------------------------------------------- sync
@@ -733,10 +980,13 @@ pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
         return Err("no 'origin' remote — run `niutero connect <url>` first".into());
     }
     ensure_repo_hygiene(v)?;
+    // Machine-local sync strategy (#48): pull/push are per-machine toggles.
+    let prefs = sync_prefs(v)?;
     let message = message.unwrap_or_else(|| auto_commit_message(v));
     let committed = git::commit_all(&v.root, &message)?;
     let mut merged = false;
-    if git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict {
+    if prefs.pull && git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict
+    {
         // A merge is now in progress; resolve it or leave a clean tree.
         match try_resolve_merge(v) {
             Ok(true) => merged = true,
@@ -750,7 +1000,9 @@ pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
             }
         }
     }
-    git::push(&v.root)?;
+    if prefs.push {
+        git::push(&v.root)?;
+    }
     Ok(SyncStatus::Synced { committed, merged })
 }
 
@@ -1649,6 +1901,148 @@ mod tests {
         (d, v)
     }
 
+    /// The crate-wide env lock (shared with the connector tests), so every
+    /// registry-touching test serializes on one mutex and never reads the real
+    /// machine registry.
+    fn reg_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_registry_env::lock()
+    }
+
+    /// Run `f` with `$NIUTERO_REGISTRY` pointed at a fresh temp file, serialized
+    /// so the registry tests never race the env var or touch the real machine
+    /// registry.
+    fn with_registry<T>(f: impl FnOnce() -> T) -> T {
+        let _g = reg_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("NIUTERO_REGISTRY", dir.path().join("vaults.toml"));
+        let out = f();
+        std::env::remove_var("NIUTERO_REGISTRY");
+        out
+    }
+
+    /// RAII form of [`with_registry`] for tests whose body is awkward to wrap in
+    /// a closure (e.g. the git-heavy `sync_*` tests). Holds the shared env lock
+    /// and points `$NIUTERO_REGISTRY` at a fresh temp file for the test's
+    /// lifetime, so `sync()` (which now reads sync-prefs) is hermetic and never
+    /// reads the real machine registry.
+    struct RegistryEnv {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    fn isolated_registry() -> RegistryEnv {
+        let guard = reg_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("NIUTERO_REGISTRY", dir.path().join("vaults.toml"));
+        RegistryEnv {
+            _dir: dir,
+            _guard: guard,
+        }
+    }
+
+    #[test]
+    fn registry_records_and_orders_recent_opens() {
+        with_registry(|| {
+            let (_a, va) = vault();
+            let (_b, vb) = vault();
+            record_open(&va.root);
+            record_open(&vb.root);
+            record_open(&va.root); // re-open A: moves to front, no duplicate
+            let recent = recent_vaults().unwrap();
+            assert_eq!(recent.len(), 2);
+            assert_eq!(recent[0].path, registry_key(&va.root));
+            assert!(recent[0].last_opened.is_some());
+            // Forgetting drops it; forgetting again is a no-op.
+            assert!(forget_vault(&va.root).unwrap());
+            assert_eq!(recent_vaults().unwrap().len(), 1);
+            assert!(!forget_vault(&va.root).unwrap());
+        });
+    }
+
+    #[test]
+    fn export_target_initial_export_then_refresh_tracks_changes() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            let (dst, _g) = (tempfile::tempdir().unwrap(), ());
+            let out = dst.path().join("mirror.bib");
+            add(&v, fields("misc", "a", &["title=A"])).unwrap();
+
+            // Registering exports immediately.
+            export_target_add(&v, &out, None).unwrap();
+            assert!(std::fs::read_to_string(&out).unwrap().contains("@misc{a"));
+
+            // A later change is mirrored only after a refresh (what the CLI runs
+            // automatically after every mutation).
+            add(&v, fields("misc", "b", &["title=B"])).unwrap();
+            let outcomes = refresh_exports(&v).unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].count, 2);
+            assert!(outcomes[0].error.is_none());
+            let mirrored = std::fs::read_to_string(&out).unwrap();
+            assert!(mirrored.contains("@misc{a") && mirrored.contains("@misc{b"));
+        });
+    }
+
+    #[test]
+    fn export_target_can_be_filtered_and_removed() {
+        with_registry(|| {
+            let (_d, mut v) = vault();
+            let dst = tempfile::tempdir().unwrap();
+            let out = dst.path().join("thesis.bib");
+            add(&v, fields("misc", "keep", &["title=K"])).unwrap();
+            add(&v, fields("misc", "drop", &["title=D"])).unwrap();
+            set_tags(&mut v, "keep", &["thesis".into()], &[]).unwrap();
+
+            export_target_add(&v, &out, Some("tag:thesis".into())).unwrap();
+            let mirrored = std::fs::read_to_string(&out).unwrap();
+            assert!(mirrored.contains("@misc{keep"));
+            assert!(!mirrored.contains("@misc{drop"), "filter not applied");
+
+            assert!(export_target_remove(&v, &out).unwrap());
+            assert!(refresh_exports(&v).unwrap().is_empty());
+            // Removing an unregistered target is a no-op, not an error.
+            assert!(!export_target_remove(&v, &out).unwrap());
+        });
+    }
+
+    #[test]
+    fn export_target_refuses_to_clobber_the_source_of_truth() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            let err = export_target_add(&v, &v.bib_path(), None).unwrap_err();
+            assert!(err.contains("references.bib"), "got: {err}");
+            // Nothing was registered.
+            assert!(export_targets(&v).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn export_target_refuses_an_aliased_spelling_of_the_source_bib() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            // A different *spelling* of references.bib that canonicalizes to the
+            // same on-disk file (a `.` segment works on every platform; on
+            // case-insensitive volumes a mis-cased name would too). The guard
+            // must catch it — else a filtered export would truncate the library.
+            let aliased = v.root.join(".").join("references.bib");
+            let err = export_target_add(&v, &aliased, Some("tag:x".into())).unwrap_err();
+            assert!(err.contains("references.bib"), "got: {err}");
+            assert!(export_targets(&v).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn sync_prefs_default_to_two_way_and_roundtrip() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            assert!(sync_prefs(&v).unwrap().is_default()); // pull && push
+            let got = set_sync_prefs(&v, None, Some(false)).unwrap();
+            assert!(got.pull && !got.push);
+            assert!(!sync_prefs(&v).unwrap().push);
+            // The other toggle is untouched by a None.
+            assert!(sync_prefs(&v).unwrap().pull);
+        });
+    }
+
     #[test]
     fn mutations_respect_the_vault_lock() {
         let (_d, v) = vault();
@@ -1976,12 +2370,14 @@ mod tests {
 
     #[test]
     fn sync_without_connect_errors() {
+        let _env = isolated_registry();
         let (_d, v) = vault();
         assert!(sync(&v, None).unwrap_err().contains("not a git repository"));
     }
 
     #[test]
     fn sync_pushes_and_a_clone_sees_it() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }
@@ -2010,6 +2406,7 @@ mod tests {
 
     #[test]
     fn sync_detects_conflict() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }
@@ -2044,6 +2441,7 @@ mod tests {
 
     #[test]
     fn sync_auto_resolves_a_field_level_merge() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }
@@ -2120,6 +2518,7 @@ mod tests {
 
     #[test]
     fn sync_aborts_on_modify_delete_instead_of_dropping_entries() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }
@@ -2138,6 +2537,7 @@ mod tests {
 
     #[test]
     fn sync_aborts_when_a_string_macro_conflicts() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }
@@ -2155,6 +2555,7 @@ mod tests {
 
     #[test]
     fn sync_aborts_on_a_sidecar_conflict() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }
@@ -2172,6 +2573,7 @@ mod tests {
 
     #[test]
     fn auto_merge_preserves_a_string_blocks() {
+        let _env = isolated_registry();
         if !niutero_sync::git_available() {
             return;
         }

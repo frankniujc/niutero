@@ -8,7 +8,17 @@ use std::fs;
 use tempfile::TempDir;
 
 fn niutero() -> Command {
+    isolate_registry();
     Command::cargo_bin("niutero").expect("binary built")
+}
+
+/// Point the machine-local registry at a per-binary temp file (inherited by the
+/// spawned process) so tests never touch — or race on — the real machine one.
+fn isolate_registry() {
+    use std::sync::OnceLock;
+    static REG: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = REG.get_or_init(|| tempfile::tempdir().expect("registry tempdir"));
+    std::env::set_var("NIUTERO_REGISTRY", dir.path().join("vaults.toml"));
 }
 
 fn new_vault() -> TempDir {
@@ -332,4 +342,73 @@ fn add_accepts_balanced_tricky_value() {
         bib(&d),
         "@misc{k,\n  title = {Hello {World} and \"q\" # x}\n}\n"
     );
+}
+
+// ------------------------------------------------------------- --json output
+
+#[test]
+fn mutating_commands_emit_json() {
+    let d = new_vault();
+
+    // add --json → {"added": [...]}
+    let out = niutero()
+        .arg("add")
+        .arg(d.path())
+        .args(["--type", "misc", "--key", "k", "--field", "title=T"])
+        .arg("--json")
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\"added\""), "got: {s}");
+    assert!(s.contains("\"k\""), "got: {s}");
+
+    // tag --json → {"tags": ["nlp"]}
+    let out = niutero()
+        .arg("tag")
+        .arg(d.path())
+        .arg("k")
+        .args(["--add", "nlp"])
+        .arg("--json")
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\"tags\"") && s.contains("nlp"), "got: {s}");
+
+    // status --json → {"status":"reading"}
+    let out = niutero()
+        .arg("status")
+        .arg(d.path())
+        .arg("k")
+        .args(["--set", "reading"])
+        .arg("--json")
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        s.contains("\"status\"") && s.contains("reading"),
+        "got: {s}"
+    );
+
+    // stars --json → {"stars":3}
+    let out = niutero()
+        .arg("stars")
+        .arg(d.path())
+        .arg("k")
+        .args(["--set", "3"])
+        .arg("--json")
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\"stars\"") && s.contains('3'), "got: {s}");
+
+    // rm --json → {"removed":"k"}
+    let out = niutero()
+        .arg("rm")
+        .arg(d.path())
+        .arg("k")
+        .arg("--json")
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\"removed\"") && s.contains("\"k\""), "got: {s}");
 }

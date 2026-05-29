@@ -7,7 +7,17 @@ use std::fs;
 use tempfile::TempDir;
 
 fn niutero() -> Command {
+    isolate_registry();
     Command::cargo_bin("niutero").expect("binary built")
+}
+
+/// Point the machine-local registry at a per-binary temp file (inherited by the
+/// spawned process) so tests never touch — or race on — the real machine one.
+fn isolate_registry() {
+    use std::sync::OnceLock;
+    static REG: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = REG.get_or_init(|| tempfile::tempdir().expect("registry tempdir"));
+    std::env::set_var("NIUTERO_REGISTRY", dir.path().join("vaults.toml"));
 }
 
 const TWO: &str = r#"@article{shannon1948, title = {A Mathematical Theory}, author = {Shannon, C. E.}, year = {1948}}
