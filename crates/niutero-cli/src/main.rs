@@ -256,6 +256,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Find likely-duplicate entries; `--merge` folds each cluster into one.
+    Dedupe {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Merge each cluster into its richest entry (default just lists them).
+        #[arg(long)]
+        merge: bool,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -411,6 +422,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             set,
         } => cmd_stars(&vault, &citekey, set).map(ok),
         Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
+        Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
     }
 }
 
@@ -906,6 +918,44 @@ fn cmd_analyze(vault: &Path, json: bool) -> Result<(), String> {
         let n = c.keys.len();
         let mark = if n == 0 { "ok" } else { "!!" };
         println!("  [{mark}] {:<22} {n:>4}   {}", c.label, c.hint);
+    }
+    Ok(())
+}
+
+fn cmd_dedupe(vault: &Path, merge: bool, json: bool) -> Result<(), String> {
+    if merge {
+        let mut v = engine::open(vault)?;
+        let merges = engine::dedupe_merge(&mut v)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&merges).map_err(|e| e.to_string())?
+            );
+        } else if merges.is_empty() {
+            println!("No duplicates found.");
+        } else {
+            println!("Merged {} cluster(s):", merges.len());
+            for m in &merges {
+                println!("  kept {} (dropped {})", m.kept, m.dropped.join(", "));
+            }
+        }
+    } else {
+        let v = engine::open(vault)?;
+        let groups = engine::dedupe_preview(&v)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&groups).map_err(|e| e.to_string())?
+            );
+        } else if groups.is_empty() {
+            println!("No duplicates found.");
+        } else {
+            println!("{} duplicate cluster(s):", groups.len());
+            for g in &groups {
+                println!("  {}", g.citekeys.join(", "));
+            }
+            println!("(re-run with --merge to fold each cluster into its first entry)");
+        }
     }
     Ok(())
 }

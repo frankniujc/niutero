@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use niutero_bib::{entries, entry_line_span, parse, to_bibtex_entries, BibItem};
 use niutero_core::filter::Facets;
-use niutero_core::{filter, texscan, BibEntry, KeyPattern};
+use niutero_core::{dedup, filter, texscan, BibEntry, KeyPattern};
 use niutero_norm::{normalize_entry, NormConfig};
 use niutero_sync as git;
 use serde::{Deserialize, Serialize};
@@ -855,6 +855,11 @@ pub fn analyze(v: &Vault) -> Result<AnalysisReport, String> {
     let missing_url = keys_where(&es, |e| blank(e.get("url")) && blank(e.get("doi")));
     let missing_year = keys_where(&es, |e| blank(e.get("year")));
     let inconsistent_venues = inconsistent_venue_keys(&es);
+    let owned: Vec<BibEntry> = es.iter().map(|&e| e.clone()).collect();
+    let duplicates: Vec<String> = dedup::duplicate_groups(&owned)
+        .into_iter()
+        .flatten()
+        .collect();
 
     Ok(AnalysisReport {
         total: es.len(),
@@ -889,8 +894,144 @@ pub fn analyze(v: &Vault) -> Result<AnalysisReport, String> {
                 hint: "No publication year set".into(),
                 keys: missing_year,
             },
+            Check {
+                id: "dupes".into(),
+                label: "Likely duplicates".into(),
+                hint: "Same first author + year + title (see `dedupe`)".into(),
+                keys: duplicates,
+            },
         ],
     })
+}
+
+// ----------------------------------------------------------------- dedupe
+
+/// One duplicate cluster — cite keys that look like the same work, ordered with
+/// the entry [`dedupe_merge`] would keep (the richest, most-fields one) first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DupGroup {
+    pub citekeys: Vec<String>,
+}
+
+/// One merge that [`dedupe_merge`] performed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DupMerge {
+    pub kept: String,
+    pub dropped: Vec<String>,
+}
+
+/// Likely-duplicate clusters, without changing anything.
+pub fn dedupe_preview(v: &Vault) -> Result<Vec<DupGroup>, String> {
+    let items = read_items(v)?;
+    let es: Vec<BibEntry> = entries(&items).cloned().collect();
+    Ok(dedup::duplicate_groups(&es)
+        .into_iter()
+        .map(|g| DupGroup {
+            citekeys: order_primary_first(&es, g),
+        })
+        .collect())
+}
+
+/// Merge each duplicate cluster into its primary: union any fields the primary
+/// is missing, fold the dropped entries' sidecar in (tags unioned, highest
+/// stars / status kept, notes appended), then remove the duplicates and their
+/// metadata. Returns the merges performed.
+pub fn dedupe_merge(v: &mut Vault) -> Result<Vec<DupMerge>, String> {
+    let _lock = lock_vault(v)?;
+    let mut items = read_items(v)?;
+    let snapshot: Vec<BibEntry> = entries(&items).cloned().collect();
+    let groups = dedup::duplicate_groups(&snapshot);
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut merges = Vec::new();
+    let mut to_remove: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for group in groups {
+        let ordered = order_primary_first(&snapshot, group);
+        let (primary, others) = ordered.split_first().expect("group has ≥2 keys");
+
+        // Union into the primary entry any field it is missing (primary wins).
+        if let Some(BibItem::Entry(p)) = items
+            .iter_mut()
+            .find(|it| matches!(it, BibItem::Entry(e) if &e.citekey == primary))
+        {
+            for key in others {
+                if let Some(donor) = snapshot.iter().find(|e| &e.citekey == key) {
+                    for (name, value) in &donor.fields {
+                        if p.get(name).is_none() {
+                            p.set(name, value);
+                        }
+                    }
+                }
+            }
+            p.validate()?;
+        }
+
+        merge_dup_sidecar(v, primary, others);
+        to_remove.extend(others.iter().cloned());
+        merges.push(DupMerge {
+            kept: primary.clone(),
+            dropped: others.to_vec(),
+        });
+    }
+
+    items.retain(|it| !matches!(it, BibItem::Entry(e) if to_remove.contains(&e.citekey)));
+    write_items(v, &items)?;
+    save_sidecar(v)?;
+    Ok(merges)
+}
+
+/// Order a duplicate group with the richest entry (most fields) first — ties
+/// keep document order — so the primary is the most complete one.
+fn order_primary_first(es: &[BibEntry], mut group: Vec<String>) -> Vec<String> {
+    group.sort_by_key(|k| {
+        let fields = es
+            .iter()
+            .find(|e| &e.citekey == k)
+            .map_or(0, |e| e.fields.len());
+        std::cmp::Reverse(fields)
+    });
+    group
+}
+
+/// Fold the `dropped` entries' sidecar metadata into the `primary`'s, removing
+/// the dropped entries' metadata. Tags are unioned; the highest star rating and
+/// reading status win; distinct notes are appended.
+fn merge_dup_sidecar(v: &mut Vault, primary: &str, dropped: &[String]) {
+    let donors: Vec<EntryMeta> = dropped.iter().filter_map(|k| v.meta.remove(k)).collect();
+    if donors.is_empty() && !v.meta.contains_key(primary) {
+        return;
+    }
+    let meta = v.meta.entry(primary.to_string()).or_default();
+    for d in donors {
+        for tag in d.tags {
+            if !meta.tags.contains(&tag) {
+                meta.tags.push(tag);
+            }
+        }
+        if meta.note.is_empty() {
+            meta.note = d.note;
+        } else if !d.note.is_empty() && !meta.note.contains(&d.note) {
+            meta.note.push('\n');
+            meta.note.push_str(&d.note);
+        }
+        meta.stars = meta.stars.max(d.stars);
+        if status_rank(d.status) > status_rank(meta.status) {
+            meta.status = d.status;
+        }
+    }
+    meta.tags.sort();
+    meta.tags.dedup();
+    prune_meta(v, primary);
+}
+
+fn status_rank(s: Option<Status>) -> u8 {
+    match s {
+        Some(Status::Done) => 2,
+        Some(Status::Reading) => 1,
+        Some(Status::Unread) | None => 0,
+    }
 }
 
 fn blank(field: Option<&str>) -> bool {
@@ -2284,6 +2425,71 @@ mod tests {
         assert!(
             !by("venues").contains(&"d".to_string()) && !by("venues").contains(&"e".to_string())
         );
+    }
+
+    // --------------------------------------------------------------- dedupe
+
+    #[test]
+    fn dedupe_merges_fields_and_sidecar_keeping_the_richest() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex(
+                "@article{a, author={Vaswani, A}, year={2017}, title={Attention}, x={1}, extra={e}}"
+                    .into(),
+            ),
+        )
+        .unwrap();
+        add(
+            &v,
+            AddSource::Bibtex(
+                "@article{b, author={Vaswani, A}, year={2017}, title={Attention!}, y={2}}".into(),
+            ),
+        )
+        .unwrap();
+        set_tags(&mut v, "b", &["topics:nlp".into()], &[]).unwrap();
+        set_stars(&mut v, "b", Some(5)).unwrap();
+
+        // preview: one cluster, the richer `a` listed first (the keeper).
+        let groups = dedupe_preview(&v).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].citekeys[0], "a");
+
+        let merges = dedupe_merge(&mut v).unwrap();
+        assert_eq!(
+            merges,
+            vec![DupMerge {
+                kept: "a".into(),
+                dropped: vec!["b".into()]
+            }]
+        );
+
+        // `a` kept its own fields, gained `b`'s missing `y`, and inherited b's
+        // tag + rating; `b` is gone.
+        let a = show(&v, "a").unwrap();
+        assert_eq!(a.fields.get("x").map(String::as_str), Some("1"));
+        assert_eq!(a.fields.get("y").map(String::as_str), Some("2"));
+        assert!(a.tags.contains(&"topics:nlp".to_string()));
+        assert_eq!(a.stars, Some(5));
+        assert!(show(&v, "b").is_err());
+    }
+
+    #[test]
+    fn dedupe_is_a_noop_without_duplicates() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            fields("article", "a", &["author=X, Y", "year=2020", "title=Alpha"]),
+        )
+        .unwrap();
+        add(
+            &v,
+            fields("article", "b", &["author=Z, W", "year=2021", "title=Beta"]),
+        )
+        .unwrap();
+        assert!(dedupe_preview(&v).unwrap().is_empty());
+        assert!(dedupe_merge(&mut v).unwrap().is_empty());
+        assert!(show(&v, "a").is_ok() && show(&v, "b").is_ok());
     }
 
     // ----------------------------------------------------- structured norm diffs

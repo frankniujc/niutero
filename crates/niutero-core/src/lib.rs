@@ -6,6 +6,7 @@
 //! entries and a library of them.
 
 pub mod citekey;
+pub mod dedup;
 mod entry;
 pub mod filter;
 mod library;

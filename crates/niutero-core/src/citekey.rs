@@ -193,7 +193,7 @@ fn apply_case(s: &str, case: Case) -> String {
 /// The first author's surname, reduced to ASCII alphanumerics. Authors are
 /// `"Last, First and Last2, First2"`; for `"Last, First"` the surname is
 /// `Last`, and for `"First Last"` it is the final whitespace token.
-fn first_author_surname(authors: &str) -> String {
+pub(crate) fn first_author_surname(authors: &str) -> String {
     let first = authors.split(" and ").next().unwrap_or("").trim();
     let surname = match first.split_once(',') {
         Some((last, _)) => last.trim(),

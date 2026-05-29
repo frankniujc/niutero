@@ -268,3 +268,37 @@ fn normalize_json_emits_field_diffs() {
         .iter()
         .any(|d| d["field"] == "abstract" && d["to"].is_null()));
 }
+
+#[test]
+fn dedupe_lists_then_merges_clusters() {
+    let d = new_vault();
+    fs::write(
+        d.path().join("references.bib"),
+        concat!(
+            "@article{a,\n  author = {Vaswani, A},\n  year = {2017},\n  title = {Attention},\n  x = {1}\n}\n\n",
+            "@article{b,\n  author = {Vaswani, A},\n  year = {2017},\n  title = {Attention},\n  y = {2}\n}\n",
+        ),
+    )
+    .unwrap();
+
+    // preview lists the cluster, writes nothing
+    niutero()
+        .arg("dedupe")
+        .arg(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("duplicate cluster"));
+    assert!(bib(&d).contains("@article{b,"), "preview must not merge");
+
+    // --merge folds b into a
+    niutero()
+        .arg("dedupe")
+        .arg(d.path())
+        .arg("--merge")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Merged 1 cluster"));
+    let after = bib(&d);
+    assert!(after.contains("@article{a,") && !after.contains("@article{b,"));
+    assert!(after.contains("x = {1}") && after.contains("y = {2}"));
+}
