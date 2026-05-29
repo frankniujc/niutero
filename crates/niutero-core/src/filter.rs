@@ -21,7 +21,7 @@ fn term_matches(term: &str, entry: &BibEntry, tags: &[String]) -> bool {
     }
     let needle = term.to_lowercase();
     entry.citekey.to_lowercase().contains(&needle)
-        || entry.entry_type.contains(&needle)
+        || entry.entry_type().contains(&needle)
         || entry
             .fields
             .values()

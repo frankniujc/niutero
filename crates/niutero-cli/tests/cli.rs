@@ -39,6 +39,28 @@ fn init_creates_vault() {
     assert!(root.join("references.bib").exists());
     assert!(root.join(".niutero").join("config.toml").exists());
     assert!(root.join(".niutero").join("meta.json").exists());
+    assert!(root.join("README.md").exists());
+    assert!(root.join(".niutero").join("norm.toml").exists());
+}
+
+#[test]
+fn cite_prints_latex_and_errors_on_missing() {
+    let dir = vault_with(TWO);
+    niutero()
+        .arg("cite")
+        .arg(dir.path())
+        .arg("shannon1948")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\\cite{shannon1948}"));
+    niutero()
+        .arg("cite")
+        .arg(dir.path())
+        .arg("nope")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no entry"));
 }
 
 #[test]

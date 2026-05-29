@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BibEntry {
     pub citekey: String,
-    pub entry_type: String,
+    /// Private so it can't be set un-lowercased — use [`entry_type`](Self::entry_type)
+    /// / [`set_type`](Self::set_type), which keep the lowercase invariant.
+    entry_type: String,
     pub fields: IndexMap<String, String>,
 }
 
@@ -24,6 +26,16 @@ impl BibEntry {
             entry_type: entry_type.into().to_ascii_lowercase(),
             fields: IndexMap::new(),
         }
+    }
+
+    /// The (lowercased) entry type, e.g. `"article"`.
+    pub fn entry_type(&self) -> &str {
+        &self.entry_type
+    }
+
+    /// Set the entry type, lowercasing it (BibTeX types are case-insensitive).
+    pub fn set_type(&mut self, entry_type: impl Into<String>) {
+        self.entry_type = entry_type.into().to_ascii_lowercase();
     }
 
     /// Builder-style field insert. See [`set`](Self::set).

@@ -45,7 +45,7 @@ mod tests {
             BibEntry::new("book", "b"),
         ]);
         assert_eq!(lib.len(), 2);
-        assert_eq!(lib.get("b").unwrap().entry_type, "book");
+        assert_eq!(lib.get("b").unwrap().entry_type(), "book");
         assert!(lib.get("missing").is_none());
     }
 }

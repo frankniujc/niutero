@@ -1,15 +1,32 @@
+use std::borrow::Cow;
+
 use crate::item::BibItem;
 use niutero_core::BibEntry;
 
 /// Parse `.bib` source into an ordered item stream. Tolerant: malformed input
-/// is captured verbatim rather than dropped, and never panics.
+/// is captured verbatim rather than dropped, and never panics. A leading UTF-8
+/// BOM is stripped and CRLF / lone CR are normalized to LF first, so a file
+/// authored on Windows (or with a BOM) round-trips to clean LF output instead
+/// of churning or leaving a stray verbatim block.
 pub fn parse(src: &str) -> Vec<BibItem> {
+    let normalized = normalize_input(src);
     Parser {
-        src,
-        b: src.as_bytes(),
+        src: normalized.as_ref(),
+        b: normalized.as_bytes(),
         i: 0,
     }
     .run()
+}
+
+/// Strip a leading UTF-8 BOM and normalize line endings to `\n`. Borrows when
+/// there is nothing to change (the common case).
+fn normalize_input(src: &str) -> Cow<'_, str> {
+    let stripped = src.strip_prefix('\u{feff}').unwrap_or(src);
+    if stripped.contains('\r') {
+        Cow::Owned(stripped.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(stripped)
+    }
 }
 
 struct Parser<'a> {
@@ -284,7 +301,7 @@ mod tests {
     #[test]
     fn basic_entry() {
         let e = one_entry("@Article{key, Title = {Hello}, Year = 2025}");
-        assert_eq!(e.entry_type, "article");
+        assert_eq!(e.entry_type(), "article");
         assert_eq!(e.citekey, "key");
         assert_eq!(e.get("title"), Some("Hello"));
         assert_eq!(e.get("year"), Some("2025"));
@@ -369,5 +386,15 @@ mod tests {
     fn concatenation_kept_raw() {
         let e = one_entry(r#"@misc{k, m = jan # " 2020"}"#);
         assert_eq!(e.get("m"), Some(r#"jan # " 2020""#));
+    }
+
+    #[test]
+    fn bom_and_crlf_are_normalized() {
+        let lf = "@misc{k,\n  title = {Hi}\n}\n";
+        let crlf_bom = "\u{feff}@misc{k,\r\n  title = {Hi}\r\n}\r\n";
+        assert_eq!(parse(crlf_bom), parse(lf));
+        let out = crate::to_bibtex(&parse(crlf_bom));
+        assert!(!out.contains('\r'), "no CR in canonical output");
+        assert!(!out.contains('\u{feff}'), "no BOM in canonical output");
     }
 }

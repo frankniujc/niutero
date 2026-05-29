@@ -148,17 +148,24 @@ impl Vault {
                 format!("{} is not a directory", root.display()),
             ));
         }
+        // Fall back to defaults only when a sidecar file is *absent*. Other IO
+        // errors (permissions, a half-written file) propagate, so we never mask
+        // a corrupt sidecar and then overwrite it with empty defaults.
         let config = match fs::read_to_string(root.join(".niutero").join("config.toml")) {
             Ok(s) => toml::from_str(&s).map_err(invalid_data)?,
-            Err(_) => Config::named(folder_name(&root)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Config::named(folder_name(&root)),
+            Err(e) => return Err(e),
         };
         let meta = match fs::read_to_string(root.join(".niutero").join("meta.json")) {
-            Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).map_err(invalid_data)?,
-            _ => Meta::new(),
+            Ok(s) if s.trim().is_empty() => Meta::new(),
+            Ok(s) => serde_json::from_str(&s).map_err(invalid_data)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Meta::new(),
+            Err(e) => return Err(e),
         };
         let views = match fs::read_to_string(root.join(".niutero").join("views.toml")) {
             Ok(s) => toml::from_str(&s).map_err(invalid_data)?,
-            Err(_) => Views::default(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Views::default(),
+            Err(e) => return Err(e),
         };
         Ok(Vault {
             root,
@@ -375,5 +382,19 @@ mod tests {
         let s = fs::read_to_string(v.bib_path()).unwrap();
         assert!(s.contains("@misc{b"));
         assert!(!s.contains("@misc{a"));
+    }
+
+    #[test]
+    fn open_errors_on_malformed_sidecar() {
+        // A present-but-corrupt sidecar must error, not silently fall back to
+        // defaults (which a later save would then persist over the real data).
+        let dir = tmp();
+        Vault::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".niutero").join("config.toml"),
+            "not valid = = toml {{{",
+        )
+        .unwrap();
+        assert!(Vault::open(dir.path()).is_err());
     }
 }

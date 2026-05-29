@@ -48,7 +48,33 @@ impl NormConfig {
             Err(_) => Self::default(),
         }
     }
+
+    /// Write a documented default `norm.toml` into `<niutero_dir>`, only if one
+    /// isn't already there (so `init` can surface the knobs).
+    pub fn write_default_if_absent(niutero_dir: &Path) -> std::io::Result<()> {
+        let path = niutero_dir.join("norm.toml");
+        if path.exists() {
+            return Ok(());
+        }
+        std::fs::write(path, DEFAULT_NORM_TOML)
+    }
 }
+
+/// The documented default written by [`NormConfig::write_default_if_absent`].
+/// Kept in sync with [`NormConfig::default`] (a test asserts they match).
+const DEFAULT_NORM_TOML: &str = "\
+# niutero offline normalization config. `niutero normalize` is propose-only:
+# it shows what would change; nothing is written without --write.
+
+# Field names to drop from entries.
+drop_fields = [\"abstract\", \"file\", \"keywords\", \"urldate\", \"annote\"]
+
+# Collapse runs of whitespace and trim each field value.
+tidy_whitespace = true
+
+# Add `archiveprefix = {arXiv}` to entries that have an `eprint`.
+arxiv = true
+";
 
 /// Apply the offline rules to `entry`, returning the normalized entry and a
 /// list of human-readable notes describing what changed (empty if nothing did).
@@ -150,5 +176,14 @@ mod tests {
         let e = BibEntry::new("article", "k").with_field("title", "Clean Title");
         let (_, notes) = normalize_entry(&e, &NormConfig::default());
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn default_toml_matches_default_config() {
+        let parsed: NormConfig = toml::from_str(DEFAULT_NORM_TOML).unwrap();
+        let d = NormConfig::default();
+        assert_eq!(parsed.drop_fields, d.drop_fields);
+        assert_eq!(parsed.tidy_whitespace, d.tidy_whitespace);
+        assert_eq!(parsed.arxiv, d.arxiv);
     }
 }

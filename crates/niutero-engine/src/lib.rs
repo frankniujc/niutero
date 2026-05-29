@@ -28,6 +28,7 @@ pub struct EntryView {
     pub fields: IndexMap<String, String>,
     pub tags: Vec<String>,
     pub note: String,
+    pub added: Option<String>,
 }
 
 /// Which entries [`list`] returns.
@@ -56,9 +57,14 @@ pub fn open(path: &Path) -> Result<Vault, String> {
     Vault::open(path).map_err(|e| format!("open {}: {e}", path.display()))
 }
 
-/// Initialize a folder as a vault.
+/// Initialize a folder as a vault, scaffolding a README and a default
+/// `norm.toml` (both only if absent).
 pub fn init(path: &Path) -> Result<Vault, String> {
-    Vault::init(path).map_err(|e| format!("init {}: {e}", path.display()))
+    let v = Vault::init(path).map_err(|e| format!("init {}: {e}", path.display()))?;
+    write_readme_if_absent(&v).map_err(|e| format!("write README.md: {e}"))?;
+    niutero_norm::NormConfig::write_default_if_absent(&v.niutero_dir())
+        .map_err(|e| format!("write norm.toml: {e}"))?;
+    Ok(v)
 }
 
 /// Entries matching `filter`, each with its sidecar tags/notes.
@@ -146,7 +152,7 @@ pub fn edit(
     let idx = find_entry(&items, citekey)?;
     if let BibItem::Entry(e) = &mut items[idx] {
         if let Some(t) = type_ {
-            e.entry_type = t.to_ascii_lowercase();
+            e.set_type(t);
         }
         for f in fields {
             let (name, value) = split_field(f)?;
@@ -384,6 +390,12 @@ pub fn export_keys(v: &Vault, keys: &[String], out: &Path) -> Result<usize, Stri
     Ok(selected.len())
 }
 
+/// `\cite{key}` for an entry (errors if the cite key is absent).
+pub fn cite(v: &Vault, citekey: &str) -> Result<String, String> {
+    entry_exists(v, citekey)?;
+    Ok(format!("\\cite{{{citekey}}}"))
+}
+
 // ------------------------------------------------------------------- sync
 
 /// Outcome of a [`sync`].
@@ -533,17 +545,32 @@ fn find_entry(items: &[BibItem], citekey: &str) -> Result<usize, String> {
 }
 
 fn view_of(entry: &BibEntry, v: &Vault) -> EntryView {
-    let (tags, note) = match v.meta.get(&entry.citekey) {
-        Some(m) => (m.tags.clone(), m.note.clone()),
-        None => (Vec::new(), String::new()),
-    };
+    let meta = v.meta.get(&entry.citekey);
     EntryView {
         citekey: entry.citekey.clone(),
-        entry_type: entry.entry_type.clone(),
+        entry_type: entry.entry_type().to_string(),
         fields: entry.fields.clone(),
-        tags,
-        note,
+        tags: meta.map(|m| m.tags.clone()).unwrap_or_default(),
+        note: meta.map(|m| m.note.clone()).unwrap_or_default(),
+        added: meta.and_then(|m| m.added.clone()),
     }
+}
+
+/// Write a vault README explaining the layout, only if one isn't there.
+fn write_readme_if_absent(v: &Vault) -> std::io::Result<()> {
+    let path = v.root.join("README.md");
+    if path.exists() {
+        return Ok(());
+    }
+    let readme = format!(
+        "# {}\n\nA niutero citation library. `references.bib` is the portable \
+source of truth — hand it to any tool. niutero's private data (tags, notes, \
+saved views, config) lives in `.niutero/` and never touches the `.bib`.\n\n\
+Edit with the `niutero` CLI, or edit `references.bib` directly; the `.niutero/` \
+sidecar is safe to commit alongside the library.\n",
+        v.config.name
+    );
+    std::fs::write(path, readme)
 }
 
 fn split_field(s: &str) -> Result<(&str, &str), String> {
@@ -992,5 +1019,20 @@ mod tests {
         )
         .unwrap();
         assert!(normalize_preview(&v).unwrap().is_empty());
+    }
+
+    #[test]
+    fn init_scaffolds_readme_and_norm_toml() {
+        let (d, _v) = vault();
+        assert!(d.path().join("README.md").exists());
+        assert!(d.path().join(".niutero").join("norm.toml").exists());
+    }
+
+    #[test]
+    fn cite_formats_existing_and_errors_on_missing() {
+        let (_d, v) = vault();
+        add(&v, fields("misc", "k", &[])).unwrap();
+        assert_eq!(cite(&v, "k").unwrap(), "\\cite{k}");
+        assert!(cite(&v, "nope").unwrap_err().contains("no entry"));
     }
 }

@@ -2,8 +2,9 @@
 //! into engine requests and formats results; every operation lives in the
 //! engine, so the future GUI drives the exact same code.
 //!
-//! Exit codes: 0 = ok, 1 = error (bad usage / IO / not found). clap itself
-//! exits 2 on argument-parse errors.
+//! Exit codes: 0 = ok; 1 = error (bad usage / IO / not found); 2 = actionable
+//! (a CI gate — `tex-scan` undefined refs, `normalize --check` would-change,
+//! `sync` conflict). clap also exits 2 on argument-parse errors.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -193,6 +194,13 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Print `\cite{key}` for an entry (to paste into LaTeX).
+    Cite {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -307,6 +315,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             write,
             check,
         } => cmd_normalize(&vault, write, check),
+        Cmd::Cite { vault, citekey } => cmd_cite(&vault, &citekey).map(ok),
     }
 }
 
@@ -670,4 +679,10 @@ fn cmd_normalize(vault: &Path, write: bool, check: bool) -> Result<ExitCode, Str
         println!("(dry run — re-run with --write to apply)");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_cite(vault: &Path, citekey: &str) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    println!("{}", engine::cite(&v, citekey)?);
+    Ok(())
 }

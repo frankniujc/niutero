@@ -31,7 +31,7 @@ fn join(blocks: Vec<String>) -> String {
 fn entry_block(e: &BibEntry) -> String {
     let mut s = String::new();
     s.push('@');
-    s.push_str(&e.entry_type);
+    s.push_str(e.entry_type());
     s.push('{');
     s.push_str(&e.citekey);
     if e.fields.is_empty() {

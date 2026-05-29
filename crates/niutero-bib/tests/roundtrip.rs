@@ -43,7 +43,7 @@ fn fixture_structure_and_idempotence() {
             _ => None,
         })
         .expect("shannon1948 present");
-    assert_eq!(shannon.entry_type, "article"); // lowercased from @Article
+    assert_eq!(shannon.entry_type(), "article"); // lowercased from @Article
     assert_eq!(
         shannon.get("title"),
         Some("A Mathematical Theory of Communication") // de-quoted
