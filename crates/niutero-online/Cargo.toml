@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# No runtime dependencies: online lookups shell out to the system `curl`, the
-# same way niutero-sync shells out to `git`. niutero never links an HTTP/TLS
-# stack, and these features stay strictly off the offline base path.
+# HTTP is shelled out to the system `curl` (no HTTP/TLS stack linked), the same
+# way niutero-sync shells out to `git`. `serde_json` is only for building the
+# LLM request and parsing its JSON reply. These features stay strictly off the
+# offline base path.
+
+[dependencies]
+serde_json = { workspace = true }

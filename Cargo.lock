@@ -415,6 +415,9 @@ dependencies = [
 [[package]]
 name = "niutero-online"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "niutero-sync"

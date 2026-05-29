@@ -303,6 +303,14 @@ enum Cmd {
         #[arg(long)]
         fetch: bool,
     },
+    /// Online (LLM): suggest tags for an entry ($ANTHROPIC_API_KEY). Prints
+    /// suggestions to review — apply with `tag --add`.
+    SuggestTags {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key.
+        citekey: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -469,6 +477,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             attach,
             fetch,
         } => cmd_pdf(&vault, &citekey, attach, fetch).map(ok),
+        Cmd::SuggestTags { vault, citekey } => cmd_suggest_tags(&vault, &citekey).map(ok),
     }
 }
 
@@ -771,6 +780,21 @@ fn cmd_pdf(
             "not attached"
         };
         println!("{} ({status})", path.display());
+    }
+    Ok(())
+}
+
+fn cmd_suggest_tags(vault: &Path, citekey: &str) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    let tags = engine::suggest_tags(&v, citekey)?;
+    if tags.is_empty() {
+        println!("(no suggestions)");
+    } else {
+        println!("Suggested tags for {citekey}:");
+        for t in &tags {
+            println!("  {t}");
+        }
+        println!("Apply with: niutero tag {citekey} --add <tag>");
     }
     Ok(())
 }

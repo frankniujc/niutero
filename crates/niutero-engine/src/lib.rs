@@ -555,6 +555,75 @@ fn ensure_pdfs_gitignored(v: &Vault) -> Result<(), String> {
     std::fs::write(&path, next).map_err(|e| format!("write .gitignore: {e}"))
 }
 
+// --------------------------------------------------------------- AI assist
+
+/// **Online (LLM).** Ask Claude to suggest tags for an entry, drawing on the
+/// library's existing tag vocabulary so suggestions reuse the user's namespaces
+/// (`topics:`/`wf:`/…). Suggestion-only — it returns tags to review, it does NOT
+/// apply them (use `tag --add`). Needs `$ANTHROPIC_API_KEY` and network access.
+pub fn suggest_tags(v: &Vault, citekey: &str) -> Result<Vec<String>, String> {
+    let view = show(v, citekey)?; // errors if the entry is absent
+    let (system, user) = tag_prompt(&view, &tag_vocabulary(v));
+    let text = niutero_online::anthropic_text(SUGGEST_MODEL, &system, &user)?;
+    Ok(parse_tag_list(&text))
+}
+
+/// A small, fast model is plenty for tagging.
+const SUGGEST_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// Every distinct tag in use across the library, sorted.
+fn tag_vocabulary(v: &Vault) -> Vec<String> {
+    let mut tags: Vec<String> = v.meta.values().flat_map(|m| m.tags.clone()).collect();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+/// Build the (system, user) prompts for tag suggestion. Pure.
+fn tag_prompt(view: &EntryView, vocab: &[String]) -> (String, String) {
+    let system = "You tag bibliography entries for a researcher's library. Reply with ONLY a \
+        comma-separated list of tags, reusing the existing vocabulary and its namespaces (e.g. \
+        topics:foo, wf:bar) where they fit; propose a new namespaced tag only when nothing fits. \
+        No prose."
+        .to_string();
+    let field = |name: &str| view.fields.get(name).map(String::as_str).unwrap_or("");
+    let venue = if field("booktitle").is_empty() {
+        field("journal")
+    } else {
+        field("booktitle")
+    };
+    let user = format!(
+        "Existing tags: {}\n\nEntry:\n  title: {}\n  author: {}\n  venue: {}\n\nSuggest up to 5 tags.",
+        if vocab.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            vocab.join(", ")
+        },
+        field("title"),
+        field("author"),
+        venue,
+    );
+    (system, user)
+}
+
+/// Parse an LLM tag list (comma- or newline-separated, possibly bulleted or
+/// quoted) into clean, deduplicated tags. Pure.
+fn parse_tag_list(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split([',', '\n']) {
+        let t = raw
+            .trim()
+            .trim_start_matches(['-', '*', '•'])
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+            .trim();
+        if !t.is_empty() && t.chars().count() <= 60 && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
 /// Write the entries matching `filter` to a standalone `.bib` at `out`.
 /// Returns the number of entries written.
 pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
@@ -2638,6 +2707,32 @@ mod tests {
         assert!(
             !by("venues").contains(&"d".to_string()) && !by("venues").contains(&"e".to_string())
         );
+    }
+
+    // --------------------------------------------------------- AI assist (pure)
+
+    #[test]
+    fn parse_tag_list_cleans_llm_output() {
+        // commas, newlines, bullets, quotes, and duplicates all handled
+        let text = "topics:nlp, \"topics:sae\"\n- wf:to-cite\n* topics:nlp\n`topics:eval`";
+        assert_eq!(
+            parse_tag_list(text),
+            vec![
+                "topics:nlp".to_string(),
+                "topics:sae".to_string(),
+                "wf:to-cite".to_string(),
+                "topics:eval".to_string(),
+            ]
+        );
+        assert!(parse_tag_list("   ").is_empty());
+    }
+
+    #[test]
+    fn suggest_tags_errors_on_a_missing_entry_before_any_call() {
+        let (_d, v) = vault();
+        assert!(suggest_tags(&v, "ghost")
+            .unwrap_err()
+            .contains("no entry with cite key 'ghost'"));
     }
 
     // ----------------------------------------------------------------- PDFs
