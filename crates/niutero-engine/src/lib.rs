@@ -959,7 +959,10 @@ pub fn dedupe_merge(v: &mut Vault) -> Result<Vec<DupMerge>, String> {
             for key in others {
                 if let Some(donor) = snapshot.iter().find(|e| &e.citekey == key) {
                     for (name, value) in &donor.fields {
-                        if p.get(name).is_none() {
+                        // A blank placeholder (e.g. `doi = {}`) on the primary
+                        // counts as missing, so a donor's real value fills it in.
+                        let primary_blank = p.get(name).is_none_or(|v| v.trim().is_empty());
+                        if primary_blank && !value.trim().is_empty() {
                             p.set(name, value);
                         }
                     }
@@ -982,15 +985,16 @@ pub fn dedupe_merge(v: &mut Vault) -> Result<Vec<DupMerge>, String> {
     Ok(merges)
 }
 
-/// Order a duplicate group with the richest entry (most fields) first — ties
-/// keep document order — so the primary is the most complete one.
+/// Order a duplicate group with the richest entry first (ties keep document
+/// order) so the primary is the most complete one. "Richest" counts only
+/// non-blank fields, so an entry padded with empty placeholders (`doi = {}`)
+/// isn't mistaken for the fuller one.
 fn order_primary_first(es: &[BibEntry], mut group: Vec<String>) -> Vec<String> {
     group.sort_by_key(|k| {
-        let fields = es
-            .iter()
-            .find(|e| &e.citekey == k)
-            .map_or(0, |e| e.fields.len());
-        std::cmp::Reverse(fields)
+        let filled = es.iter().find(|e| &e.citekey == k).map_or(0, |e| {
+            e.fields.values().filter(|v| !v.trim().is_empty()).count()
+        });
+        std::cmp::Reverse(filled)
     });
     group
 }
@@ -2499,6 +2503,40 @@ mod tests {
         assert!(a.tags.contains(&"topics:nlp".to_string()));
         assert_eq!(a.stars, Some(5));
         assert!(show(&v, "b").is_err());
+    }
+
+    #[test]
+    fn dedupe_fills_blank_keeper_fields_from_the_donor() {
+        let (_d, mut v) = vault();
+        // `a` looks richer by raw count but its doi/url are blank placeholders;
+        // `b` is leaner but has the real values. The merge must keep them.
+        add(
+            &v,
+            AddSource::Bibtex(
+                "@article{a, author={Vaswani, A}, year={2017}, title={Attention}, doi={}, url={}}"
+                    .into(),
+            ),
+        )
+        .unwrap();
+        add(
+            &v,
+            AddSource::Bibtex(
+                "@article{b, author={Vaswani, A}, year={2017}, title={Attention}, doi={10.5555/real}, url={https://real}}"
+                    .into(),
+            ),
+        )
+        .unwrap();
+        let merges = dedupe_merge(&mut v).unwrap();
+        assert_eq!(merges.len(), 1);
+        let kept = show(&v, &merges[0].kept).unwrap();
+        assert_eq!(
+            kept.fields.get("doi").map(String::as_str),
+            Some("10.5555/real")
+        );
+        assert_eq!(
+            kept.fields.get("url").map(String::as_str),
+            Some("https://real")
+        );
     }
 
     #[test]

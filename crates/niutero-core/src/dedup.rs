@@ -38,12 +38,9 @@ fn signature(e: &BibEntry) -> Option<String> {
     if title.is_empty() || surname.is_empty() {
         return None;
     }
-    let year: String = e
-        .get("year")
-        .unwrap_or("")
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect();
+    // Keep any disambiguating letter ("2020a" != "2020b" — distinct works) while
+    // still folding punctuation/case.
+    let year = alnum_fold(e.get("year").unwrap_or(""));
     Some(format!("{surname}\u{1f}{year}\u{1f}{title}"))
 }
 
@@ -82,6 +79,16 @@ mod tests {
             e("a", "Smith, J", "2020", "A Study"),
             e("b", "Smith, J", "2021", "A Study"), // different year
             e("c", "Jones, K", "2020", "A Study"), // different author
+        ];
+        assert!(duplicate_groups(&entries).is_empty());
+    }
+
+    #[test]
+    fn year_disambiguation_suffix_keeps_works_distinct() {
+        // 2020a / 2020b mark DIFFERENT works — must not be grouped.
+        let entries = [
+            e("a", "Smith, J", "2020a", "A Study"),
+            e("b", "Smith, J", "2020b", "A Study"),
         ];
         assert!(duplicate_groups(&entries).is_empty());
     }
