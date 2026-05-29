@@ -8,6 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod connector;
+pub use connector::serve_connector;
+
 use indexmap::IndexMap;
 use niutero_bib::{entries, entry_line_span, parse, to_bibtex_entries, BibItem};
 use niutero_core::filter::Facets;
@@ -455,6 +458,20 @@ fn fill_missing(entry: &mut BibEntry, fetched: &BibEntry) -> Vec<String> {
         }
     }
     filled
+}
+
+// ----------------------------------------------------------- browser connector
+
+/// Add BibTeX captured by the browser connector, skipping any entry whose cite
+/// key already exists (re-capturing a saved paper is a no-op). The server loop
+/// lives in [`serve_connector`]; this is the per-capture operation.
+pub fn capture(v: &Vault, bibtex: &str) -> Result<ImportReport, String> {
+    let _lock = lock_vault(v)?;
+    let incoming: Vec<BibEntry> = entries(&parse(bibtex)).cloned().collect();
+    if incoming.is_empty() {
+        return Err("no BibTeX entries in the captured payload".into());
+    }
+    merge_incoming(v, incoming, DupPolicy::Skip)
 }
 
 /// Write the entries matching `filter` to a standalone `.bib` at `out`.

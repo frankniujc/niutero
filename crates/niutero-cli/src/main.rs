@@ -280,6 +280,14 @@ enum Cmd {
         /// Cite key to enrich.
         citekey: String,
     },
+    /// Run the browser-connector server (loopback) until stopped (Ctrl-C).
+    Connector {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Loopback port to listen on.
+        #[arg(long, default_value_t = 23510)]
+        port: u16,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -439,6 +447,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
         Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
         Cmd::Enrich { vault, citekey } => cmd_enrich(&vault, &citekey).map(ok),
+        Cmd::Connector { vault, port } => cmd_connector(&vault, port).map(ok),
     }
 }
 
@@ -709,6 +718,12 @@ fn cmd_enrich(vault: &Path, citekey: &str) -> Result<(), String> {
         println!("{citekey}: filled {}", filled.join(", "));
     }
     Ok(())
+}
+
+fn cmd_connector(vault: &Path, port: u16) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    println!("Browser connector listening on http://127.0.0.1:{port}  (POST BibTeX to /capture; Ctrl-C to stop)");
+    engine::serve_connector(&v, port)
 }
 
 fn cmd_export(
