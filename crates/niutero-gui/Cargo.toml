@@ -15,6 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+# Pull wgpu directly (same 27.x eframe uses) so its default GPU backends —
+# DX12/Vulkan on Windows, Metal on macOS, Vulkan/GL on Linux — are enabled.
+# `eframe`'s `wgpu` feature alone wires the integration but selects no backend.
+wgpu = "27"
 niutero-engine = { path = "../niutero-engine" }
 # eframe pinned via `cargo add` to the latest release compatible with the 1.89
 # toolchain; wgpu backend for GPU rendering.

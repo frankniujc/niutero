@@ -51,11 +51,14 @@ pub struct NiuteroApp {
     library: Option<Library>,
     /// Set when opening a library fails, shown in the empty state.
     open_error: Option<String>,
-    fonts_installed: bool,
 }
 
 impl NiuteroApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Fonts must be bound before the first frame uses the custom serif/mono
+        // families: `set_fonts` only takes effect on the *next* frame, so doing
+        // it here (not in `update`) avoids a "family not bound" panic on frame 1.
+        theme::install_fonts(&cc.egui_ctx);
         // Boot a library: an explicit path arg wins, else the most-recently
         // opened vault from the machine-local registry.
         let path = std::env::args().nth(1).map(PathBuf::from).or_else(|| {
@@ -76,7 +79,6 @@ impl NiuteroApp {
             lib_view: LibView::Classic,
             library,
             open_error,
-            fonts_installed: false,
         }
     }
 
@@ -99,10 +101,6 @@ impl eframe::App for NiuteroApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.fonts_installed {
-            theme::install_fonts(ctx);
-            self.fonts_installed = true;
-        }
         let theme = Theme::of(self.dark);
         theme.apply(ctx);
 
