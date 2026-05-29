@@ -394,6 +394,7 @@ dependencies = [
  "niutero-bib",
  "niutero-core",
  "niutero-norm",
+ "niutero-online",
  "niutero-sync",
  "niutero-vault",
  "serde",
@@ -410,6 +411,10 @@ dependencies = [
  "serde",
  "toml",
 ]
+
+[[package]]
+name = "niutero-online"
+version = "0.1.0"
 
 [[package]]
 name = "niutero-sync"

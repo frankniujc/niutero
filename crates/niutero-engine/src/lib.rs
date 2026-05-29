@@ -324,10 +324,10 @@ pub struct ImportReport {
     pub renamed: Vec<(String, String)>,
 }
 
-/// Merge the entries of an external `.bib` into the library under `policy`.
-/// The whole import is atomic: if any entry is invalid the library is left
-/// untouched (validation happens before the single write). Existing entries
-/// and verbatim blocks are preserved.
+/// Merge the entries of an external `.bib` file into the library under
+/// `policy`. The whole import is atomic: if any entry is invalid the library is
+/// left untouched (validation happens before the single write). Existing
+/// entries and verbatim blocks are preserved.
 pub fn import(v: &Vault, file: &Path, policy: DupPolicy) -> Result<ImportReport, String> {
     let _lock = lock_vault(v)?;
     let src = std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
@@ -335,7 +335,28 @@ pub fn import(v: &Vault, file: &Path, policy: DupPolicy) -> Result<ImportReport,
     if incoming.is_empty() {
         return Err("no BibTeX entries found in the file".into());
     }
+    merge_incoming(v, incoming, policy)
+}
 
+/// **Online.** Fetch an entry's BibTeX from its DOI (via doi.org) and import it
+/// under `policy`. Needs network access; the offline core never calls this.
+pub fn import_doi(v: &Vault, doi: &str, policy: DupPolicy) -> Result<ImportReport, String> {
+    let _lock = lock_vault(v)?;
+    let src = niutero_online::fetch_doi_bibtex(doi)?;
+    let incoming: Vec<BibEntry> = entries(&parse(&src)).cloned().collect();
+    if incoming.is_empty() {
+        return Err(format!("doi.org returned no BibTeX entries for {doi}"));
+    }
+    merge_incoming(v, incoming, policy)
+}
+
+/// Merge `incoming` entries into the library under `policy`. The caller must
+/// already hold the vault lock.
+fn merge_incoming(
+    v: &Vault,
+    incoming: Vec<BibEntry>,
+    policy: DupPolicy,
+) -> Result<ImportReport, String> {
     let mut items = read_items(v)?;
     let mut keys: std::collections::HashSet<String> =
         entries(&items).map(|e| e.citekey.clone()).collect();
@@ -371,6 +392,69 @@ pub fn import(v: &Vault, file: &Path, policy: DupPolicy) -> Result<ImportReport,
 
     write_items(v, &items)?;
     Ok(report)
+}
+
+// -------------------------------------------------------------- online enrich
+
+/// **Online.** Fill in fields an entry is missing by fetching its canonical
+/// record from its DOI (doi.org). Never overwrites a field the entry already
+/// has with a non-blank value. Returns the names of the fields that were
+/// filled. The entry must carry a DOI (a `doi` field, or a doi.org `url`).
+pub fn enrich(v: &Vault, citekey: &str) -> Result<Vec<String>, String> {
+    let _lock = lock_vault(v)?;
+    let mut items = read_items(v)?;
+    let idx = find_entry(&items, citekey)?;
+    let doi = match &items[idx] {
+        BibItem::Entry(e) => entry_doi(e),
+        BibItem::Verbatim(_) => None,
+    }
+    .ok_or_else(|| format!("'{citekey}' has no DOI to enrich from"))?;
+
+    let src = niutero_online::fetch_doi_bibtex(&doi)?;
+    let fetched = entries(&parse(&src))
+        .next()
+        .cloned()
+        .ok_or_else(|| format!("doi.org returned no BibTeX for {doi}"))?;
+
+    let filled = match &mut items[idx] {
+        BibItem::Entry(e) => fill_missing(e, &fetched),
+        BibItem::Verbatim(_) => Vec::new(),
+    };
+    if !filled.is_empty() {
+        if let BibItem::Entry(e) = &items[idx] {
+            e.validate()?;
+        }
+        write_items(v, &items)?;
+    }
+    Ok(filled)
+}
+
+/// The DOI to enrich `entry` from: its `doi` field, else a DOI parsed out of a
+/// doi.org `url`. Pure.
+fn entry_doi(entry: &BibEntry) -> Option<String> {
+    if let Some(doi) = entry.get("doi").map(str::trim).filter(|d| !d.is_empty()) {
+        return Some(doi.to_string());
+    }
+    let url = entry.get("url")?.trim();
+    url.strip_prefix("https://doi.org/")
+        .or_else(|| url.strip_prefix("http://doi.org/"))
+        .map(|d| d.trim_matches('/').to_string())
+        .filter(|d| !d.is_empty())
+}
+
+/// Copy any field present on `fetched` but missing (or blank) on `entry`,
+/// without overwriting what the entry already has. Returns the filled names.
+/// Pure.
+fn fill_missing(entry: &mut BibEntry, fetched: &BibEntry) -> Vec<String> {
+    let mut filled = Vec::new();
+    for (name, value) in &fetched.fields {
+        let have = entry.get(name).is_some_and(|v| !v.trim().is_empty());
+        if !have && !value.trim().is_empty() {
+            entry.set(name, value);
+            filled.push(name.clone());
+        }
+    }
+    filled
 }
 
 /// Write the entries matching `filter` to a standalone `.bib` at `out`.
@@ -2456,6 +2540,47 @@ mod tests {
         assert!(
             !by("venues").contains(&"d".to_string()) && !by("venues").contains(&"e".to_string())
         );
+    }
+
+    // -------------------------------------------------- online enrich (pure parts)
+
+    #[test]
+    fn fill_missing_only_fills_absent_or_blank_fields() {
+        let mut e = BibEntry::new("article", "k")
+            .with_field("title", "Mine") // present — must be kept
+            .with_field("doi", ""); // blank — should be filled
+        let fetched = BibEntry::new("article", "x")
+            .with_field("title", "Canonical") // must NOT overwrite
+            .with_field("doi", "10.1/x")
+            .with_field("year", "2020"); // absent — should be filled
+        let filled = fill_missing(&mut e, &fetched);
+        assert_eq!(e.get("title"), Some("Mine")); // not overwritten
+        assert_eq!(e.get("doi"), Some("10.1/x")); // blank filled
+        assert_eq!(e.get("year"), Some("2020")); // absent filled
+        assert_eq!(filled, vec!["doi".to_string(), "year".to_string()]);
+    }
+
+    #[test]
+    fn entry_doi_prefers_doi_field_then_doi_url() {
+        let with_doi = BibEntry::new("misc", "k").with_field("doi", "10.1/x");
+        assert_eq!(entry_doi(&with_doi).as_deref(), Some("10.1/x"));
+        let with_url = BibEntry::new("misc", "k").with_field("url", "https://doi.org/10.2/y");
+        assert_eq!(entry_doi(&with_url).as_deref(), Some("10.2/y"));
+        let neither = BibEntry::new("misc", "k").with_field("url", "https://example.com/p");
+        assert_eq!(entry_doi(&neither), None);
+    }
+
+    #[test]
+    fn enrich_errors_before_any_network_call() {
+        let (_d, v) = vault();
+        add(&v, fields("misc", "k", &["title=T"])).unwrap(); // no doi / doi.org url
+                                                             // No DOI → fails up front, never touching the network.
+        assert!(enrich(&v, "k")
+            .unwrap_err()
+            .contains("no DOI to enrich from"));
+        assert!(enrich(&v, "ghost")
+            .unwrap_err()
+            .contains("no entry with cite key 'ghost'"));
     }
 
     // --------------------------------------------------------------- dedupe

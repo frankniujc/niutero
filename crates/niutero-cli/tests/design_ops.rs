@@ -302,3 +302,14 @@ fn dedupe_lists_then_merges_clusters() {
     assert!(after.contains("@article{a,") && !after.contains("@article{b,"));
     assert!(after.contains("x = {1}") && after.contains("y = {2}"));
 }
+
+#[test]
+fn import_requires_a_file_or_doi() {
+    let d = new_vault();
+    niutero()
+        .arg("import")
+        .arg(d.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("specify a .bib file or --doi"));
+}

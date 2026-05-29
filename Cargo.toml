@@ -6,6 +6,7 @@ members = [
     "crates/niutero-vault",
     "crates/niutero-sync",
     "crates/niutero-norm",
+    "crates/niutero-online",
     "crates/niutero-engine",
     "crates/niutero-cli",
 ]

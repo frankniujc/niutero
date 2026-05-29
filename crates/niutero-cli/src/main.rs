@@ -130,12 +130,15 @@ enum Cmd {
         #[command(subcommand)]
         action: ViewAction,
     },
-    /// Import entries from a .bib file (merge with a duplicate-key policy).
+    /// Import entries from a .bib file, or online by --doi (merge w/ dup policy).
     Import {
         /// Vault folder.
         vault: PathBuf,
-        /// The .bib file to import.
-        file: PathBuf,
+        /// The .bib file to import (omit when using --doi).
+        file: Option<PathBuf>,
+        /// Online: fetch this DOI's BibTeX from doi.org instead of a file.
+        #[arg(long)]
+        doi: Option<String>,
         /// What to do when a cite key already exists.
         #[arg(long = "on-dup", value_enum, default_value_t = OnDup::Skip)]
         on_dup: OnDup,
@@ -270,6 +273,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Online: fill an entry's missing fields from its DOI (needs network).
+    Enrich {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Cite key to enrich.
+        citekey: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -380,8 +390,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Cmd::Import {
             vault,
             file,
+            doi,
             on_dup,
-        } => cmd_import(&vault, &file, on_dup).map(ok),
+        } => cmd_import(&vault, file, doi, on_dup).map(ok),
         Cmd::Export {
             vault,
             out,
@@ -427,6 +438,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         } => cmd_stars(&vault, &citekey, set).map(ok),
         Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
         Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
+        Cmd::Enrich { vault, citekey } => cmd_enrich(&vault, &citekey).map(ok),
     }
 }
 
@@ -653,14 +665,24 @@ fn cmd_view(vault: &Path, action: ViewAction) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_import(vault: &Path, file: &Path, on_dup: OnDup) -> Result<(), String> {
+fn cmd_import(
+    vault: &Path,
+    file: Option<PathBuf>,
+    doi: Option<String>,
+    on_dup: OnDup,
+) -> Result<(), String> {
     let v = engine::open(vault)?;
     let policy = match on_dup {
         OnDup::Skip => DupPolicy::Skip,
         OnDup::Overwrite => DupPolicy::Overwrite,
         OnDup::Rename => DupPolicy::Rename,
     };
-    let r = engine::import(&v, file, policy)?;
+    let r = match (file, doi) {
+        (Some(_), Some(_)) => return Err("use either a .bib file or --doi, not both".into()),
+        (Some(f), None) => engine::import(&v, &f, policy)?,
+        (None, Some(d)) => engine::import_doi(&v, &d, policy)?,
+        (None, None) => return Err("specify a .bib file or --doi".into()),
+    };
     let mut parts = vec![format!("{} added", r.added)];
     if r.overwritten > 0 {
         parts.push(format!("{} overwritten", r.overwritten));
@@ -674,6 +696,17 @@ fn cmd_import(vault: &Path, file: &Path, on_dup: OnDup) -> Result<(), String> {
     println!("Imported: {}", parts.join(", "));
     for (old, new) in &r.renamed {
         println!("  {old} -> {new}");
+    }
+    Ok(())
+}
+
+fn cmd_enrich(vault: &Path, citekey: &str) -> Result<(), String> {
+    let v = engine::open(vault)?;
+    let filled = engine::enrich(&v, citekey)?;
+    if filled.is_empty() {
+        println!("{citekey}: already complete (nothing to fill).");
+    } else {
+        println!("{citekey}: filled {}", filled.join(", "));
     }
     Ok(())
 }
