@@ -73,7 +73,7 @@ pub enum LibAction {
 /// Render the Classic view. Returns nothing; queued engine actions go into
 /// `actions`. `entries` is already filtered? No — we filter here from the full set.
 pub fn classic(
-    ui: &mut egui::Ui,
+    ctx: &egui::Context,
     theme: &Theme,
     entries: &[EntryView],
     st: &mut LibState,
@@ -84,27 +84,42 @@ pub fn classic(
         st.selected = entries.first().map(|e| e.citekey.clone());
     }
 
-    // ---- Tags sidebar (left) -------------------------------------------------
-    if !st.hide_tags {
+    // Responsive: on a genuinely narrow logical width, collapse panels so the
+    // three columns never crowd out the list (the user can still toggle them).
+    let avail = ctx.content_rect().width() - 60.0; // minus the rail
+    let hide_tags = st.hide_tags || avail < 820.0;
+    let hide_detail = st.hide_detail || avail < 560.0;
+
+    // Tags sidebar (left). Top-level ctx panels so egui sizes the central list
+    // correctly between the two side panels.
+    if !hide_tags {
         egui::SidePanel::left("niu-tags")
             .exact_width(232.0)
             .resizable(false)
-            .frame(panel_frame(theme).inner_margin(egui::Margin {
-                left: 12,
-                right: 12,
-                top: 14,
-                bottom: 12,
-            }))
-            .show_inside(ui, |ui| tags_sidebar(ui, theme, entries, st));
+            .frame(
+                egui::Frame::default()
+                    .fill(theme.surface)
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 12,
+                        top: 14,
+                        bottom: 12,
+                    }),
+            )
+            .show(ctx, |ui| tags_sidebar(ui, theme, entries, st));
     }
 
-    // ---- Detail panel (right) -----------------------------------------------
-    if !st.hide_detail {
+    // Detail panel (right).
+    if !hide_detail {
         egui::SidePanel::right("niu-detail")
             .exact_width(392.0)
             .resizable(false)
-            .frame(panel_frame(theme).inner_margin(egui::Margin::same(20)))
-            .show_inside(ui, |ui| {
+            .frame(
+                egui::Frame::default()
+                    .fill(theme.surface)
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .show(ctx, |ui| {
                 let sel = st
                     .selected
                     .as_ref()
@@ -121,10 +136,10 @@ pub fn classic(
             });
     }
 
-    // ---- Item list (center) --------------------------------------------------
+    // Item list (center).
     egui::CentralPanel::default()
         .frame(egui::Frame::default().fill(theme.bg))
-        .show_inside(ui, |ui| item_list(ui, theme, entries, st));
+        .show(ctx, |ui| item_list(ui, theme, entries, st));
 }
 
 // ----------------------------------------------------------------- sidebar
@@ -757,12 +772,6 @@ fn edit_field_raw(
 }
 
 // ------------------------------------------------------------- tiny widgets
-
-fn panel_frame(theme: &Theme) -> egui::Frame {
-    egui::Frame::default()
-        .fill(theme.surface)
-        .stroke(egui::Stroke::new(1.0, theme.border))
-}
 
 fn icon_btn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph, on: bool) -> egui::Response {
     icon_btn_colored(

@@ -32,9 +32,9 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([880.0, 580.0])
             .with_title("Niutero")
             // Frameless: the design has its own titlebar (traffic lights, view
-            // switcher, theme toggle). Transparent for clean rounded corners.
-            .with_decorations(false)
-            .with_transparent(true),
+            // switcher, theme toggle). Opaque, square corners for now (rounded
+            // frameless corners are a later polish).
+            .with_decorations(false),
         ..Default::default()
     };
     eframe::run_native(

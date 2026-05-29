@@ -1,13 +1,17 @@
-//! The app shell: a frameless window with the design's custom titlebar, the
-//! tool rail (Library / Normalize / AI / Settings + Sync), the read-only status
-//! bar, and the active tool body. Faithful to spec §3.
+//! The app shell: a frameless window laid out with top-level egui panels — the
+//! design's custom titlebar (top), the tool rail (left), the read-only status
+//! bar (bottom), and the active tool body (center). Faithful to spec §3.
+//!
+//! Top-level `ctx` panels (rather than nested `show_inside`) are used so egui
+//! computes the central region correctly — nesting silently dropped the
+//! Library's right-hand detail panel. The window is frameless with square
+//! corners for now; rounded corners are a later polish.
 //!
 //! State lives here; tool bodies read it. The engine is called directly — this
-//! is a thin client over `niutero-engine`, doing nothing the CLI can't. The
-//! Library (Classic) view renders into `library`; its engine-touching requests
-//! come back as [`library::LibAction`]s that [`NiuteroApp::apply_lib_action`]
-//! applies, so the immutable read borrow and the mutable engine call never
-//! overlap.
+//! is a thin client over `niutero-engine`. The Library view's engine-touching
+//! requests come back as [`library::LibAction`]s that
+//! [`NiuteroApp::apply_lib_action`] applies, so the read borrow and the engine
+//! write never overlap.
 
 use std::path::PathBuf;
 
@@ -129,92 +133,125 @@ impl NiuteroApp {
 }
 
 impl eframe::App for NiuteroApp {
-    fn clear_color(&self, _v: &egui::Visuals) -> [f32; 4] {
-        // Transparent so the rounded frameless window corners read cleanly.
-        egui::Rgba::TRANSPARENT.to_array()
-    }
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let theme = Theme::of(self.dark);
         theme.apply(ctx);
 
-        // Frameless: paint our own rounded window background.
-        let window = egui::Frame {
-            fill: theme.bg,
-            corner_radius: egui::CornerRadius::same(12),
-            stroke: egui::Stroke::new(1.0, theme.border),
-            ..Default::default()
-        };
-        egui::CentralPanel::default().frame(window).show(ctx, |ui| {
-            self.title_bar(ui, &theme);
-            self.status_bar_and_body(ui, &theme);
-        });
+        // Titlebar (top), status (bottom), rail (left), tool body (center).
+        egui::TopBottomPanel::top("niu-titlebar")
+            .exact_height(38.0)
+            .frame(egui::Frame::default().fill(theme.surface))
+            .show(ctx, |ui| self.title_bar(ui, &theme));
+
+        egui::TopBottomPanel::bottom("niu-status")
+            .exact_height(26.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme.surface)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
+            )
+            .show(ctx, |ui| self.status_bar(ui, &theme));
+
+        egui::SidePanel::left("niu-rail")
+            .exact_width(60.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme.surface)
+                    .inner_margin(egui::Margin::symmetric(0, 12)),
+            )
+            .show(ctx, |ui| self.tool_rail(ui, &theme));
+
+        match self.tool {
+            Tool::Library => self.body_library(ctx, &theme),
+            Tool::Normalize => {
+                tool_placeholder(ctx, &theme, "Normalize", "The cleanup engine (G4).")
+            }
+            Tool::Ai => tool_placeholder(
+                ctx,
+                &theme,
+                "AI Assistant",
+                "Chat across your library (G5).",
+            ),
+            Tool::Settings => tool_placeholder(
+                ctx,
+                &theme,
+                "Settings",
+                "Library, workflow, appearance, sync (G5).",
+            ),
+        }
+
+        // Transient toast (bottom-center).
+        if let Some(msg) = self.toast.clone() {
+            egui::Area::new("niu-toast".into())
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(theme.text)
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::symmetric(12, 7))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(msg).color(theme.bg).size(12.5));
+                        });
+                });
+        }
     }
 }
 
 impl NiuteroApp {
     // ---- titlebar (spec §3): logo + lib name, centered view switcher, theme toggle
     fn title_bar(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let bar_h = 38.0;
-        let rect =
-            egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(ui.max_rect().width(), bar_h));
-        let resp = ui.interact(
-            rect,
-            ui.id().with("titlebar"),
-            egui::Sense::click_and_drag(),
-        );
-        if resp.drag_started() {
+        let rect = ui.max_rect();
+        // Drag-to-move / double-click-to-maximize on the bar background. Buttons
+        // added afterward take pointer priority, so they still click normally.
+        let drag = ui.interact(rect, ui.id().with("drag"), egui::Sense::click_and_drag());
+        if drag.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
-        if resp.double_clicked() {
+        if drag.double_clicked() {
             let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
         }
         ui.painter().hline(
             rect.x_range(),
-            rect.max.y,
+            rect.bottom() - 0.5,
             egui::Stroke::new(1.0, theme.border),
         );
 
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(14.0, 0.0))),
-            |ui| {
-                ui.horizontal_centered(|ui| {
-                    self.window_controls(ui);
-                    ui.add_space(8.0);
-                    niu_mark(ui, theme, 20.0);
-                    ui.add_space(7.0);
-                    ui.label(
-                        RichText::new("Niutero")
-                            .font(theme::serif(14.0))
-                            .color(theme.text),
-                    );
-                    ui.label(RichText::new("—").color(theme.faint));
-                    ui.label(
-                        RichText::new(self.lib_name())
-                            .color(theme.text_2)
-                            .size(12.5),
-                    );
+        ui.horizontal_centered(|ui| {
+            ui.add_space(2.0);
+            self.window_controls(ui);
+            ui.add_space(8.0);
+            niu_mark(ui, theme, 20.0);
+            ui.add_space(7.0);
+            ui.label(
+                RichText::new("Niutero")
+                    .font(theme::serif(14.0))
+                    .color(theme.text),
+            );
+            ui.label(RichText::new("—").color(theme.faint));
+            ui.label(
+                RichText::new(self.lib_name())
+                    .color(theme.text_2)
+                    .size(12.5),
+            );
 
-                    // centered view switcher (Library only)
-                    if matches!(self.tool, Tool::Library) {
-                        let avail = ui.available_width();
-                        ui.add_space((avail - 230.0).max(0.0) * 0.5);
-                        self.view_switcher(ui, theme);
-                    }
+            // centered view switcher (Library only)
+            if matches!(self.tool, Tool::Library) {
+                let avail = ui.available_width();
+                ui.add_space((avail - 230.0).max(0.0) * 0.5);
+                self.view_switcher(ui, theme);
+            }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let g = if self.dark { Glyph::Sun } else { Glyph::Moon };
-                        if icbtn(ui, theme, g).on_hover_text("Toggle theme").clicked() {
-                            self.dark = !self.dark;
-                            info!("theme → {}", if self.dark { "dark" } else { "light" });
-                        }
-                    });
-                });
-            },
-        );
-        ui.advance_cursor_after_rect(rect);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let g = if self.dark { Glyph::Sun } else { Glyph::Moon };
+                if icbtn(ui, theme, g).on_hover_text("Toggle theme").clicked() {
+                    self.dark = !self.dark;
+                    info!("theme → {}", if self.dark { "dark" } else { "light" });
+                }
+            });
+        });
     }
 
     /// macOS-style traffic lights — functional in a frameless window.
@@ -287,86 +324,33 @@ impl NiuteroApp {
             });
     }
 
-    fn status_bar_and_body(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        // Status bar pinned to the bottom (spec §3).
-        egui::TopBottomPanel::bottom("niu-status")
-            .exact_height(26.0)
-            .frame(
-                egui::Frame::default()
-                    .fill(theme.surface)
-                    .inner_margin(egui::Margin::symmetric(14, 0)),
-            )
-            .show_inside(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    let dot = ui
-                        .allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover())
-                        .0;
-                    ui.painter().circle_filled(dot.center(), 3.5, theme.accent);
-                    ui.label(
-                        RichText::new("connector · 127.0.0.1:23510")
-                            .font(theme::mono(11.0))
-                            .color(theme.muted),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("{} entries", self.entry_count()))
-                                .color(theme.muted)
-                                .size(11.5),
-                        );
-                        ui.label(RichText::new("·").color(theme.faint));
-                        ui.label(RichText::new("modified").color(theme.text_2).size(11.5));
-                        ui.label(
-                            RichText::new("main")
-                                .font(theme::mono(11.0))
-                                .color(theme.muted),
-                        );
-                        icons::show(ui, Glyph::Branch, 13.0, theme.muted);
-                    });
-                });
+    fn status_bar(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.horizontal_centered(|ui| {
+            let dot = ui
+                .allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover())
+                .0;
+            ui.painter().circle_filled(dot.center(), 3.5, theme.accent);
+            ui.label(
+                RichText::new("connector · 127.0.0.1:23510")
+                    .font(theme::mono(11.0))
+                    .color(theme.muted),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{} entries", self.entry_count()))
+                        .color(theme.muted)
+                        .size(11.5),
+                );
+                ui.label(RichText::new("·").color(theme.faint));
+                ui.label(RichText::new("modified").color(theme.text_2).size(11.5));
+                ui.label(
+                    RichText::new("main")
+                        .font(theme::mono(11.0))
+                        .color(theme.muted),
+                );
+                icons::show(ui, Glyph::Branch, 13.0, theme.muted);
             });
-
-        // Tool rail on the left (spec §3).
-        egui::SidePanel::left("niu-rail")
-            .exact_width(60.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::default()
-                    .fill(theme.surface)
-                    .inner_margin(egui::Margin::symmetric(0, 12)),
-            )
-            .show_inside(ui, |ui| self.tool_rail(ui, theme));
-
-        // Active tool body.
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(theme.bg))
-            .show_inside(ui, |ui| match self.tool {
-                Tool::Library => self.body_library(ui, theme),
-                Tool::Normalize => placeholder(ui, theme, "Normalize", "The cleanup engine (G4)."),
-                Tool::Ai => {
-                    placeholder(ui, theme, "AI Assistant", "Chat across your library (G5).")
-                }
-                Tool::Settings => placeholder(
-                    ui,
-                    theme,
-                    "Settings",
-                    "Library, workflow, appearance, sync (G5).",
-                ),
-            });
-
-        // Transient toast (bottom-center), auto-clears next interaction.
-        if let Some(msg) = self.toast.clone() {
-            egui::Area::new("niu-toast".into())
-                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -38.0))
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::default()
-                        .fill(theme.text)
-                        .corner_radius(8.0)
-                        .inner_margin(egui::Margin::symmetric(12, 7))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(msg).color(theme.bg).size(12.5));
-                        });
-                });
-        }
+        });
     }
 
     fn tool_rail(&mut self, ui: &mut egui::Ui, theme: &Theme) {
@@ -396,23 +380,27 @@ impl NiuteroApp {
         });
     }
 
-    fn body_library(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+    fn body_library(&mut self, ctx: &egui::Context, theme: &Theme) {
         if self.library.is_none() {
-            empty_state(ui, theme, self.open_error.as_deref());
+            let err = self.open_error.clone();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().fill(theme.bg))
+                .show(ctx, |ui| empty_state(ui, theme, err.as_deref()));
             return;
         }
-        // Classic for now (Reader/Board land in G3).
         let mut actions = Vec::new();
         match self.lib_view {
             LibView::Classic => {
                 let entries = &self.library.as_ref().unwrap().entries;
-                library::classic(ui, theme, entries, &mut self.lib, &mut actions);
+                library::classic(ctx, theme, entries, &mut self.lib, &mut actions);
             }
-            LibView::Reader => placeholder(ui, theme, "Reader", "Reading-first layout (G3)."),
-            LibView::Board => placeholder(ui, theme, "Board", "Kanban by reading status (G3)."),
+            LibView::Reader => tool_placeholder(ctx, theme, "Reader", "Reading-first layout (G3)."),
+            LibView::Board => {
+                tool_placeholder(ctx, theme, "Board", "Kanban by reading status (G3).")
+            }
         }
         for a in actions {
-            self.apply_lib_action(a, ui.ctx());
+            self.apply_lib_action(a, ctx);
         }
     }
 
@@ -489,6 +477,13 @@ impl NiuteroApp {
 
 // ---------------------------------------------------------------- helpers
 
+/// A tool body that fills the central area with a centered placeholder.
+fn tool_placeholder(ctx: &egui::Context, theme: &Theme, title: &str, sub: &str) {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::default().fill(theme.bg))
+        .show(ctx, |ui| placeholder(ui, theme, title, sub));
+}
+
 /// The solid-tile logo: a white serif N on an accent squircle, nudged down ~7%
 /// to optically center (caps reserve descender space) — spec §2 / `NiuMark`.
 fn niu_mark(ui: &mut egui::Ui, theme: &Theme, size: f32) {
@@ -521,8 +516,8 @@ fn rail_button(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph, on: bool) -> egui
         .rect_filled(rect, egui::CornerRadius::same(11), fill);
     if on {
         let m = egui::Rect::from_min_max(
-            egui::pos2(rect.left() - 12.0, rect.top() + 11.0),
-            egui::pos2(rect.left() - 9.0, rect.bottom() - 11.0),
+            egui::pos2(rect.left() - 9.0, rect.top() + 11.0),
+            egui::pos2(rect.left() - 6.0, rect.bottom() - 11.0),
         );
         ui.painter()
             .rect_filled(m, egui::CornerRadius::same(2), theme.accent);
