@@ -9,6 +9,7 @@ members = [
     "crates/niutero-online",
     "crates/niutero-engine",
     "crates/niutero-cli",
+    "crates/niutero-gui",
 ]
 
 [workspace.package]

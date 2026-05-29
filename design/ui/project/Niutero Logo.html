@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Niutero — Logo</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Hanken+Grotesk:wght@400;500;600;700&display=swap');
+  :root{
+    --bg:#FAFAF8; --surface:#FFFFFF; --ink:#1B1C19; --muted:#888B82; --faint:#B6B8B0;
+    --border:rgba(20,22,18,.10); --accent:#1F8A5B; --accent-deep:#155F3F;
+    --sans:'Hanken Grotesk',system-ui,sans-serif; --serif:'Newsreader',Georgia,serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;background:var(--bg);font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1180px;margin:0 auto;padding:64px 48px 96px;}
+  .head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;border-bottom:1px solid var(--border);padding-bottom:28px;margin-bottom:48px;}
+  h1{font-family:var(--serif);font-weight:500;font-size:40px;letter-spacing:-.02em;margin:0;}
+  .head p{margin:6px 0 0;color:var(--muted);font-size:15px;max-width:520px;line-height:1.5;}
+  .seclabel{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 20px;}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-bottom:56px;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:30px;display:flex;flex-direction:column;align-items:center;gap:22px;box-shadow:0 1px 2px rgba(20,22,18,.04),0 12px 32px rgba(20,22,18,.05);position:relative;cursor:pointer;transition:border-color .15s,transform .15s;}
+  .card:hover{border-color:var(--accent);transform:translateY(-2px);}
+  .card.pick{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent),0 12px 32px rgba(31,138,91,.16);}
+  .stage{height:148px;display:flex;align-items:center;justify-content:center;width:100%;}
+  .cap{font-size:13px;color:var(--muted);text-align:center;line-height:1.45;}
+  .cap b{color:var(--ink);font-weight:600;display:block;font-size:14px;margin-bottom:2px;}
+  .badge{position:absolute;top:14px;right:14px;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);background:rgba(31,138,91,.1);padding:3px 8px;border-radius:20px;opacity:0;transition:opacity .15s;}
+  .card.pick .badge{opacity:1;}
+
+  /* ---- mark constructions ---- */
+  .serifN{font-family:var(--serif);font-weight:500;line-height:1;color:var(--accent);}
+  /* 1 bare serif */
+  .m-bare{font-size:118px;letter-spacing:-.02em;}
+  /* 2 tile (app icon) */
+  .tile{width:108px;height:108px;border-radius:26px;background:var(--accent);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 22px rgba(31,138,91,.28);}
+  .tile .serifN{color:#fff;font-size:74px;font-weight:600;}
+  /* 3 tile soft / squircle outline */
+  .tile-o{width:108px;height:108px;border-radius:28px;background:var(--surface);border:2px solid var(--accent);display:flex;align-items:center;justify-content:center;}
+  .tile-o .serifN{font-size:72px;}
+  /* 4 italic */
+  .m-ital{font-size:116px;font-style:italic;font-weight:500;letter-spacing:-.01em;}
+  /* 5 ink (neutral) */
+  .m-ink{font-size:118px;letter-spacing:-.02em;color:var(--ink);}
+  .m-ink .stop{color:var(--accent);}
+  /* 6 underline / shelf */
+  .m-shelf{display:flex;flex-direction:column;align-items:center;gap:9px;}
+  .m-shelf .serifN{font-size:104px;}
+  .m-shelf .bar{width:78px;height:5px;border-radius:3px;background:var(--accent);}
+  /* wordmark row */
+  .wordmark{display:flex;align-items:center;gap:14px;}
+  .wordmark .serifN{font-size:60px;}
+  .wm-tile .serifN{color:#fff;font-size:40px;font-weight:600;}
+  .wm-tile{width:62px;height:62px;border-radius:16px;background:var(--accent);display:flex;align-items:center;justify-content:center;box-shadow:0 5px 14px rgba(31,138,91,.26);}
+  .wmtext{font-family:var(--serif);font-size:42px;font-weight:500;letter-spacing:-.01em;}
+  .wmtext .dim{color:var(--muted);}
+
+  /* sizes strip */
+  .sizes{display:flex;align-items:flex-end;gap:34px;background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:34px 40px;flex-wrap:wrap;}
+  .sztile{border-radius:22%;background:var(--accent);display:flex;align-items:center;justify-content:center;box-shadow:0 6px 16px rgba(31,138,91,.22);}
+  .sztile .serifN{color:#fff;font-weight:600;}
+  .szcap{font-size:11px;color:var(--faint);text-align:center;margin-top:10px;font-variant-numeric:tabular-nums;}
+  .szitem{display:flex;flex-direction:column;align-items:center;}
+
+  /* context: dark + in-rail */
+  .ctx{display:grid;grid-template-columns:1fr 1fr;gap:22px;}
+  .ctx .panel{border-radius:18px;padding:40px;display:flex;align-items:center;justify-content:center;gap:18px;min-height:150px;}
+  .ctx .light{background:#fff;border:1px solid var(--border);}
+  .ctx .dark{background:#121411;}
+  .ctx .dark .wmtext{color:#E9EBE4;}
+  .ctx .dark .wmtext .dim{color:#7E8378;}
+  .ctx .dark .wm-tile{background:#3BB178;box-shadow:0 5px 14px rgba(59,177,120,.3);}
+  .ctx .dark .serifN{color:#3BB178;}
+  .ctx .dark .wm-tile .serifN{color:#fff;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <div>
+      <h1>Niutero — the mark</h1>
+      <p>A single stylistic serif <em style="font-family:var(--serif)">N</em>, drawn from Newsreader — our title face. Click a tile to mark your pick; I'll wire it into the app rail, titlebar, and favicon.</p>
+    </div>
+    <div class="wordmark">
+      <span class="wm-tile"><span class="serifN">N</span></span>
+      <span class="wmtext">Niutero</span>
+    </div>
+  </div>
+
+  <p class="seclabel">Mark options</p>
+  <div class="grid" id="grid">
+    <div class="card" data-k="tile">
+      <span class="badge">Your pick</span>
+      <div class="stage"><div class="tile"><span class="serifN">N</span></div></div>
+      <div class="cap"><b>Solid tile</b>White serif N on a green squircle. Reads at any size — natural app icon.</div>
+    </div>
+    <div class="card" data-k="bare">
+      <span class="badge">Your pick</span>
+      <div class="stage"><span class="serifN m-bare">N</span></div>
+      <div class="cap"><b>Bare serif</b>Just the letter, in accent green. Quiet and editorial.</div>
+    </div>
+    <div class="card" data-k="ital">
+      <span class="badge">Your pick</span>
+      <div class="stage"><span class="serifN m-ital">N</span></div>
+      <div class="cap"><b>Italic</b>The italic N has a calligraphic, manuscript feel.</div>
+    </div>
+    <div class="card" data-k="tileo">
+      <span class="badge">Your pick</span>
+      <div class="stage"><div class="tile-o"><span class="serifN">N</span></div></div>
+      <div class="cap"><b>Outline tile</b>Lighter weight on the page — green hairline squircle.</div>
+    </div>
+    <div class="card" data-k="ink">
+      <span class="badge">Your pick</span>
+      <div class="stage"><span class="serifN m-ink">N<span class="stop">.</span></span></div>
+      <div class="cap"><b>Ink + period</b>Near-black N with a green full stop — a bibliographic nod.</div>
+    </div>
+    <div class="card" data-k="shelf">
+      <span class="badge">Your pick</span>
+      <div class="stage"><div class="m-shelf"><span class="serifN">N</span><span class="bar"></span></div></div>
+      <div class="cap"><b>Shelf</b>N over a short rule — a shelf / underline of citations.</div>
+    </div>
+  </div>
+
+  <p class="seclabel">Solid tile — at size</p>
+  <div class="sizes" id="sizes"></div>
+
+  <p class="seclabel" style="margin-top:56px;">In context — light &amp; dark</p>
+  <div class="ctx">
+    <div class="panel light">
+      <span class="wm-tile"><span class="serifN">N</span></span>
+      <span class="wmtext">Niutero</span>
+    </div>
+    <div class="panel dark">
+      <span class="wm-tile"><span class="serifN">N</span></span>
+      <span class="wmtext">Niutero</span>
+    </div>
+  </div>
+</div>
+
+<script>
+  // size strip for the tile mark
+  var sizes = [[112,'app rail'],[64,'titlebar'],[40,'menu'],[28,'favicon'],[18,'inline']];
+  var host = document.getElementById('sizes');
+  sizes.forEach(function(s){
+    var item = document.createElement('div'); item.className='szitem';
+    var t = document.createElement('div'); t.className='sztile';
+    t.style.width=s[0]+'px'; t.style.height=s[0]+'px';
+    var n = document.createElement('span'); n.className='serifN'; n.textContent='N';
+    n.style.fontSize=Math.round(s[0]*0.62)+'px';
+    t.appendChild(n); item.appendChild(t);
+    var c = document.createElement('div'); c.className='szcap'; c.textContent=s[0]+'px · '+s[1];
+    item.appendChild(c); host.appendChild(item);
+  });
+  // pick interaction (persisted)
+  var grid = document.getElementById('grid');
+  var saved = localStorage.getItem('niu-logo-pick') || 'tile';
+  function paint(){ [...grid.children].forEach(function(c){ c.classList.toggle('pick', c.dataset.k===saved); }); }
+  grid.addEventListener('click', function(e){ var card=e.target.closest('.card'); if(!card) return; saved=card.dataset.k; localStorage.setItem('niu-logo-pick',saved); paint(); });
+  paint();
+</script>
+</body>
+</html>

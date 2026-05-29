@@ -2,3 +2,8 @@
 # Machine-specific linker/xwin paths. Copy .cargo/config.toml.example and edit.
 /.cargo/config.toml
 *.pdb
+# Design bundle: keep the text reference (UI Design Spec.md, *.jsx, *.html,
+# chat) checked in; skip the heavy exported mockup screenshots/sketches.
+/design/ui/project/uploads/
+/design/ui/project/verify/
+/design/ui/project/scraps/
