@@ -404,6 +404,7 @@ name = "niutero-norm"
 version = "0.1.0"
 dependencies = [
  "niutero-core",
+ "regex",
  "serde",
  "toml",
 ]

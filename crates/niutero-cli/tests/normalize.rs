@@ -34,7 +34,7 @@ fn dry_run_reports_without_writing() {
         .success()
         .stdout(predicate::str::contains("would change"))
         .stdout(predicate::str::contains("dropped 'abstract'"))
-        .stdout(predicate::str::contains("tidied whitespace in 'title'"));
+        .stdout(predicate::str::contains("rewrote 'title'"));
     assert_eq!(bib(&d), before, "dry run must not write");
 }
 
@@ -50,7 +50,8 @@ fn write_applies_and_is_idempotent() {
         .stdout(predicate::str::contains("changed"));
     let s = bib(&d);
     assert!(!s.contains("abstract"));
-    assert!(s.contains("title = {A B}")); // whitespace tidied
+    // capitalized words {{}}-protected; serializer adds one outer brace pair
+    assert!(s.contains("title = {{{A}} {{B}}}"), "got: {s}");
     niutero()
         .arg("normalize")
         .arg(d.path())

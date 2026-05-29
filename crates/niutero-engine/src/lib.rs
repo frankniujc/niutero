@@ -999,7 +999,11 @@ mod tests {
         assert_eq!(normalize_apply(&v).unwrap().len(), 1);
         let view = show(&v, "k").unwrap();
         assert!(view.fields.get("abstract").is_none());
-        assert_eq!(view.fields.get("title").map(String::as_str), Some("A B"));
+        // capitalized title words are {{}}-protected (bib_fixer behavior)
+        assert_eq!(
+            view.fields.get("title").map(String::as_str),
+            Some("{{A}} {{B}}")
+        );
 
         // idempotent: nothing left to change
         assert!(normalize_preview(&v).unwrap().is_empty());
@@ -1015,7 +1019,8 @@ mod tests {
         .unwrap();
         std::fs::write(
             v.niutero_dir().join("norm.toml"),
-            "drop_fields = []\ntidy_whitespace = false\narxiv = false\n",
+            "keep_fields = [\"title\", \"abstract\"]\nprotect_title_caps = false\n\
+             conference_acronyms = false\ndoi_to_url = false\ntidy_whitespace = false\n",
         )
         .unwrap();
         assert!(normalize_preview(&v).unwrap().is_empty());
