@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 fn niutero() -> Command {
     isolate_registry();
-    Command::cargo_bin("niutero").expect("binary built")
+    Command::cargo_bin("niutero-cli").expect("binary built")
 }
 
 /// Point the machine-local registry at a per-binary temp file (inherited by the

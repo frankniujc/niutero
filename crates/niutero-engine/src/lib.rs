@@ -974,10 +974,10 @@ const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
 pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
     let _lock = lock_vault(v)?;
     if !git::is_repo(&v.root) {
-        return Err("not a git repository — run `niutero connect <url>` first".into());
+        return Err("not a git repository — run `niutero-cli connect <url>` first".into());
     }
     if git::remote_url(&v.root, "origin").is_none() {
-        return Err("no 'origin' remote — run `niutero connect <url>` first".into());
+        return Err("no 'origin' remote — run `niutero-cli connect <url>` first".into());
     }
     ensure_repo_hygiene(v)?;
     // Machine-local sync strategy (#48): pull/push are per-machine toggles.
@@ -1154,10 +1154,10 @@ pub struct HistoryCommit {
 /// isn't in HEAD (added-but-not-synced vs. no such entry at all).
 pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
     if !git::is_repo(&v.root) {
-        return Err("not a git repository — run `niutero connect <url>` first".into());
+        return Err("not a git repository — run `niutero-cli connect <url>` first".into());
     }
     let head = git::file_at_head(&v.root, "references.bib").ok_or_else(|| {
-        "references.bib has no committed history yet — run `niutero sync` first".to_string()
+        "references.bib has no committed history yet — run `niutero-cli sync` first".to_string()
     })?;
     let (start, end) = match entry_line_span(&head, citekey) {
         Some(span) => span,
@@ -1166,7 +1166,7 @@ pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
         None => {
             let exists = entries(&read_items(v)?).any(|e| e.citekey == citekey);
             return Err(if exists {
-                format!("'{citekey}' isn't in the last commit yet — run `niutero sync` first")
+                format!("'{citekey}' isn't in the last commit yet — run `niutero-cli sync` first")
             } else {
                 format!("no entry with cite key '{citekey}'")
             });

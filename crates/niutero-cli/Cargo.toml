@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "niutero"
+name = "niutero-cli"
 path = "src/main.rs"
 
 [dependencies]

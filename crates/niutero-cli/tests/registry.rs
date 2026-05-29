@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 /// A `niutero` command whose registry is the given (isolated) file.
 fn niutero(reg: &Path) -> Command {
-    let mut c = Command::cargo_bin("niutero").expect("binary built");
+    let mut c = Command::cargo_bin("niutero-cli").expect("binary built");
     c.env("NIUTERO_REGISTRY", reg);
     c
 }

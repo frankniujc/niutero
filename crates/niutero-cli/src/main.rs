@@ -14,7 +14,7 @@ use niutero_engine::{self as engine, AddSource, DupPolicy, Filter};
 
 #[derive(Parser)]
 #[command(
-    name = "niutero",
+    name = "niutero-cli",
     version,
     about = "Lightweight, LaTeX-oriented citation manager (CLI)"
 )]
@@ -1033,7 +1033,7 @@ fn cmd_suggest_tags(vault: &Path, citekey: &str) -> Result<(), String> {
         for t in &tags {
             println!("  {t}");
         }
-        println!("Apply with: niutero tag {citekey} --add <tag>");
+        println!("Apply with: niutero-cli tag {citekey} --add <tag>");
     }
     Ok(())
 }
