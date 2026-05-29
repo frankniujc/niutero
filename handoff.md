@@ -18,9 +18,12 @@ is the explicit spec that W2's offline normalizer was ported from.
 
 ## Current state (2026-05-29)
 
-- **Phase 1 (M1–M5) is complete and was reviewed** (8-agent review, fixes
-  landed, `niutero-engine` extracted as the operations layer).
-- **Post-Phase-1 backlog in progress**, routed as waves. Done so far:
+- **Phase 1 is COMPLETE** — base scope (M1–M5) plus every optional feature, all
+  built, tested offline, reviewed, and committed. `niutero-engine` is the
+  operations layer; the CLI is a thin shell over it. (External features' live
+  network paths are code-complete but unverified in this offline sandbox — see
+  "Remaining work".)
+- **Waves**, in order. All committed; all unpushed. Done:
   - **Wave 1** (`8dfd8ee`): small deferred fixes — CRLF/BOM input normalization,
     `open` hardening, entry-type encapsulation, init scaffolding, `cite`.
   - **W2** (`5851e4e`, pushed): **real offline normalization** — full port of
@@ -95,54 +98,70 @@ is the explicit spec that W2's offline normalizer was ported from.
     `niutero-core::dedup::duplicate_groups` (surname+year+title signature);
     `analyze` "Likely duplicates" check; engine `dedupe_preview`/`dedupe_merge`
     (fold cluster into richest entry, union fields + sidecar); CLI `dedupe [--merge]`.
-  - **W4c** (**committed, NOT yet pushed**): **normalize profiles** (half of #48).
+  - **W4c** (`origin`-unpushed): **normalize profiles** (half of #48).
     `[profiles.<name>]` in norm.toml, `NormConfig::resolve`, `normalize --profile`.
-    Plus a top-level repo **README.md** (long-flagged gap). *(sync-strategy config,
-    the other half of #48, deferred — see below.)*
+    Plus a top-level repo **README.md** (long-flagged gap).
+  - **W5a–W5d** (committed, unpushed): **the five external-service features**, all
+    built behind the offline base path. HTTP shells out to the system `curl` (the
+    same pattern niutero-sync uses for `git`); `niutero-online` is the new crate.
+    (a) **DOI import** — `import --doi` (doi.org content negotiation → BibTeX).
+    (b) **online enrich** — `enrich <key>` fills missing fields from the entry's
+    DOI. (c) **browser connector** — `connector` runs a tiny loopback HTTP server
+    whose `POST /capture` adds BibTeX (the browser-extension endpoint). (d) **PDF
+    management** — `pdf <key> [--attach|--fetch]`, binaries in git-ignored
+    `pdfs/`, never in the .bib. (e) **LLM tag suggestions** — `suggest-tags <key>`
+    via the Anthropic Messages API (key via a temp `curl -K` config, never argv).
+    Pure logic (URL/prompt/parse/HTTP-spec building) is unit-tested; the actual
+    network calls **could not be exercised in this offline sandbox** — they are
+    code-complete but **network-unverified**.
+  - **W6** (`5e29770`, unpushed): **machine-local registry + the features on it**,
+    finishing Phase 1's base scope. `niutero-vault::registry` (`vaults.toml` at the
+    platform config dir or `$NIUTERO_REGISTRY`; never synced). #45 **keep-updated
+    auto-export** (`export-target add/rm/list`; targets re-exported after every
+    change via a central CLI trigger; atomic mirror writes; refuses references.bib
+    even by aliased spelling). #48 **sync-strategy config** (`sync-config`;
+    machine-local pull/push toggles `sync()` honors). **recent**/**forget**
+    commands. **`--json`** added to add/edit/rm/tag/note/import/export/status/stars.
+    Reviewed by a read-only adversarial workflow (6 findings, all fixed): the
+    references.bib-alias data-loss path (HIGH), an unlocked registry read-modify-save
+    race (now a locked `with_registry_mut`), non-atomic mirror writes, connector
+    captures not refreshing mirrors, a tex-scan `--json` stdout leak, and
+    non-hermetic `sync_*` tests (isolated via a shared crate-level registry env lock).
 
-- **Git**: `main` is **8 commits ahead of `origin/main`** (W3a · W3b · W-design ·
-  W-norm · W3c · W4a · W4b · W4c — all unpushed). Working tree clean.
+- **Git**: `main` is **14 commits ahead of `origin/main`** (W3a · W3b · W-design ·
+  W-norm · W3c · W4a · W4b · W4c · W5a · W5b · W5c · W5d · W6 — all unpushed; the
+  user has not asked to push). Working tree clean.
   Remote: `git@github.com:frankniujc/niutero_2.git`.
-- **Tests**: full `cargo test --workspace` green at W4c (233 tests); fmt +
+- **Tests**: full `cargo test --workspace` green at W6 (**269 tests**); fmt +
   clippy (`-D warnings`) clean. Re-run the full gate before the next commit.
   Norm has an optional whole-library idempotence test: run with
   `NIUTERO_BIB_FIXTURE=/path/to/library.bib cargo test -p niutero-norm`.
 
-## Remaining work (tracked as tasks #43–#48)
+## Remaining work — Phase 1 is COMPLETE
 
-Routing decision in force: **do the non-external-dependency waves first
-(W2–W4)**; external-service crates are deferred (see below).
+Every Phase-1 item (base scope + all optional features) is now built, tested
+offline, and committed. Nothing buildable remains for Phase 1. What's left is
+out of Phase-1 scope or unverifiable here:
 
-- ~~**W3b — per-entry `history`** (#43)~~ · ~~**W3c — 3-way merge** (#44)~~ — **DONE**.
-- ~~**#46 file locking** (W4a)~~ · ~~**#47 dup detection & merge** (W4b)~~ —
-  **DONE**. ~~repo README~~ — **DONE** (W4c).
-- **#48 — half done**: ~~normalize profiles (W4c)~~ done; **sync-strategy config**
-  still open (pull/push timing, merge mode, conflict policy). Note: a push toggle
-  / merge-mode is partly a *machine-local preference*, which ties into the
-  unbuilt machine-local registry (see #45).
-- **#45 — keep-updated auto-export** (still open, biggest remaining offline piece):
-  register target `.bib` files and auto-rewrite on every change. Needs a
-  **machine-local registry** (per-vault export targets are machine-specific
-  paths, must NOT sync into `.niutero/`) — that infra doesn't exist yet, so this
-  is the one tracked item that requires new groundwork.
-- **Small gap**: `--json` on the mutating commands (add/edit/rm/tag/note/status/
-  stars) for the future GUI. Low-urgency.
+- **External features are network-UNVERIFIED.** DOI import, enrich, connector,
+  PDF fetch, and LLM tag-suggestions are code-complete with their pure logic
+  tested, but no live HTTP/API call could run in this offline sandbox. Before
+  trusting them, exercise each against the real services (a real DOI, an entry
+  with a fillable DOI, the loopback `POST /capture`, a PDF url, and a request
+  with `$ANTHROPIC_API_KEY` set) and add the network-path integration coverage.
+- **Phase 2 GUI** — explicitly descoped. It will be a thin client over
+  `niutero-engine` (every capability already has an engine fn + CLI command).
+- **Cross-platform CI matrix** — not set up (developed on Windows-on-ARM only).
 
-Each wave: tests + `cargo fmt --all --check` + `cargo clippy --workspace
---all-targets -- -D warnings` + `cargo test --workspace` all green, then commit
-(and push when convenient).
+## Known limitations (acceptable, documented)
 
-## Deferred — do NOT build now
-
-- **Phase 2 GUI** (descoped entirely). The UI design handoff was mined for
-  *operational logic* only (see W-design); the rest of its surface — AI
-  assistant (chat across the library), online enrich / "arXiv → published",
-  browser-connector capture, share links, appearance/keymap/integrations — is
-  Phase-2 UI and/or the external-service crates below.
-- **External-service crates**: DOI import/fetch, online enrich, browser
-  connector, LLM, PDF management; cross-platform CI. These must stay off the
-  base path — the core works fully offline with all of them disabled.
-- See `memory/project_niutero_deferred.md` for the comprehensive backlog.
+- The registry's `record_open` and the user-initiated pref mutators take a
+  cross-process lock (`vaults.toml.lock`), so a confirmed pref change isn't lost
+  to a concurrent writer. Registry *reads* are lock-free (the atomic rename means
+  a reader sees the old or new file whole, never torn).
+- Pre-W6 deferred path-resolution note still stands (`file_at_head` repo-root vs
+  cwd-relative) — see the gotchas section; only bites a vault nested in a larger
+  repo.
 
 ## Build & test
 
