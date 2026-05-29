@@ -691,6 +691,16 @@ pub fn cite(v: &Vault, citekey: &str) -> Result<String, String> {
     Ok(format!("\\cite{{{citekey}}}"))
 }
 
+/// The raw, canonical BibTeX for a single entry (the detail panel's "BibTeX"
+/// action copies this). Uses the same deterministic serializer as the library.
+pub fn entry_bibtex(v: &Vault, citekey: &str) -> Result<String, String> {
+    let items = read_items(v)?;
+    let entry = entries(&items)
+        .find(|e| e.citekey == citekey)
+        .ok_or_else(|| format!("no entry with cite key '{citekey}'"))?;
+    Ok(to_bibtex_entries(std::slice::from_ref(entry)))
+}
+
 // ------------------------------------------------ machine-local registry
 
 /// A vault this machine has opened, for a "recent libraries" listing. The

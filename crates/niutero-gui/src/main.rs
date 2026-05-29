@@ -8,11 +8,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod icons;
+mod library;
 mod theme;
 
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // Logging to stderr via the `log` facade (eframe/egui/winit log here too).
+    // Default: warnings from deps, info from this app; tune with RUST_LOG.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,niutero=info"),
+    )
+    .init();
+    log::info!("niutero {} starting", env!("CARGO_PKG_VERSION"));
+
     let native_options = eframe::NativeOptions {
         // OpenGL backend — the native graphics path that works on this
         // Windows-on-ARM hardware (wgpu's DX12/Vulkan device creation fails here).

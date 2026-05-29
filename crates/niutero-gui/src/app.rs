@@ -2,14 +2,21 @@
 //! tool rail (Library / Normalize / AI / Settings + Sync), the read-only status
 //! bar, and the active tool body. Faithful to spec §3.
 //!
-//! State is held here; the tool bodies (filled in across waves G2–G5) read it.
-//! The engine is called directly — this is a thin client over `niutero-engine`.
+//! State lives here; tool bodies read it. The engine is called directly — this
+//! is a thin client over `niutero-engine`, doing nothing the CLI can't. The
+//! Library (Classic) view renders into `library`; its engine-touching requests
+//! come back as [`library::LibAction`]s that [`NiuteroApp::apply_lib_action`]
+//! applies, so the immutable read borrow and the mutable engine call never
+//! overlap.
 
 use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, RichText};
+use log::{info, warn};
 use niutero_engine::{self as engine, EntryView, Vault};
 
+use crate::icons::{self, Glyph};
+use crate::library::{self, LibAction, LibState};
 use crate::theme::{self, Theme};
 
 /// The four tools in the left rail (spec §1).
@@ -42,6 +49,13 @@ impl Library {
         let entries = engine::list(&vault, engine::Filter::All)?;
         Ok(Library { vault, entries })
     }
+    /// Re-list entries after a mutation so the views reflect the new state.
+    fn reload(&mut self) {
+        match engine::list(&self.vault, engine::Filter::All) {
+            Ok(e) => self.entries = e,
+            Err(e) => warn!("reload entries: {e}"),
+        }
+    }
 }
 
 pub struct NiuteroApp {
@@ -51,6 +65,10 @@ pub struct NiuteroApp {
     library: Option<Library>,
     /// Set when opening a library fails, shown in the empty state.
     open_error: Option<String>,
+    /// Classic/Reader/Board view-local UI state (selection, filter, lock, …).
+    lib: LibState,
+    /// Transient one-line confirmation (e.g. "Copied citation"), shown briefly.
+    toast: Option<String>,
 }
 
 impl NiuteroApp {
@@ -59,6 +77,7 @@ impl NiuteroApp {
         // families: `set_fonts` only takes effect on the *next* frame, so doing
         // it here (not in `update`) avoids a "family not bound" panic on frame 1.
         theme::install_fonts(&cc.egui_ctx);
+
         // Boot a library: an explicit path arg wins, else the most-recently
         // opened vault from the machine-local registry.
         let path = std::env::args().nth(1).map(PathBuf::from).or_else(|| {
@@ -68,10 +87,23 @@ impl NiuteroApp {
         });
         let (library, open_error) = match path {
             Some(p) => match Library::load(&p) {
-                Ok(lib) => (Some(lib), None),
-                Err(e) => (None, Some(e)),
+                Ok(lib) => {
+                    info!(
+                        "opened library '{}' ({} entries)",
+                        lib.vault.config.name,
+                        lib.entries.len()
+                    );
+                    (Some(lib), None)
+                }
+                Err(e) => {
+                    warn!("open library failed: {e}");
+                    (None, Some(e))
+                }
             },
-            None => (None, None),
+            None => {
+                info!("no library to open (no path arg, no recent vault)");
+                (None, None)
+            }
         };
         NiuteroApp {
             dark: false,
@@ -79,6 +111,8 @@ impl NiuteroApp {
             lib_view: LibView::Classic,
             library,
             open_error,
+            lib: LibState::default(),
+            toast: None,
         }
     }
 
@@ -113,7 +147,7 @@ impl eframe::App for NiuteroApp {
         };
         egui::CentralPanel::default().frame(window).show(ctx, |ui| {
             self.title_bar(ui, &theme);
-            self.status_bar_and_body(ctx, ui, &theme);
+            self.status_bar_and_body(ui, &theme);
         });
     }
 }
@@ -137,7 +171,6 @@ impl NiuteroApp {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
         }
-        // bottom hairline
         ui.painter().hline(
             rect.x_range(),
             rect.max.y,
@@ -148,7 +181,7 @@ impl NiuteroApp {
             egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(14.0, 0.0))),
             |ui| {
                 ui.horizontal_centered(|ui| {
-                    self.window_controls(ui, theme);
+                    self.window_controls(ui);
                     ui.add_space(8.0);
                     niu_mark(ui, theme, 20.0);
                     ui.add_space(7.0);
@@ -172,26 +205,20 @@ impl NiuteroApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let icon = if self.dark { "☀" } else { "☾" };
-                        if ui
-                            .add(icbtn(icon, theme))
-                            .on_hover_text("Toggle theme")
-                            .clicked()
-                        {
+                        let g = if self.dark { Glyph::Sun } else { Glyph::Moon };
+                        if icbtn(ui, theme, g).on_hover_text("Toggle theme").clicked() {
                             self.dark = !self.dark;
+                            info!("theme → {}", if self.dark { "dark" } else { "light" });
                         }
                     });
                 });
             },
         );
-        ui.add_space(bar_h - ui.min_rect().height().min(bar_h)); // ensure we advance past the bar
-        ui.allocate_space(egui::vec2(0.0, 0.0));
-        // Move the cursor below the titlebar for subsequent panels.
         ui.advance_cursor_after_rect(rect);
     }
 
     /// macOS-style traffic lights — functional in a frameless window.
-    fn window_controls(&self, ui: &mut egui::Ui, _theme: &Theme) {
+    fn window_controls(&self, ui: &mut egui::Ui) {
         let dot = |ui: &mut egui::Ui, color: Color32| -> egui::Response {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::click());
             let c = if resp.hovered() {
@@ -228,37 +255,39 @@ impl NiuteroApp {
     }
 
     fn view_switcher(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let mut seg = |ui: &mut egui::Ui, label: &str, v: LibView| {
-            let on = self.lib_view == v;
-            let txt =
-                RichText::new(label)
-                    .size(12.5)
-                    .color(if on { theme.accent } else { theme.text_2 });
-            let btn = egui::Button::new(txt)
-                .fill(if on {
-                    theme.surface
-                } else {
-                    Color32::TRANSPARENT
-                })
-                .corner_radius(7.0);
-            if ui.add(btn).clicked() {
-                self.lib_view = v;
-            }
-        };
         egui::Frame::default()
             .fill(theme.surface_2)
             .corner_radius(9.0)
             .inner_margin(3)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    seg(ui, "Classic", LibView::Classic);
-                    seg(ui, "Reader", LibView::Reader);
-                    seg(ui, "Board", LibView::Board);
+                    for (label, v) in [
+                        ("Classic", LibView::Classic),
+                        ("Reader", LibView::Reader),
+                        ("Board", LibView::Board),
+                    ] {
+                        let on = self.lib_view == v;
+                        let txt = RichText::new(label).size(12.5).color(if on {
+                            theme.accent
+                        } else {
+                            theme.text_2
+                        });
+                        let btn = egui::Button::new(txt)
+                            .fill(if on {
+                                theme.surface
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(7.0);
+                        if ui.add(btn).clicked() {
+                            self.lib_view = v;
+                        }
+                    }
                 });
             });
     }
 
-    fn status_bar_and_body(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, theme: &Theme) {
+    fn status_bar_and_body(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         // Status bar pinned to the bottom (spec §3).
         egui::TopBottomPanel::bottom("niu-status")
             .exact_height(26.0)
@@ -269,7 +298,6 @@ impl NiuteroApp {
             )
             .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.painter(); // ensure layout
                     let dot = ui
                         .allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover())
                         .0;
@@ -288,10 +316,11 @@ impl NiuteroApp {
                         ui.label(RichText::new("·").color(theme.faint));
                         ui.label(RichText::new("modified").color(theme.text_2).size(11.5));
                         ui.label(
-                            RichText::new("⎇ main")
+                            RichText::new("main")
                                 .font(theme::mono(11.0))
                                 .color(theme.muted),
                         );
+                        icons::show(ui, Glyph::Branch, 13.0, theme.muted);
                     });
                 });
             });
@@ -323,6 +352,21 @@ impl NiuteroApp {
                     "Library, workflow, appearance, sync (G5).",
                 ),
             });
+
+        // Transient toast (bottom-center), auto-clears next interaction.
+        if let Some(msg) = self.toast.clone() {
+            egui::Area::new("niu-toast".into())
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -38.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::default()
+                        .fill(theme.text)
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::symmetric(12, 7))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(msg).color(theme.bg).size(12.5));
+                        });
+                });
+        }
     }
 
     fn tool_rail(&mut self, ui: &mut egui::Ui, theme: &Theme) {
@@ -330,22 +374,25 @@ impl NiuteroApp {
             ui.add_space(2.0);
             niu_mark(ui, theme, 30.0);
             ui.add_space(10.0);
-            for (tool, label) in [
-                (Tool::Library, "Lib"),
-                (Tool::Normalize, "Nrm"),
-                (Tool::Ai, "AI"),
-                (Tool::Settings, "Set"),
+            for (tool, glyph, name) in [
+                (Tool::Library, Glyph::Library, "Library"),
+                (Tool::Normalize, Glyph::Normalize, "Normalize"),
+                (Tool::Ai, Glyph::Ai, "AI Assistant"),
+                (Tool::Settings, Glyph::Settings, "Settings"),
             ] {
-                if rail_button(ui, theme, label, self.tool == tool).clicked() {
+                if rail_button(ui, theme, glyph, self.tool == tool)
+                    .on_hover_text(name)
+                    .clicked()
+                {
                     self.tool = tool;
                 }
                 ui.add_space(4.0);
             }
         });
-        // Sync pinned to the bottom.
+        // Sync pinned to the bottom (commit & push — wired in a later wave).
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             ui.add_space(2.0);
-            let _ = rail_button(ui, theme, "↻", false);
+            let _ = rail_button(ui, theme, Glyph::Sync, false).on_hover_text("Sync");
         });
     }
 
@@ -354,48 +401,89 @@ impl NiuteroApp {
             empty_state(ui, theme, self.open_error.as_deref());
             return;
         }
-        // G1 taste of real data; G2 builds the full Classic 3-pane.
-        egui::Frame::default()
-            .inner_margin(egui::Margin::same(20))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} — {} entries",
-                        self.lib_name(),
-                        self.entry_count()
-                    ))
-                    .color(theme.muted)
-                    .size(12.0),
-                );
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let entries = &self.library.as_ref().unwrap().entries;
-                    for e in entries {
-                        let title = e
-                            .fields
-                            .get("title")
-                            .map(String::as_str)
-                            .unwrap_or("(untitled)");
-                        let creator = e.fields.get("author").map(String::as_str).unwrap_or("");
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(title)
-                                .font(theme::serif(16.0))
-                                .color(theme.text),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "{}  ·  {}",
-                                creator,
-                                e.fields.get("year").map(String::as_str).unwrap_or("")
-                            ))
-                            .color(theme.text_2)
-                            .size(12.5),
-                        );
-                        ui.separator();
+        // Classic for now (Reader/Board land in G3).
+        let mut actions = Vec::new();
+        match self.lib_view {
+            LibView::Classic => {
+                let entries = &self.library.as_ref().unwrap().entries;
+                library::classic(ui, theme, entries, &mut self.lib, &mut actions);
+            }
+            LibView::Reader => placeholder(ui, theme, "Reader", "Reading-first layout (G3)."),
+            LibView::Board => placeholder(ui, theme, "Board", "Kanban by reading status (G3)."),
+        }
+        for a in actions {
+            self.apply_lib_action(a, ui.ctx());
+        }
+    }
+
+    /// Apply an engine-touching action from the Library view, then reload.
+    fn apply_lib_action(&mut self, action: LibAction, ctx: &egui::Context) {
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        let Some(key) = self.lib.selected.clone() else {
+            return;
+        };
+        match action {
+            LibAction::Edit(field, value) => {
+                let (set, unset): (Vec<String>, Vec<String>) = if value.trim().is_empty() {
+                    (vec![], vec![field.clone()])
+                } else {
+                    (vec![format!("{field}={value}")], vec![])
+                };
+                match engine::edit(&lib.vault, &key, &set, &unset, None) {
+                    Ok(()) => {
+                        info!("edit {key}.{field}");
+                        lib.reload();
+                        self.lib.refresh();
                     }
-                });
-            });
+                    Err(e) => self.toast = Some(format!("Edit failed: {e}")),
+                }
+            }
+            LibAction::SetStatus(s) => {
+                if let Err(e) = engine::set_status(&mut lib.vault, &key, s) {
+                    self.toast = Some(format!("Status failed: {e}"));
+                } else {
+                    lib.reload();
+                }
+            }
+            LibAction::SetStars(n) => {
+                if let Err(e) = engine::set_stars(&mut lib.vault, &key, n) {
+                    self.toast = Some(format!("Stars failed: {e}"));
+                } else {
+                    lib.reload();
+                }
+            }
+            LibAction::AddTag(t) => {
+                if let Err(e) = engine::set_tags(&mut lib.vault, &key, &[t], &[]) {
+                    self.toast = Some(format!("Tag failed: {e}"));
+                } else {
+                    lib.reload();
+                }
+            }
+            LibAction::RemoveTag(t) => {
+                if let Err(e) = engine::set_tags(&mut lib.vault, &key, &[], &[t]) {
+                    self.toast = Some(format!("Untag failed: {e}"));
+                } else {
+                    lib.reload();
+                }
+            }
+            LibAction::OpenUrl(u) => ctx.open_url(egui::OpenUrl::new_tab(u)),
+            LibAction::Cite => match engine::cite(&lib.vault, &key) {
+                Ok(s) => {
+                    ctx.copy_text(s);
+                    self.toast = Some("Copied citation".into());
+                }
+                Err(e) => self.toast = Some(e),
+            },
+            LibAction::Bibtex => match engine::entry_bibtex(&lib.vault, &key) {
+                Ok(s) => {
+                    ctx.copy_text(s);
+                    self.toast = Some("Copied BibTeX".into());
+                }
+                Err(e) => self.toast = Some(e),
+            },
+        }
     }
 }
 
@@ -419,7 +507,8 @@ fn niu_mark(ui: &mut egui::Ui, theme: &Theme, size: f32) {
     );
 }
 
-fn rail_button(ui: &mut egui::Ui, theme: &Theme, label: &str, on: bool) -> egui::Response {
+/// A 42×42 rail button painting `glyph`; accent tint + inset marker when active.
+fn rail_button(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph, on: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::click());
     let fill = if on {
         theme.accent_tint
@@ -431,7 +520,6 @@ fn rail_button(ui: &mut egui::Ui, theme: &Theme, label: &str, on: bool) -> egui:
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(11), fill);
     if on {
-        // 3px inset accent marker on the left.
         let m = egui::Rect::from_min_max(
             egui::pos2(rect.left() - 12.0, rect.top() + 11.0),
             egui::pos2(rect.left() - 9.0, rect.bottom() - 11.0),
@@ -440,21 +528,19 @@ fn rail_button(ui: &mut egui::Ui, theme: &Theme, label: &str, on: bool) -> egui:
             .rect_filled(m, egui::CornerRadius::same(2), theme.accent);
     }
     let color = if on { theme.accent } else { theme.muted };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(12.0),
-        color,
-    );
+    icons::paint(ui.painter(), rect.shrink(10.0), glyph, color);
     resp
 }
 
-fn icbtn(glyph: &str, theme: &Theme) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(glyph).size(15.0).color(theme.muted))
-        .fill(Color32::TRANSPARENT)
-        .corner_radius(8.0)
-        .min_size(egui::vec2(32.0, 32.0))
+/// A 32×32 transparent icon button (titlebar use).
+fn icbtn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(8), theme.surface_2);
+    }
+    icons::paint(ui.painter(), rect.shrink(8.0), glyph, theme.muted);
+    resp
 }
 
 fn placeholder(ui: &mut egui::Ui, theme: &Theme, title: &str, sub: &str) {
@@ -482,11 +568,9 @@ fn empty_state(ui: &mut egui::Ui, theme: &Theme, err: Option<&str>) {
         match err {
             Some(e) => ui.label(RichText::new(e).color(theme.rose)),
             None => ui.label(
-                RichText::new(
-                    "Pass a vault folder:  niutero <path>   (or open one — coming in G2)",
-                )
-                .font(theme::mono(12.0))
-                .color(theme.muted),
+                RichText::new("Pass a vault folder:  niutero <path>   (or open one — coming soon)")
+                    .font(theme::mono(12.0))
+                    .color(theme.muted),
             ),
         };
     });
