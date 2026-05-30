@@ -381,7 +381,7 @@ fn drawer(
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(6.0);
-    super::detail_body(ui, theme, e, st, actions);
+    super::detail_body(ui, theme, e, st, actions, true);
 
     if close {
         st.drawer_open = false;

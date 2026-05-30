@@ -467,25 +467,47 @@ impl NiuteroApp {
             .inner_margin(3)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (label, v) in [
-                        ("Classic", LibView::Classic),
-                        ("Reader", LibView::Reader),
-                        ("Board", LibView::Board),
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (label, glyph, v) in [
+                        ("Classic", Glyph::Rows, LibView::Classic),
+                        ("Reader", Glyph::Book, LibView::Reader),
+                        ("Board", Glyph::Grid, LibView::Board),
                     ] {
                         let on = self.lib_view == v;
-                        let txt = RichText::new(label).size(12.5).color(if on {
-                            theme.accent
-                        } else {
-                            theme.text_2
-                        });
-                        let btn = egui::Button::new(txt)
-                            .fill(if on {
-                                theme.surface
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(7.0);
-                        if ui.add(btn).clicked() {
+                        let w = label.len() as f32 * 7.0 + 30.0;
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+                        if on {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::CornerRadius::same(7),
+                                theme.surface,
+                            );
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::CornerRadius::same(7),
+                                theme.surface.gamma_multiply(0.5),
+                            );
+                        }
+                        let fg = if on { theme.accent } else { theme.text_2 };
+                        icons::paint_at(
+                            ui,
+                            egui::Rect::from_center_size(
+                                egui::pos2(rect.left() + 13.0, rect.center().y),
+                                egui::vec2(15.0, 15.0),
+                            ),
+                            glyph,
+                            fg,
+                        );
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 24.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(12.5),
+                            fg,
+                        );
+                        if resp.clicked() {
                             self.lib_view = v;
                         }
                     }

@@ -10,7 +10,7 @@
 //! after rendering — this keeps the immutable library borrow and the mutable
 //! engine call from overlapping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use eframe::egui::{self, Color32, RichText};
 use niutero_engine::{EntryView, Status};
@@ -38,6 +38,10 @@ pub struct LibState {
     pub hide_list: bool,
     /// Board: whether the slide-in detail drawer is open for `selected`.
     pub drawer_open: bool,
+    /// Classic: sort the list by creator (CREATOR ▾ column header toggle).
+    pub sort_by_creator: bool,
+    /// Classic: tag-tree namespace groups the user has collapsed.
+    collapsed_ns: HashSet<String>,
     /// Edit buffers for the selected entry's text fields, valid while unlocked.
     buffers: BTreeMap<String, String>,
     buffers_for: Option<String>,
@@ -66,6 +70,8 @@ impl Default for LibState {
             hide_detail: false,
             hide_list: false,
             drawer_open: false,
+            sort_by_creator: false,
+            collapsed_ns: HashSet::new(),
             buffers: BTreeMap::new(),
             buffers_for: None,
             adding_tag: false,
@@ -164,21 +170,29 @@ pub fn classic(
 // ----------------------------------------------------------------- sidebar
 
 fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
-    // "All Entries" clears the tag filter.
+    // "All Entries" (library icon) clears the tag filter.
     let all_on = st.active_tag.is_none();
-    if row_button(ui, theme, "All Entries", all_on, entries.len()).clicked() {
+    if all_entries_row(ui, theme, all_on, entries.len()) {
         st.active_tag = None;
     }
-    ui.add_space(10.0);
+    ui.add_space(12.0);
+
+    // TAGS section header with the AI auto-tag (✦) and new-tag (+) buttons.
+    // Both open popovers in the design; rendered now, wired in a later wave.
+    tags_header(ui, theme);
 
     for (label, tags) in tag_groups(entries) {
-        ui.label(
-            RichText::new(label.to_uppercase())
-                .size(11.0)
-                .strong()
-                .color(theme.muted),
-        );
-        ui.add_space(2.0);
+        let collapsed = st.collapsed_ns.contains(&label);
+        if group_header(ui, theme, &label, tags.len(), collapsed) {
+            if collapsed {
+                st.collapsed_ns.remove(&label);
+            } else {
+                st.collapsed_ns.insert(label.clone());
+            }
+        }
+        if collapsed {
+            continue;
+        }
         for (full, value, count, color) in tags {
             let on = st.active_tag.as_deref() == Some(full.as_str());
             let (rect, resp) = ui
@@ -190,14 +204,15 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
                     if on { theme.sel } else { theme.surface_2 },
                 );
             }
-            let dot = rect.left_center() + egui::vec2(14.0, 0.0);
+            // indented under the group header
+            let dot = rect.left_center() + egui::vec2(22.0, 0.0);
             ui.painter().rect_filled(
                 egui::Rect::from_center_size(dot, egui::vec2(8.0, 8.0)),
                 egui::CornerRadius::same(3),
                 color,
             );
             ui.painter().text(
-                rect.left_center() + egui::vec2(26.0, 0.0),
+                rect.left_center() + egui::vec2(34.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 &value,
                 egui::FontId::proportional(13.0),
@@ -214,8 +229,110 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
                 st.active_tag = if on { None } else { Some(full.clone()) };
             }
         }
-        ui.add_space(8.0);
+        ui.add_space(6.0);
     }
+}
+
+/// "All Entries" row with a leading library icon. Returns whether clicked.
+fn all_entries_row(ui: &mut egui::Ui, theme: &Theme, on: bool, count: usize) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    if on || resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(8),
+            if on { theme.sel } else { theme.surface_2 },
+        );
+    }
+    icons::paint_at(
+        ui,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 18.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        ),
+        Glyph::Library,
+        theme.accent,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "All Entries",
+        egui::FontId::proportional(13.5),
+        if on { theme.text } else { theme.text_2 },
+    );
+    ui.painter().text(
+        rect.right_center() - egui::vec2(10.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        count.to_string(),
+        egui::FontId::proportional(11.0),
+        theme.muted,
+    );
+    resp.clicked()
+}
+
+/// "TAGS" section header with ✦ (AI auto-tag) and + (new tag) buttons.
+fn tags_header(ui: &mut egui::Ui, theme: &Theme) {
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(RichText::new("TAGS").size(11.0).strong().color(theme.muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let _ = mini_icon_btn(ui, theme, Glyph::Plus).on_hover_text("New tag");
+            let _ = mini_icon_btn(ui, theme, Glyph::Sparkle).on_hover_text("Auto-tag with AI");
+        });
+    });
+    ui.add_space(2.0);
+}
+
+/// Collapsible namespace group header: chevron · LABEL · count. Returns clicked.
+fn group_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    count: usize,
+    collapsed: bool,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+    let chevron = if collapsed {
+        Glyph::ChevronRight
+    } else {
+        Glyph::ChevronDown
+    };
+    icons::paint_at(
+        ui,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            egui::vec2(12.0, 12.0),
+        ),
+        chevron,
+        theme.muted,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label.to_uppercase(),
+        egui::FontId::proportional(11.0),
+        theme.muted,
+    );
+    ui.painter().text(
+        rect.right_center() - egui::vec2(8.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        count.to_string(),
+        egui::FontId::proportional(11.0),
+        theme.muted,
+    );
+    resp.clicked()
+}
+
+/// A 22×22 transparent icon button (sidebar header controls).
+fn mini_icon_btn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(6), theme.surface_2);
+    }
+    icons::paint_at(ui, rect.shrink(4.0), glyph, theme.muted);
+    resp
 }
 
 /// One tag in the tree: (full `ns:value`, display value, count, dot color).
@@ -280,39 +397,6 @@ fn tag_color(name: &str) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-fn row_button(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    label: &str,
-    on: bool,
-    count: usize,
-) -> egui::Response {
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
-    if on || resp.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(8),
-            if on { theme.sel } else { theme.surface_2 },
-        );
-    }
-    ui.painter().text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(13.5),
-        if on { theme.text } else { theme.text_2 },
-    );
-    ui.painter().text(
-        rect.right_center() - egui::vec2(10.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        count.to_string(),
-        egui::FontId::proportional(11.0),
-        theme.muted,
-    );
-    resp
-}
-
 // -------------------------------------------------------------------- list
 
 fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
@@ -361,15 +445,26 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         egui::Stroke::new(1.0, theme.border),
     );
 
+    // Sortable column header (TITLE · CREATOR ▾ · YEAR), aligned to the row
+    // columns; clicking CREATOR toggles the sort.
+    list_header(ui, theme, st);
+
     let search = st.search.to_lowercase();
-    // Only the matching entries, then row-virtualized: with a large library
-    // (1,292 in the mock) egui would otherwise lay out and lay out a text galley
-    // for every row each frame. `show_rows` runs the closure for just the
-    // visible range (rows are a uniform 56px).
-    let shown: Vec<&EntryView> = entries
+    // Only the matching entries, optionally sorted, then row-virtualized: with a
+    // large library (1,292 in the mock) egui would otherwise lay out a text
+    // galley for every row each frame. `show_rows` runs the closure for just the
+    // visible range (rows are a uniform 62px).
+    let mut shown: Vec<&EntryView> = entries
         .iter()
         .filter(|e| matches_filter(e, &st.active_tag, &search))
         .collect();
+    if st.sort_by_creator {
+        // Key once (creator_of allocates) rather than in every comparison.
+        let mut keyed: Vec<(String, &EntryView)> =
+            shown.into_iter().map(|e| (creator_of(e), e)).collect();
+        keyed.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        shown = keyed.into_iter().map(|(_, e)| e).collect();
+    }
     if shown.is_empty() {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -382,11 +477,11 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         return;
     }
     // Rows are flush (each draws its own bottom hairline), so the pitch must be
-    // exactly 56 — `show_rows` reads this spacing to size the virtual range.
+    // exactly 62 — `show_rows` reads this spacing to size the virtual range.
     ui.spacing_mut().item_spacing.y = 0.0;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show_rows(ui, 56.0, shown.len(), |ui, range| {
+        .show_rows(ui, 62.0, shown.len(), |ui, range| {
             for i in range {
                 let e = shown[i];
                 if list_row(ui, theme, e, st.selected.as_deref() == Some(&e.citekey)).clicked() {
@@ -397,10 +492,84 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         });
 }
 
-/// One 56px list row: type glyph · serif title + tag hashes · creator · year · PDF.
+/// The list's column x-positions (shared by the header and rows), measured from
+/// the right so the title column flexes. A fixed clip slot keeps columns aligned
+/// whether or not a given row has a PDF.
+struct ListCols {
+    creator_right: f32,
+    year_right: f32,
+    title_right: f32,
+}
+
+fn list_cols(rect: egui::Rect) -> ListCols {
+    let year_right = rect.right() - 14.0 - 26.0; // right pad + clip slot
+    let creator_right = year_right - 46.0 - 14.0; // year width + gap
+    let title_right = creator_right - 150.0 - 14.0; // creator width + gap
+    ListCols {
+        creator_right,
+        year_right,
+        title_right,
+    }
+}
+
+/// Sortable column header row (spec §4·A).
+fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+    let cols = list_cols(rect);
+    let cy = rect.center().y;
+    ui.painter().text(
+        egui::pos2(rect.left() + 16.0, cy),
+        egui::Align2::LEFT_CENTER,
+        "TITLE",
+        egui::FontId::proportional(11.0),
+        theme.muted,
+    );
+    // CREATOR ▾ — clickable to toggle sort (accent when active).
+    let creator_col = if st.sort_by_creator {
+        theme.accent
+    } else {
+        theme.muted
+    };
+    let creator_txt = "CREATOR  ▾";
+    let cw = creator_txt.len() as f32 * 6.0;
+    let chit = egui::Rect::from_min_max(
+        egui::pos2(cols.creator_right - cw, rect.top()),
+        egui::pos2(cols.creator_right + 4.0, rect.bottom()),
+    );
+    if ui
+        .interact(chit, ui.id().with("sort-creator"), egui::Sense::click())
+        .on_hover_text("Sort by creator")
+        .clicked()
+    {
+        st.sort_by_creator = !st.sort_by_creator;
+    }
+    ui.painter().text(
+        egui::pos2(cols.creator_right, cy),
+        egui::Align2::RIGHT_CENTER,
+        creator_txt,
+        egui::FontId::proportional(11.0),
+        creator_col,
+    );
+    ui.painter().text(
+        egui::pos2(cols.year_right, cy),
+        egui::Align2::RIGHT_CENTER,
+        "YEAR",
+        egui::FontId::proportional(11.0),
+        theme.muted,
+    );
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom(),
+        egui::Stroke::new(1.0, theme.border),
+    );
+}
+
+/// One 62px list row (spec §4·A): type glyph · serif title with a tag-hash line
+/// underneath · right-aligned CREATOR and YEAR columns · PDF clip.
 fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> egui::Response {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::click());
     if selected {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::ZERO, theme.sel);
@@ -413,54 +582,78 @@ fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> 
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::ZERO, theme.surface_2);
     }
+    let cols = list_cols(rect);
+    let cy = rect.center().y;
+
     // type glyph
     let (glyph, gcolor) = type_glyph(theme, &e.entry_type);
-    let gr = egui::Rect::from_center_size(
-        rect.left_center() + egui::vec2(26.0, 0.0),
-        egui::vec2(20.0, 20.0),
+    icons::paint_at(
+        ui,
+        egui::Rect::from_center_size(egui::pos2(rect.left() + 26.0, cy), egui::vec2(20.0, 20.0)),
+        glyph,
+        gcolor,
     );
-    icons::paint_at(ui, gr, glyph, gcolor);
 
-    let x = rect.left() + 48.0;
+    let title_left = rect.left() + 48.0;
+    let title_w = (cols.title_right - title_left).max(80.0);
     let title = crate::tex::display(
         e.fields
             .get("title")
             .map(String::as_str)
             .unwrap_or("(untitled)"),
     );
-    ui.painter().text(
-        egui::pos2(x, rect.center().y - 9.0),
-        egui::Align2::LEFT_CENTER,
-        ellipsize(&title, 64),
-        theme::serif(15.5),
-        theme.text,
-    );
-    let creator = creator_of(e);
-    let year = e.fields.get("year").map(String::as_str).unwrap_or("");
     let tagline = e
         .tags
         .iter()
         .map(|t| format!("#{}", t.rsplit(':').next().unwrap_or(t)))
         .collect::<Vec<_>>()
         .join("  ");
-    let sub = if tagline.is_empty() {
-        format!("{creator}   ·   {year}")
-    } else {
-        format!("{creator}   ·   {year}   ·   {tagline}")
-    };
+    let has_tags = !tagline.is_empty();
+
+    // Title (and tag-hash line under it, when present), left block vertically
+    // centered within the row.
+    let title_y = if has_tags { cy - 9.0 } else { cy };
     ui.painter().text(
-        egui::pos2(x, rect.center().y + 11.0),
+        egui::pos2(title_left, title_y),
         egui::Align2::LEFT_CENTER,
-        ellipsize(&sub, 76),
-        egui::FontId::proportional(12.0),
-        theme.muted,
+        ellipsize(&title, (title_w / 7.4) as usize),
+        theme::serif(15.5),
+        theme.text,
     );
-    // PDF clip on the right
+    if has_tags {
+        ui.painter().text(
+            egui::pos2(title_left, cy + 11.0),
+            egui::Align2::LEFT_CENTER,
+            ellipsize(&tagline, (title_w / 6.6) as usize),
+            egui::FontId::proportional(12.0),
+            theme.muted,
+        );
+    }
+
+    // CREATOR and YEAR columns (right-aligned), vertically centered.
+    let creator = creator_of(e);
+    ui.painter().text(
+        egui::pos2(cols.creator_right, cy),
+        egui::Align2::RIGHT_CENTER,
+        ellipsize(&creator, 20),
+        egui::FontId::proportional(13.0),
+        theme.text_2,
+    );
+    let year = e.fields.get("year").map(String::as_str).unwrap_or("");
+    ui.painter().text(
+        egui::pos2(cols.year_right, cy),
+        egui::Align2::RIGHT_CENTER,
+        year,
+        egui::FontId::proportional(13.0),
+        theme.text_2,
+    );
+
+    // PDF clip on the far right.
     if has_pdf(e) {
         icons::paint_at(
             ui,
             egui::Rect::from_center_size(
-                rect.right_center() - egui::vec2(20.0, 0.0),
+                egui::pos2(rect.right() - 16.0, cy),
                 egui::vec2(16.0, 16.0),
             ),
             Glyph::Attach,
@@ -531,15 +724,9 @@ pub(super) fn detail_panel(
     ensure_buffers(st, e);
     let locked = st.locked;
 
-    // header: type badge + lock toggle
+    // header: type pill badge + "Locked/Editing" label + lock toggle
     ui.horizontal(|ui| {
-        let (_, gcolor) = type_glyph(theme, &e.entry_type);
-        ui.label(
-            RichText::new(type_label(&e.entry_type))
-                .size(11.0)
-                .strong()
-                .color(gcolor),
-        );
+        type_badge(ui, theme, e);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let g = if locked { Glyph::Lock } else { Glyph::Unlock };
             let col = if locked { theme.muted } else { theme.accent };
@@ -554,10 +741,17 @@ pub(super) fn detail_panel(
                 st.locked = !st.locked;
                 st.buffers_for = None;
             }
+            ui.label(
+                RichText::new(if locked { "Locked" } else { "Editing" })
+                    .size(11.0)
+                    .strong()
+                    .color(theme.muted),
+            );
         });
     });
     ui.add_space(8.0);
-    detail_body(ui, theme, e, st, actions);
+    // Classic detail omits the reading-status/stars row (it's in the Board).
+    detail_body(ui, theme, e, st, actions, false);
 }
 
 /// The detail content below the header (title … Cite/BibTeX footer), shared by
@@ -569,6 +763,7 @@ pub(super) fn detail_body(
     e: &EntryView,
     st: &mut LibState,
     actions: &mut Vec<LibAction>,
+    reading: bool,
 ) {
     let locked = st.locked;
     egui::ScrollArea::vertical()
@@ -578,19 +773,18 @@ pub(super) fn detail_body(
             edit_text(ui, theme, st, actions, "title", locked, true);
             ui.add_space(10.0);
 
-            // Authors (compact line locked; editable raw line when unlocked — the
-            // Zotero per-author rows are a planned refinement).
-            meta_label(ui, theme, "Authors");
+            // Authors byline (no label) — compact line locked; editable raw line
+            // when unlocked (the Zotero per-author rows are a planned refinement).
             if locked {
                 ui.label(
                     RichText::new(authors_line(e))
-                        .size(13.5)
+                        .size(14.0)
                         .color(theme.text_2),
                 );
             } else {
                 edit_field_raw(ui, theme, st, actions, "author", false);
             }
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
             let pub_field = if e.fields.contains_key("journal") {
                 "journal"
@@ -606,14 +800,17 @@ pub(super) fn detail_body(
             ui.label(
                 RichText::new(&e.citekey)
                     .font(theme::mono(12.5))
-                    .color(theme.text_2),
+                    .color(theme.accent),
             );
             ui.add_space(10.0);
 
-            // Status + stars.
-            meta_label(ui, theme, "Reading");
-            status_stars(ui, theme, e, actions);
-            ui.add_space(10.0);
+            // Reading status + stars (Board drawer only; the Classic detail omits
+            // it to match the design).
+            if reading {
+                meta_label(ui, theme, "Reading");
+                status_stars(ui, theme, e, actions);
+                ui.add_space(10.0);
+            }
 
             // Tags.
             meta_label(ui, theme, "Tags");
@@ -655,8 +852,9 @@ pub(super) fn detail_body(
                     }
                 }
             });
-            ui.add_space(6.0);
-            if ghost_btn(ui, theme, "BibTeX", 176.0).clicked() {
+            ui.add_space(8.0);
+            let w = ui.available_width();
+            if ghost_btn(ui, theme, Some(Glyph::Book), "BibTeX", w).clicked() {
                 actions.push(LibAction::Bibtex);
             }
         });
@@ -720,15 +918,27 @@ fn tags_editor(
                 .inner_margin(egui::Margin::symmetric(8, 3))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.painter(); // ensure a paint surface
+                        ui.spacing_mut().item_spacing.x = 0.0;
                         let dot = ui
                             .allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover())
                             .0;
                         ui.painter()
                             .rect_filled(dot, egui::CornerRadius::same(2), tag_color(t));
-                        ui.label(RichText::new(value).size(11.0).color(theme.text));
-                        if !locked
-                            && ui
+                        ui.add_space(5.0);
+                        // Full namespace:value, with the namespace dimmed (spec §4·A).
+                        if let Some((ns, val)) = t.split_once(':') {
+                            ui.label(
+                                RichText::new(format!("{ns}: "))
+                                    .size(11.0)
+                                    .color(theme.muted),
+                            );
+                            ui.label(RichText::new(val).size(11.0).color(theme.text));
+                        } else {
+                            ui.label(RichText::new(value).size(11.0).color(theme.text));
+                        }
+                        if !locked {
+                            ui.add_space(4.0);
+                            if ui
                                 .add(
                                     egui::Button::new(
                                         RichText::new("×").size(11.0).color(theme.muted),
@@ -736,8 +946,9 @@ fn tags_editor(
                                     .frame(false),
                                 )
                                 .clicked()
-                        {
-                            actions.push(LibAction::RemoveTag(t.clone()));
+                            {
+                                actions.push(LibAction::RemoveTag(t.clone()));
+                            }
                         }
                     });
                 });
@@ -914,14 +1125,50 @@ fn primary_btn(
         .interact(egui::Sense::click())
 }
 
-fn ghost_btn(ui: &mut egui::Ui, theme: &Theme, label: &str, w: f32) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(label).size(13.0).strong().color(theme.text))
-            .fill(theme.surface)
-            .stroke(egui::Stroke::new(1.0, theme.border))
-            .corner_radius(8.0)
-            .min_size(egui::vec2(w, 32.0)),
-    )
+fn ghost_btn(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Option<Glyph>,
+    label: &str,
+    w: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
+    let fill = if resp.hovered() {
+        theme.surface_2
+    } else {
+        theme.surface
+    };
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(8),
+        fill,
+        egui::Stroke::new(1.0, theme.border),
+        egui::StrokeKind::Inside,
+    );
+    // center icon + label
+    let label_w = label.len() as f32 * 7.0;
+    let icon_w = if icon.is_some() { 22.0 } else { 0.0 };
+    let mut x = rect.center().x - (icon_w + label_w) * 0.5;
+    if let Some(g) = icon {
+        icons::paint_at(
+            ui,
+            egui::Rect::from_center_size(
+                egui::pos2(x + 8.0, rect.center().y),
+                egui::vec2(16.0, 16.0),
+            ),
+            g,
+            theme.text,
+        );
+        x += icon_w;
+    }
+    ui.painter().text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        theme.text,
+    );
+    resp
 }
 
 // -------------------------------------------------------------- entry helpers
@@ -995,6 +1242,16 @@ fn type_label(t: &str) -> &'static str {
     match t {
         "inproceedings" | "conference" => "Conference Paper",
         "article" => "Journal Article",
+        "book" => "Book",
+        "incollection" | "inbook" => "Book Chapter",
+        "proceedings" => "Proceedings",
+        "phdthesis" => "PhD Thesis",
+        "mastersthesis" => "Master's Thesis",
+        "techreport" => "Technical Report",
+        "manual" => "Manual",
+        "booklet" => "Booklet",
+        "unpublished" => "Unpublished",
+        "online" | "electronic" => "Online",
         "misc" => "Preprint",
         _ => "Document",
     }
@@ -1002,9 +1259,11 @@ fn type_label(t: &str) -> &'static str {
 
 fn type_glyph(theme: &Theme, t: &str) -> (Glyph, Color32) {
     match t {
-        "inproceedings" | "conference" => (Glyph::Book, theme.accent),
+        "inproceedings" | "conference" | "proceedings" => (Glyph::Book, theme.accent),
         "article" => (Glyph::Doc, theme.blue),
-        "misc" => (Glyph::Doc, theme.amber),
+        "book" | "incollection" | "inbook" | "manual" | "booklet" => (Glyph::Book, theme.purple),
+        "phdthesis" | "mastersthesis" => (Glyph::Doc, theme.teal),
+        "misc" | "online" | "electronic" => (Glyph::Doc, theme.amber),
         _ => (Glyph::Doc, theme.muted),
     }
 }
