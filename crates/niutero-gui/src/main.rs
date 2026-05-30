@@ -14,6 +14,7 @@ mod library;
 mod normalize;
 mod overlays;
 mod settings;
+mod tex;
 mod theme;
 mod widgets;
 

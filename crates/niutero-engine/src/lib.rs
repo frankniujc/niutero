@@ -32,6 +32,7 @@ use niutero_norm::{normalize_entry, NormConfig};
 use niutero_sync as git;
 use serde::{Deserialize, Serialize};
 
+pub use niutero_core::texdisplay;
 pub use niutero_core::texscan::TexReport;
 pub use niutero_vault::{EntryMeta, ExportTarget, Registry, Status, SyncPrefs, Vault, View};
 

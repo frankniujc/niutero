@@ -463,12 +463,14 @@ fn diff_card(
 ) {
     let rejected = st.done.get(&d.citekey) == Some(&false);
     let accepted = st.done.get(&d.citekey) == Some(&true);
-    let title = entries
-        .iter()
-        .find(|e| e.citekey == d.citekey)
-        .and_then(|e| e.fields.get("title"))
-        .map(String::as_str)
-        .unwrap_or("(untitled)");
+    let title = crate::tex::display(
+        entries
+            .iter()
+            .find(|e| e.citekey == d.citekey)
+            .and_then(|e| e.fields.get("title"))
+            .map(String::as_str)
+            .unwrap_or("(untitled)"),
+    );
     let rule = d
         .notes
         .first()
@@ -486,7 +488,7 @@ fn diff_card(
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(crate::library::ellipsize(title, 64))
+                            RichText::new(crate::library::ellipsize(&title, 64))
                                 .font(theme::serif(15.5))
                                 .color(theme.text),
                         );

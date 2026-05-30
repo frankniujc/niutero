@@ -361,13 +361,14 @@ fn item_card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) ->
                 });
             });
             ui.add_space(5.0);
-            let title = e
-                .fields
-                .get("title")
-                .map(String::as_str)
-                .unwrap_or("(untitled)");
+            let title = crate::tex::display(
+                e.fields
+                    .get("title")
+                    .map(String::as_str)
+                    .unwrap_or("(untitled)"),
+            );
             ui.label(
-                RichText::new(super::ellipsize(title, 110))
+                RichText::new(super::ellipsize(&title, 110))
                     .font(theme::serif(16.0))
                     .color(theme.text),
             );
@@ -532,11 +533,7 @@ fn reading_column(
             .get("title")
             .map(String::as_str)
             .unwrap_or("(untitled)");
-        ui.label(
-            RichText::new(title)
-                .font(theme::serif(33.0))
-                .color(theme.text),
-        );
+        crate::tex::runs_label(ui, title, theme::serif(33.0), theme.text);
     } else {
         let buf = st.buffers.entry("title".into()).or_default();
         let r = ui.add(
@@ -564,14 +561,15 @@ fn reading_column(
     ui.add_space(4.0);
 
     // ---- venue · year
-    let venue = e
-        .fields
-        .get("journal")
-        .or_else(|| e.fields.get("booktitle"))
-        .map(String::as_str)
-        .unwrap_or("");
+    let venue = crate::tex::display(
+        e.fields
+            .get("journal")
+            .or_else(|| e.fields.get("booktitle"))
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
     let year = e.fields.get("year").map(String::as_str).unwrap_or("");
-    let vy = [venue, year]
+    let vy = [venue.as_str(), year]
         .iter()
         .filter(|s| !s.is_empty())
         .cloned()
@@ -611,11 +609,8 @@ fn reading_column(
         ui.vertical(|ui| {
             super::meta_label(ui, theme, "Abstract");
             if locked {
-                ui.label(
-                    RichText::new(e.fields.get("abstract").map(String::as_str).unwrap_or("—"))
-                        .font(theme::serif(15.0))
-                        .color(theme.text),
-                );
+                let abs = e.fields.get("abstract").map(String::as_str).unwrap_or("—");
+                crate::tex::runs_label(ui, abs, theme::serif(15.0), theme.text);
             } else {
                 let buf = st.buffers.entry("abstract".into()).or_default();
                 let r = ui.add(
@@ -765,7 +760,10 @@ fn venue_short(e: &EntryView) -> String {
     e.fields
         .get("journal")
         .or_else(|| e.fields.get("booktitle"))
-        .map(|v| v.split([' ', ',']).next().unwrap_or(v).to_string())
+        .map(|v| {
+            let v = crate::tex::display(v);
+            v.split([' ', ',']).next().unwrap_or(&v).to_string()
+        })
         .unwrap_or_else(|| match e.entry_type.as_str() {
             "inproceedings" | "conference" => "CONF".into(),
             "article" => "JOURNAL".into(),

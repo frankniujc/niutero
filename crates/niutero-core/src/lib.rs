@@ -11,6 +11,7 @@ mod entry;
 pub mod filter;
 mod library;
 pub mod merge;
+pub mod texdisplay;
 pub mod texscan;
 
 pub use citekey::KeyPattern;

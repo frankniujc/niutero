@@ -410,15 +410,16 @@ fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> 
     icons::paint_at(ui, gr, glyph, gcolor);
 
     let x = rect.left() + 48.0;
-    let title = e
-        .fields
-        .get("title")
-        .map(String::as_str)
-        .unwrap_or("(untitled)");
+    let title = crate::tex::display(
+        e.fields
+            .get("title")
+            .map(String::as_str)
+            .unwrap_or("(untitled)"),
+    );
     ui.painter().text(
         egui::pos2(x, rect.center().y - 9.0),
         egui::Align2::LEFT_CENTER,
-        ellipsize(title, 64),
+        ellipsize(&title, 64),
         theme::serif(15.5),
         theme.text,
     );
@@ -610,11 +611,8 @@ pub(super) fn detail_body(
             // Abstract (serif).
             meta_label(ui, theme, "Abstract");
             if locked {
-                ui.label(
-                    RichText::new(e.fields.get("abstract").map(String::as_str).unwrap_or("—"))
-                        .font(theme::serif(13.5))
-                        .color(theme.text_2),
-                );
+                let abs = e.fields.get("abstract").map(String::as_str).unwrap_or("—");
+                crate::tex::runs_label(ui, abs, theme::serif(13.5), theme.text_2);
             } else {
                 let buf = st.buffers.get_mut("abstract").unwrap();
                 let r = ui.add(
@@ -779,7 +777,13 @@ fn meta_row(
 ) {
     meta_label(ui, theme, label);
     if locked {
-        let v = st.buffers.get(field).cloned().unwrap_or_default();
+        let raw = st.buffers.get(field).cloned().unwrap_or_default();
+        // DOI is an identifier (no LaTeX); other fields get the display transform.
+        let v = if field == "doi" {
+            raw
+        } else {
+            crate::tex::display(&raw)
+        };
         let shown = if v.is_empty() { "—".to_string() } else { v };
         let font = if field == "doi" {
             theme::mono(12.5)
@@ -805,7 +809,7 @@ fn edit_text(
 ) {
     if locked {
         let v = st.buffers.get(field).cloned().unwrap_or_default();
-        ui.label(RichText::new(v).font(theme::serif(19.0)).color(theme.text));
+        crate::tex::runs_label(ui, &v, theme::serif(19.0), theme.text);
     } else {
         edit_field_raw(ui, theme, st, actions, field, false);
     }
@@ -937,11 +941,14 @@ fn creator_of(e: &EntryView) -> String {
 }
 
 fn authors_vec(e: &EntryView) -> Vec<String> {
+    // Split the raw `author` on " and " first, then de-TeX each name for display
+    // (so `M\"uller`/`{\v S}imek` render as Müller / Šimek). Search/edit still use
+    // the raw field — this is display-only.
     e.fields
         .get("author")
         .map(|a| {
             a.split(" and ")
-                .map(|s| s.trim().to_string())
+                .map(|s| crate::tex::display(s.trim()))
                 .filter(|s| !s.is_empty())
                 .collect()
         })

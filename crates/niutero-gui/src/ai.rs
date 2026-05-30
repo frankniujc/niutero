@@ -167,9 +167,10 @@ fn thread(
                 if cite_chip(ui, theme, &cite_label(e)).clicked() {
                     actions.push(AiAction::OpenEntry(e.citekey.clone()));
                 }
-                let title = e.fields.get("title").map(String::as_str).unwrap_or("");
+                let title =
+                    crate::tex::display(e.fields.get("title").map(String::as_str).unwrap_or(""));
                 ui.label(
-                    RichText::new(crate::library::ellipsize(title, 52))
+                    RichText::new(crate::library::ellipsize(&title, 52))
                         .size(13.5)
                         .color(theme.text_2),
                 );
@@ -401,6 +402,7 @@ pub(crate) fn cite_label(e: &EntryView) -> String {
         .first()
         .map(|a| a.split(',').next().unwrap_or(a).trim())
         .unwrap_or("Anon");
+    let last = crate::tex::display(last);
     if authors.len() > 1 {
         format!("{last} et al. {year}").trim().to_string()
     } else {

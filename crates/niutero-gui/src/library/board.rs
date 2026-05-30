@@ -269,13 +269,14 @@ fn card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> bool
             });
             ui.add_space(7.0);
             // title (serif, clamped)
-            let title = e
-                .fields
-                .get("title")
-                .map(String::as_str)
-                .unwrap_or("(untitled)");
+            let title = crate::tex::display(
+                e.fields
+                    .get("title")
+                    .map(String::as_str)
+                    .unwrap_or("(untitled)"),
+            );
             ui.label(
-                RichText::new(super::ellipsize(title, 96))
+                RichText::new(super::ellipsize(&title, 96))
                     .font(theme::serif(16.5))
                     .color(theme.text),
             );
@@ -448,7 +449,10 @@ fn venue_short(e: &EntryView) -> String {
     e.fields
         .get("journal")
         .or_else(|| e.fields.get("booktitle"))
-        .map(|v| v.split([' ', ',']).next().unwrap_or(v).to_string())
+        .map(|v| {
+            let v = crate::tex::display(v);
+            v.split([' ', ',']).next().unwrap_or(&v).to_string()
+        })
         .unwrap_or_else(|| match e.entry_type.as_str() {
             "inproceedings" | "conference" => "CONF".into(),
             "article" => "JOURNAL".into(),
