@@ -401,20 +401,21 @@ fn reading_pane(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // Center a 720px reading column.
-            let col = 720.0_f32.min(ui.available_width());
-            let pad = ((ui.available_width() - col) * 0.5).max(0.0);
-            egui::Frame::default()
-                .inner_margin(egui::Margin {
-                    left: (pad + 8.0) as i8,
-                    right: (pad + 8.0) as i8,
-                    top: 30,
-                    bottom: 44,
-                })
-                .show(ui, |ui| {
-                    ui.set_max_width(col);
-                    reading_column(ui, theme, e, st, actions);
-                });
+            // Center a 720px reading column with the spec's 34/44/48 padding.
+            // (Centering is done by `centered_column` via add_space, not by an
+            // i8 inner_margin — a wide window's pad would overflow i8.)
+            crate::widgets::centered_column(ui, 720.0, |ui| {
+                egui::Frame::default()
+                    .inner_margin(egui::Margin {
+                        left: 44,
+                        right: 44,
+                        top: 34,
+                        bottom: 48,
+                    })
+                    .show(ui, |ui| {
+                        reading_column(ui, theme, e, st, actions);
+                    });
+            });
         });
 }
 
@@ -533,7 +534,7 @@ fn reading_column(
             .unwrap_or("(untitled)");
         ui.label(
             RichText::new(title)
-                .font(theme::serif(31.0))
+                .font(theme::serif(33.0))
                 .color(theme.text),
         );
     } else {
@@ -653,7 +654,7 @@ fn reading_column(
             false,
         );
     });
-    ui.add_space(20.0);
+    ui.add_space(24.0);
 
     // ---- tags
     super::meta_label(ui, theme, "Tags");
@@ -708,8 +709,8 @@ fn pdf_thumb(ui: &egui::Ui, theme: &Theme, rect: egui::Rect) {
         egui::Stroke::new(1.0, theme.border),
         egui::StrokeKind::Inside,
     );
-    // Diagonal hatch (135°), ~18px pitch, clipped to the thumbnail.
-    let step = 18.0;
+    // Diagonal hatch (135°), 9px pitch (spec's striped gradient), clipped.
+    let step = 9.0;
     let mut x = rect.left() - rect.height();
     while x < rect.right() {
         p.line_segment(

@@ -172,7 +172,7 @@ pub fn button(
         .corner_radius(8.0)
         .inner_margin(egui::Margin::symmetric(
             13,
-            ((h - 16.0) * 0.5).round() as i8,
+            ((h - 16.0) * 0.5).round().clamp(0.0, 60.0) as i8,
         ))
         .show(ui, |ui| {
             ui.horizontal(|ui| {

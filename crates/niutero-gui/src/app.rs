@@ -743,30 +743,6 @@ impl NiuteroApp {
                 ctx.copy_text(patch);
                 self.toast = Some("Copied patch".into());
             }
-            NormAction::ApplyEntry(key) => {
-                let args = self
-                    .norm_cache
-                    .as_ref()
-                    .and_then(|c| c.diffs.iter().find(|d| d.citekey == key))
-                    .map(norm_edit_args);
-                if let Some((set, unset)) = args {
-                    let r = self
-                        .library
-                        .as_ref()
-                        .map(|lib| engine::edit(&lib.vault, &key, &set, &unset, None));
-                    match r {
-                        Some(Ok(())) => {
-                            if let Some(lib) = self.library.as_mut() {
-                                lib.reload();
-                            }
-                            self.lib.refresh();
-                            info!("normalize: applied {key}");
-                        }
-                        Some(Err(e)) => self.toast = Some(format!("Apply failed: {e}")),
-                        None => {}
-                    }
-                }
-            }
             NormAction::ApplyAll => self.apply_all_norm(),
             NormAction::ApplyRekey => {
                 let res = self
@@ -877,13 +853,14 @@ impl NiuteroApp {
                     return;
                 };
                 let mut out = String::new();
+                let mut n = 0usize;
                 for k in &keys {
                     if let Ok(c) = engine::cite(&lib.vault, k) {
                         out.push_str(&c);
                         out.push('\n');
+                        n += 1;
                     }
                 }
-                let n = keys.len();
                 ctx.copy_text(out);
                 self.toast = Some(format!(
                     "Copied {n} citation{}",
@@ -1042,16 +1019,25 @@ fn norm_edit_args(d: &niutero_engine::NormChange) -> (Vec<String>, Vec<String>) 
 
 /// Render the staged normalization changes as a human-readable text patch.
 fn build_patch(diffs: &[niutero_engine::NormChange]) -> String {
+    // Flatten values to one line so an embedded newline (e.g. a multi-line
+    // abstract) can't break the line-oriented patch format.
+    fn oneline(s: &str) -> String {
+        s.replace(['\n', '\r'], " ")
+    }
     let mut out = String::new();
     for d in diffs {
         out.push_str(&format!("@ {}\n", d.citekey));
         for c in &d.diffs {
             match (&c.from, &c.to) {
-                (Some(f), Some(t)) => {
-                    out.push_str(&format!("  {}: - {f}\n  {}: + {t}\n", c.field, c.field))
-                }
-                (None, Some(t)) => out.push_str(&format!("  {}: + {t}\n", c.field)),
-                (Some(f), None) => out.push_str(&format!("  {}: - {f}\n", c.field)),
+                (Some(f), Some(t)) => out.push_str(&format!(
+                    "  {}: - {}\n  {}: + {}\n",
+                    c.field,
+                    oneline(f),
+                    c.field,
+                    oneline(t)
+                )),
+                (None, Some(t)) => out.push_str(&format!("  {}: + {}\n", c.field, oneline(t))),
+                (Some(f), None) => out.push_str(&format!("  {}: - {}\n", c.field, oneline(f))),
                 (None, None) => {}
             }
         }

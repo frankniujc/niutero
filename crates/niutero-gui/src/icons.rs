@@ -56,6 +56,7 @@ pub enum Glyph {
     Info,
     Clock,
     Download,
+    Tag,
 }
 
 // Wrap design `d`/element markup into a full SVG with a white stroke (round
@@ -175,6 +176,14 @@ const INFO: &str = svg!(
 );
 const CLOCK: &str = svg!("<circle cx='12' cy='12' r='8'/>", "<path d='M12 8v4l3 2'/>",);
 const DOWNLOAD: &str = svg!("<path d='M12 4v11m0 0l-4-4m4 4l4-4M5 19h14'/>");
+// Tag: a stroked tag outline with a filled punch-hole dot.
+const TAG: &str = concat!(
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' ",
+    "stroke='#ffffff' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>",
+    "<path d='M3 12l8.5-8.5a2 2 0 0 1 1.4-.6H19a2 2 0 0 1 2 2v5.7a2 2 0 0 1-.6 1.4L12 20.5a2 2 0 0 1-2.8 0l-6-6a2 2 0 0 1 0-2.8z'/>",
+    "<circle cx='16' cy='8' r='1.2' fill='#ffffff' stroke='none'/>",
+    "</svg>"
+);
 
 /// (stable cache uri, SVG markup) for a glyph.
 fn source(g: Glyph) -> (&'static str, &'static str) {
@@ -223,6 +232,7 @@ fn source(g: Glyph) -> (&'static str, &'static str) {
         Glyph::Info => ("bytes://niu-info.svg", INFO),
         Glyph::Clock => ("bytes://niu-clock.svg", CLOCK),
         Glyph::Download => ("bytes://niu-download.svg", DOWNLOAD),
+        Glyph::Tag => ("bytes://niu-tag.svg", TAG),
     }
 }
 

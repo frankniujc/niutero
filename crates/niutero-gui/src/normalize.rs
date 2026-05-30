@@ -110,8 +110,6 @@ pub enum NormAction {
     RunOffline,
     /// Start the Online-enrich background task (an online feature).
     StartEnrich,
-    /// Apply one entry's staged changes (`engine::edit` field-by-field).
-    ApplyEntry(String),
     /// Apply every staged change not rejected.
     ApplyAll,
     /// Copy the staged diff as a text patch.
@@ -451,7 +449,7 @@ fn review(
     }
 
     for d in &cache.diffs {
-        diff_card(ui, theme, entries, d, st, actions);
+        diff_card(ui, theme, entries, d, st);
         ui.add_space(16.0);
     }
 }
@@ -462,7 +460,6 @@ fn diff_card(
     entries: &[EntryView],
     d: &NormChange,
     st: &mut NormalizeState,
-    actions: &mut Vec<NormAction>,
 ) {
     let rejected = st.done.get(&d.citekey) == Some(&false);
     let accepted = st.done.get(&d.citekey) == Some(&true);
@@ -527,10 +524,11 @@ fn diff_card(
             .inner_margin(egui::Margin::symmetric(18, 11))
             .show(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Accept/Reject are *staging* decisions only — nothing is
+                    // written until "Apply all" (so the banner's promise holds).
                     let acc_label = if accepted { "Accepted ✓" } else { "Accept" };
                     if widgets::button(ui, theme, None, acc_label, true, 30.0).clicked() {
                         st.done.insert(d.citekey.clone(), true);
-                        actions.push(NormAction::ApplyEntry(d.citekey.clone()));
                     }
                     if widgets::button(ui, theme, None, "Reject", false, 30.0).clicked() {
                         st.done.insert(d.citekey.clone(), false);

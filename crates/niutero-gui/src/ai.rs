@@ -203,7 +203,7 @@ fn thread(
                 ));
             }
             let tag_lbl = format!("Tag these {} “unlearning”", cited.len());
-            if widgets::button(ui, theme, None, &tag_lbl, false, 30.0).clicked() {
+            if widgets::button(ui, theme, Some(Glyph::Tag), &tag_lbl, false, 30.0).clicked() {
                 actions.push(AiAction::Toast(
                     "Bulk-tag needs a connected model (preview)".into(),
                 ));

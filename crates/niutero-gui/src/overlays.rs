@@ -221,7 +221,7 @@ fn popup_panel(
                                         if widgets::button(
                                             ui,
                                             theme,
-                                            Some(Glyph::Doc),
+                                            Some(Glyph::Tag),
                                             "Tag both",
                                             false,
                                             28.0,
@@ -304,6 +304,7 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
     let now = ui.ctx().input(|i| i.time);
     let pct = t.progress(now);
     let done = pct >= 1.0;
+    let count = (pct * t.total as f32).round() as usize;
     if !done {
         ui.ctx().request_repaint(); // keep the bar animating
     }
@@ -333,7 +334,6 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
                 ui.painter().rect_filled(b, egui::CornerRadius::same(8), bg);
                 icons::paint_at(ui, b.shrink(6.0), glyph, fg);
                 ui.add_space(4.0);
-                let count = (pct * t.total as f32).round() as usize;
                 ui.vertical(|ui| {
                     let title = if done { &t.done_label } else { &t.label };
                     ui.label(RichText::new(title).size(13.5).strong().color(theme.text));
@@ -380,20 +380,27 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
                     }
                 });
             } else {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Run in background")
-                                    .size(11.5)
-                                    .color(theme.muted),
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{count} / {}", t.total))
+                            .size(11.5)
+                            .color(theme.muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Run in background")
+                                        .size(11.5)
+                                        .color(theme.muted),
+                                )
+                                .frame(false),
                             )
-                            .frame(false),
-                        )
-                        .clicked()
-                    {
-                        msgs.push(OverlayMsg::DismissTask);
-                    }
+                            .clicked()
+                        {
+                            msgs.push(OverlayMsg::DismissTask);
+                        }
+                    });
                 });
             }
         });

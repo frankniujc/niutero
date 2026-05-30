@@ -633,7 +633,7 @@ pub(super) fn detail_body(
 
             // Footer: Cite + link (row 1), BibTeX (row 2) — two narrow rows (spec §4·A).
             ui.horizontal(|ui| {
-                if primary_btn(ui, theme, "Cite").clicked() {
+                if primary_btn(ui, theme, Some(Glyph::Quote), "Cite").clicked() {
                     actions.push(LibAction::Cite);
                 }
                 if let Some(url) = e.fields.get("url").filter(|u| !u.is_empty()) {
@@ -870,18 +870,32 @@ fn icon_btn_colored(
     resp
 }
 
-fn primary_btn(ui: &mut egui::Ui, theme: &Theme, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            RichText::new(label)
-                .size(13.0)
-                .strong()
-                .color(Color32::WHITE),
-        )
+fn primary_btn(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Option<Glyph>,
+    label: &str,
+) -> egui::Response {
+    egui::Frame::default()
         .fill(theme.accent)
         .corner_radius(8.0)
-        .min_size(egui::vec2(120.0, 32.0)),
-    )
+        .inner_margin(egui::Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                if let Some(g) = icon {
+                    icons::show(ui, g, 16.0, Color32::WHITE);
+                }
+                ui.label(
+                    RichText::new(label)
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+            });
+        })
+        .response
+        .interact(egui::Sense::click())
 }
 
 fn ghost_btn(ui: &mut egui::Ui, theme: &Theme, label: &str, w: f32) -> egui::Response {
