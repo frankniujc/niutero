@@ -137,13 +137,11 @@ pub fn classic(
     // Detail panel (right).
     if !hide_detail {
         egui::SidePanel::right("niu-detail")
-            .exact_width(392.0)
+            .exact_width(384.0)
             .resizable(false)
-            .frame(
-                egui::Frame::default()
-                    .fill(theme.surface)
-                    .inner_margin(egui::Margin::same(20)),
-            )
+            // No inner margin — `detail_panel` lays out its own pinned footer +
+            // padded scroll via nested panels.
+            .frame(egui::Frame::default().fill(theme.surface))
             .show(ctx, |ui| {
                 let sel = st
                     .selected
@@ -769,30 +767,24 @@ pub(super) fn type_badge(ui: &mut egui::Ui, theme: &Theme, e: &EntryView) {
         });
 }
 
-pub(super) fn detail_panel(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    e: &EntryView,
-    st: &mut LibState,
-    actions: &mut Vec<LibAction>,
-) {
-    ensure_buffers(st, e);
-    let locked = st.locked;
+/// The lock/unlock toggle button (icon flips with state).
+pub(super) fn lock_toggle(ui: &mut egui::Ui, theme: &Theme, locked: bool) -> egui::Response {
+    let g = if locked { Glyph::Lock } else { Glyph::Unlock };
+    let col = if locked { theme.muted } else { theme.accent };
+    icon_btn_colored(ui, theme, g, col, !locked).on_hover_text(if locked {
+        "Locked — click to edit"
+    } else {
+        "Editing — click to lock"
+    })
+}
 
-    // header: type pill badge + "Locked/Editing" label + lock toggle
+/// Classic detail header (inside the scroll): type pill · "Locked/Editing" · lock.
+fn detail_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState, e: &EntryView) {
+    let locked = st.locked;
     ui.horizontal(|ui| {
         type_badge(ui, theme, e);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let g = if locked { Glyph::Lock } else { Glyph::Unlock };
-            let col = if locked { theme.muted } else { theme.accent };
-            if icon_btn_colored(ui, theme, g, col, !locked)
-                .on_hover_text(if locked {
-                    "Locked — click to edit"
-                } else {
-                    "Editing — click to lock"
-                })
-                .clicked()
-            {
+            if lock_toggle(ui, theme, locked).clicked() {
                 st.locked = !st.locked;
                 st.buffers_for = None;
             }
@@ -804,15 +796,56 @@ pub(super) fn detail_panel(
             );
         });
     });
-    ui.add_space(8.0);
-    // Classic detail omits the reading-status/stars row (it's in the Board).
-    detail_body(ui, theme, e, st, actions, false);
+    ui.add_space(6.0);
 }
 
-/// The detail content below the header (title … Cite/BibTeX footer), shared by
-/// the Classic detail panel and the Board drawer (which renders its own header
-/// + close button above this body).
-pub(super) fn detail_body(
+pub(super) fn detail_panel(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    e: &EntryView,
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
+    ensure_buffers(st, e);
+    // Footer pinned at the bottom (design §4·A); the fields scroll above it.
+    egui::TopBottomPanel::bottom("niu-detail-footer")
+        .frame(
+            egui::Frame::default()
+                .fill(theme.surface)
+                .inner_margin(egui::Margin {
+                    left: 16,
+                    right: 16,
+                    top: 4,
+                    bottom: 14,
+                }),
+        )
+        .show_inside(ui, |ui| detail_footer(ui, theme, e, actions));
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::default()
+                .fill(theme.surface)
+                .inner_margin(egui::Margin {
+                    left: 22,
+                    right: 22,
+                    top: 16,
+                    bottom: 8,
+                }),
+        )
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    detail_header(ui, theme, st, e);
+                    // Classic detail omits the reading row (it's in the Board).
+                    detail_fields(ui, theme, e, st, actions, false);
+                });
+        });
+}
+
+/// The scrollable detail content (title … tags), shared by the Classic detail
+/// panel and the Board drawer. The header and footer are rendered by the caller
+/// (pinned). `reading` adds the Reading status+stars row (Board only).
+pub(super) fn detail_fields(
     ui: &mut egui::Ui,
     theme: &Theme,
     e: &EntryView,
@@ -821,98 +854,162 @@ pub(super) fn detail_body(
     reading: bool,
 ) {
     let locked = st.locked;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            // Title (serif).
-            edit_text(ui, theme, st, actions, "title", locked, true);
-            ui.add_space(10.0);
 
-            // Authors byline (no label) — compact line locked; editable raw line
-            // when unlocked (the Zotero per-author rows are a planned refinement).
-            if locked {
-                ui.label(
-                    RichText::new(authors_line(e))
-                        .size(14.0)
-                        .color(theme.text_2),
-                );
-            } else {
-                edit_field_raw(ui, theme, st, actions, "author", false);
+    // Title (serif 24).
+    edit_text(ui, theme, st, actions, "title", locked, true);
+    ui.add_space(6.0);
+
+    // Authors byline (no label) — compact line locked; editable raw line when
+    // unlocked (the Zotero per-author rows are a planned refinement).
+    if locked {
+        ui.label(
+            RichText::new(authors_line(e))
+                .size(14.0)
+                .color(theme.text_2),
+        );
+    } else {
+        edit_field_raw(ui, theme, st, actions, "author", false);
+    }
+    ui.add_space(14.0);
+
+    // Divided metadata rows.
+    let pub_field = if e.fields.contains_key("journal") {
+        "journal"
+    } else {
+        "booktitle"
+    };
+    meta_row(ui, theme, st, actions, "Publication", pub_field, locked);
+    meta_row(ui, theme, st, actions, "Year", "year", locked);
+    meta_row(ui, theme, st, actions, "DOI", "doi", locked);
+    // Citation key (read-only — re-keying is a Normalize action).
+    divided_meta(ui, theme, "Citation Key", |ui| {
+        ui.label(
+            RichText::new(&e.citekey)
+                .font(theme::mono(12.0))
+                .color(theme.accent),
+        );
+    });
+
+    // Reading status + stars (Board drawer only).
+    if reading {
+        ui.add_space(14.0);
+        meta_label(ui, theme, "Reading");
+        status_stars(ui, theme, e, actions);
+    }
+
+    // Abstract.
+    ui.add_space(14.0);
+    meta_label(ui, theme, "Abstract");
+    if locked {
+        let abs = e.fields.get("abstract").map(String::as_str).unwrap_or("—");
+        crate::tex::runs_label(ui, abs, theme::serif(13.5), theme.text_2);
+    } else {
+        let buf = st.buffers.get_mut("abstract").unwrap();
+        let r = ui.add(
+            egui::TextEdit::multiline(buf)
+                .desired_width(f32::INFINITY)
+                .desired_rows(5),
+        );
+        if r.lost_focus() {
+            actions.push(LibAction::Edit(
+                "abstract".into(),
+                st.buffers["abstract"].clone(),
+            ));
+        }
+    }
+
+    // Tags.
+    ui.add_space(14.0);
+    meta_label(ui, theme, "Tags");
+    tags_editor(ui, theme, e, locked, st, actions);
+}
+
+/// The pinned detail footer: Cite (primary) + open-link on row 1, BibTeX on
+/// row 2 — constrained to a 248px column (design §4·A).
+pub(super) fn detail_footer(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    e: &EntryView,
+    actions: &mut Vec<LibAction>,
+) {
+    ui.add_space(4.0);
+    ui.vertical(|ui| {
+        ui.set_max_width(248.0);
+        let has_link = e.fields.get("url").is_some_and(|u| !u.is_empty());
+        ui.horizontal(|ui| {
+            let cite_w = if has_link { 248.0 - 40.0 } else { 248.0 };
+            if pri_btn_centered(ui, theme, Glyph::Quote, "Cite", cite_w).clicked() {
+                actions.push(LibAction::Cite);
             }
-            ui.add_space(12.0);
-
-            let pub_field = if e.fields.contains_key("journal") {
-                "journal"
-            } else {
-                "booktitle"
-            };
-            meta_row(ui, theme, st, actions, "Publication", pub_field, locked);
-            meta_row(ui, theme, st, actions, "Year", "year", locked);
-            meta_row(ui, theme, st, actions, "DOI", "doi", locked);
-
-            // Cite key (read-only — re-keying is a Normalize action).
-            meta_label(ui, theme, "Citation key");
-            ui.label(
-                RichText::new(&e.citekey)
-                    .font(theme::mono(12.5))
-                    .color(theme.accent),
-            );
-            ui.add_space(10.0);
-
-            // Reading status + stars (Board drawer only; the Classic detail omits
-            // it to match the design).
-            if reading {
-                meta_label(ui, theme, "Reading");
-                status_stars(ui, theme, e, actions);
-                ui.add_space(10.0);
-            }
-
-            // Tags.
-            meta_label(ui, theme, "Tags");
-            tags_editor(ui, theme, e, locked, st, actions);
-            ui.add_space(12.0);
-
-            // Abstract (serif).
-            meta_label(ui, theme, "Abstract");
-            if locked {
-                let abs = e.fields.get("abstract").map(String::as_str).unwrap_or("—");
-                crate::tex::runs_label(ui, abs, theme::serif(13.5), theme.text_2);
-            } else {
-                let buf = st.buffers.get_mut("abstract").unwrap();
-                let r = ui.add(
-                    egui::TextEdit::multiline(buf)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(5),
-                );
-                if r.lost_focus() {
-                    actions.push(LibAction::Edit(
-                        "abstract".into(),
-                        st.buffers["abstract"].clone(),
-                    ));
+            if has_link {
+                let url = e.fields.get("url").cloned().unwrap_or_default();
+                if icbtn_bordered(ui, theme, Glyph::Link)
+                    .on_hover_text("Open source")
+                    .clicked()
+                {
+                    actions.push(LibAction::OpenUrl(url));
                 }
-            }
-            ui.add_space(16.0);
-
-            // Footer: Cite + link (row 1), BibTeX (row 2) — two narrow rows (spec §4·A).
-            ui.horizontal(|ui| {
-                if primary_btn(ui, theme, Some(Glyph::Quote), "Cite").clicked() {
-                    actions.push(LibAction::Cite);
-                }
-                if let Some(url) = e.fields.get("url").filter(|u| !u.is_empty()) {
-                    if icon_btn(ui, theme, Glyph::Link, false)
-                        .on_hover_text("Open source")
-                        .clicked()
-                    {
-                        actions.push(LibAction::OpenUrl(url.clone()));
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            let w = ui.available_width();
-            if ghost_btn(ui, theme, Some(Glyph::Book), "BibTeX", w).clicked() {
-                actions.push(LibAction::Bibtex);
             }
         });
+        ui.add_space(8.0);
+        if ghost_btn(ui, theme, Some(Glyph::Book), "BibTeX", 248.0).clicked() {
+            actions.push(LibAction::Bibtex);
+        }
+    });
+}
+
+/// A fixed-width primary button with centered icon + label.
+fn pri_btn_centered(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Glyph,
+    label: &str,
+    w: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), egui::Sense::click());
+    let fill = if resp.hovered() {
+        theme.accent_press
+    } else {
+        theme.accent
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(8), fill);
+    let label_w = label.len() as f32 * 7.0;
+    let mut x = rect.center().x - (22.0 + label_w) * 0.5;
+    icons::paint_at(
+        ui,
+        egui::Rect::from_center_size(egui::pos2(x + 8.0, rect.center().y), egui::vec2(16.0, 16.0)),
+        icon,
+        Color32::WHITE,
+    );
+    x += 22.0;
+    ui.painter().text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        Color32::WHITE,
+    );
+    resp
+}
+
+/// A 32×32 bordered icon button (the footer's open-link button).
+fn icbtn_bordered(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+    let bg = if resp.hovered() {
+        theme.surface_2
+    } else {
+        theme.surface
+    };
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(8),
+        bg,
+        egui::Stroke::new(1.0, theme.border),
+        egui::StrokeKind::Inside,
+    );
+    icons::paint_at(ui, rect.shrink(8.0), glyph, theme.muted);
+    resp
 }
 
 fn status_stars(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, actions: &mut Vec<LibAction>) {
@@ -1038,12 +1135,44 @@ fn tags_editor(
 
 // ----------------------------------------------------------- detail helpers
 
+/// An uppercase section label (Abstract / Tags / …) — design's `secLabel` style.
 fn meta_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
-    ui.label(RichText::new(text).size(11.0).strong().color(theme.muted));
-    ui.add_space(2.0);
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(11.0)
+            .strong()
+            .color(theme.muted),
+    );
+    ui.add_space(6.0);
 }
 
-/// A labelled meta field (Publication/Year/DOI), editable when unlocked.
+/// A divided metadata row (design `metaRow`): a top hairline, then a fixed 92px
+/// label and a flexing value, 9px padding top & bottom.
+fn divided_meta(ui: &mut egui::Ui, theme: &Theme, label: &str, value: impl FnOnce(&mut egui::Ui)) {
+    let top = ui.cursor().min.y;
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        top,
+        egui::Stroke::new(1.0, theme.border_2),
+    );
+    ui.add_space(9.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        let (lr, _) = ui.allocate_exact_size(egui::vec2(92.0, 18.0), egui::Sense::hover());
+        ui.painter().text(
+            lr.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            theme.muted,
+        );
+        value(ui);
+    });
+    ui.add_space(9.0);
+}
+
+/// A labelled meta field (Publication/Year/DOI) as a divided row, editable when
+/// unlocked. The DOI is mono + accent (an identifier, no LaTeX).
 fn meta_row(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1053,26 +1182,27 @@ fn meta_row(
     field: &str,
     locked: bool,
 ) {
-    meta_label(ui, theme, label);
-    if locked {
-        let raw = st.buffers.get(field).cloned().unwrap_or_default();
-        // DOI is an identifier (no LaTeX); other fields get the display transform.
-        let v = if field == "doi" {
-            raw
+    let is_doi = field == "doi";
+    divided_meta(ui, theme, label, |ui| {
+        if locked {
+            let raw = st.buffers.get(field).cloned().unwrap_or_default();
+            let v = if is_doi {
+                raw
+            } else {
+                crate::tex::display(&raw)
+            };
+            let shown = if v.is_empty() { "—".to_string() } else { v };
+            let font = if is_doi {
+                theme::mono(12.5)
+            } else {
+                egui::FontId::proportional(13.0)
+            };
+            let col = if is_doi { theme.accent } else { theme.text };
+            ui.label(RichText::new(shown).font(font).color(col));
         } else {
-            crate::tex::display(&raw)
-        };
-        let shown = if v.is_empty() { "—".to_string() } else { v };
-        let font = if field == "doi" {
-            theme::mono(12.5)
-        } else {
-            egui::FontId::proportional(13.5)
-        };
-        ui.label(RichText::new(shown).font(font).color(theme.text_2));
-    } else {
-        edit_field_raw(ui, theme, st, actions, field, field == "doi");
-    }
-    ui.add_space(8.0);
+            edit_field_raw(ui, theme, st, actions, field, is_doi);
+        }
+    });
 }
 
 /// The title field: serif, large; editable when unlocked.
@@ -1087,7 +1217,7 @@ fn edit_text(
 ) {
     if locked {
         let v = st.buffers.get(field).cloned().unwrap_or_default();
-        crate::tex::runs_label(ui, &v, theme::serif(19.0), theme.text);
+        crate::tex::runs_label(ui, &v, theme::serif(24.0), theme.text);
     } else {
         edit_field_raw(ui, theme, st, actions, field, false);
     }
@@ -1150,34 +1280,6 @@ fn icon_btn_colored(
     }
     icons::paint_at(ui, rect.shrink(8.0), glyph, color);
     resp
-}
-
-fn primary_btn(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    icon: Option<Glyph>,
-    label: &str,
-) -> egui::Response {
-    egui::Frame::default()
-        .fill(theme.accent)
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(14, 8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 7.0;
-                if let Some(g) = icon {
-                    icons::show(ui, g, 16.0, Color32::WHITE);
-                }
-                ui.label(
-                    RichText::new(label)
-                        .size(13.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-            });
-        })
-        .response
-        .interact(egui::Sense::click())
 }
 
 fn ghost_btn(

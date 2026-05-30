@@ -1,8 +1,8 @@
 //! Library — Board view (design spec §4·C): a kanban by reading status
 //! (To Read / Reading / Read). Cards show venue, title, creator, tags and a
 //! star-rating dot row; clicking a card opens a slide-in detail drawer (the
-//! same lock + fields + Cite/BibTeX/link footer as Classic, reused via
-//! [`super::detail_body`]).
+//! same lock + fields + Cite/BibTeX/link footer as Classic, reusing
+//! [`super::detail_fields`] + [`super::detail_footer`]).
 //!
 //! Moving a card between columns is done by changing its reading status in the
 //! drawer — the board reflows on the next reload. (The design's drag-between-
@@ -41,16 +41,7 @@ pub fn board(
                 egui::SidePanel::right("niu-board-drawer")
                     .exact_width(400.0)
                     .resizable(false)
-                    .frame(
-                        egui::Frame::default()
-                            .fill(theme.surface)
-                            .inner_margin(egui::Margin {
-                                left: 16,
-                                right: 16,
-                                top: 12,
-                                bottom: 12,
-                            }),
-                    )
+                    .frame(egui::Frame::default().fill(theme.surface))
                     .show(ctx, |ui| drawer(ui, theme, e, st, actions));
             }
             None => st.drawer_open = false,
@@ -353,35 +344,65 @@ fn drawer(
     super::ensure_buffers(st, e);
     let mut close = false;
 
-    ui.horizontal(|ui| {
-        super::type_badge(ui, theme, e);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if super::icon_btn(ui, theme, Glyph::Close, false)
-                .on_hover_text("Close")
-                .clicked()
-            {
-                close = true;
-            }
-            let locked = st.locked;
-            let lg = if locked { Glyph::Lock } else { Glyph::Unlock };
-            let lc = if locked { theme.muted } else { theme.accent };
-            if super::icon_btn_colored(ui, theme, lg, lc, !locked)
-                .on_hover_text(if locked {
-                    "Locked — click to edit"
-                } else {
-                    "Editing — click to lock"
-                })
-                .clicked()
-            {
-                st.locked = !st.locked;
-                st.buffers_for = None;
-            }
+    // Pinned header: type pill · lock · close (border-bottom from the panel).
+    egui::TopBottomPanel::top("niu-drawer-header")
+        .frame(
+            egui::Frame::default()
+                .fill(theme.surface)
+                .inner_margin(egui::Margin::symmetric(16, 12)),
+        )
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                super::type_badge(ui, theme, e);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if super::icon_btn(ui, theme, Glyph::Close, false)
+                        .on_hover_text("Close")
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                    let locked = st.locked;
+                    if super::lock_toggle(ui, theme, locked).clicked() {
+                        st.locked = !locked;
+                        st.buffers_for = None;
+                    }
+                });
+            });
         });
-    });
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(6.0);
-    super::detail_body(ui, theme, e, st, actions, true);
+
+    // Pinned footer: Cite / link / BibTeX.
+    egui::TopBottomPanel::bottom("niu-drawer-footer")
+        .frame(
+            egui::Frame::default()
+                .fill(theme.surface)
+                .inner_margin(egui::Margin {
+                    left: 16,
+                    right: 16,
+                    top: 4,
+                    bottom: 14,
+                }),
+        )
+        .show_inside(ui, |ui| super::detail_footer(ui, theme, e, actions));
+
+    // Scrollable fields (with the reading row, since the Board is status-centric).
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::default()
+                .fill(theme.surface)
+                .inner_margin(egui::Margin {
+                    left: 20,
+                    right: 20,
+                    top: 14,
+                    bottom: 8,
+                }),
+        )
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    super::detail_fields(ui, theme, e, st, actions, true)
+                });
+        });
 
     if close {
         st.drawer_open = false;
