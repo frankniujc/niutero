@@ -477,11 +477,11 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         return;
     }
     // Rows are flush (each draws its own bottom hairline), so the pitch must be
-    // exactly 62 — `show_rows` reads this spacing to size the virtual range.
+    // exactly 56 — `show_rows` reads this spacing to size the virtual range.
     ui.spacing_mut().item_spacing.y = 0.0;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show_rows(ui, 62.0, shown.len(), |ui, range| {
+        .show_rows(ui, 56.0, shown.len(), |ui, range| {
             for i in range {
                 let e = shown[i];
                 if list_row(ui, theme, e, st.selected.as_deref() == Some(&e.citekey)).clicked() {
@@ -525,16 +525,30 @@ fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
         egui::FontId::proportional(11.0),
         theme.muted,
     );
-    // CREATOR ▾ — clickable to toggle sort (accent when active).
+    // CREATOR with a sort chevron — clickable to toggle sort (accent when active).
     let creator_col = if st.sort_by_creator {
         theme.accent
     } else {
         theme.muted
     };
-    let creator_txt = "CREATOR  ▾";
-    let cw = creator_txt.len() as f32 * 6.0;
+    icons::paint_at(
+        ui,
+        egui::Rect::from_center_size(
+            egui::pos2(cols.creator_right - 5.0, cy),
+            egui::vec2(11.0, 11.0),
+        ),
+        Glyph::ChevronDown,
+        creator_col,
+    );
+    ui.painter().text(
+        egui::pos2(cols.creator_right - 14.0, cy),
+        egui::Align2::RIGHT_CENTER,
+        "CREATOR",
+        egui::FontId::proportional(11.0),
+        creator_col,
+    );
     let chit = egui::Rect::from_min_max(
-        egui::pos2(cols.creator_right - cw, rect.top()),
+        egui::pos2(cols.creator_right - 80.0, rect.top()),
         egui::pos2(cols.creator_right + 4.0, rect.bottom()),
     );
     if ui
@@ -544,13 +558,6 @@ fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
     {
         st.sort_by_creator = !st.sort_by_creator;
     }
-    ui.painter().text(
-        egui::pos2(cols.creator_right, cy),
-        egui::Align2::RIGHT_CENTER,
-        creator_txt,
-        egui::FontId::proportional(11.0),
-        creator_col,
-    );
     ui.painter().text(
         egui::pos2(cols.year_right, cy),
         egui::Align2::RIGHT_CENTER,
@@ -565,11 +572,11 @@ fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
     );
 }
 
-/// One 62px list row (spec §4·A): type glyph · serif title with a tag-hash line
+/// One 56px list row (spec §4·A): type glyph · serif title with a tag-hash line
 /// underneath · right-aligned CREATOR and YEAR columns · PDF clip.
 fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> egui::Response {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 62.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
     if selected {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::ZERO, theme.sel);
