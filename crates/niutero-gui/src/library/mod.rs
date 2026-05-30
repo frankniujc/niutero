@@ -362,25 +362,37 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
     );
 
     let search = st.search.to_lowercase();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let mut shown = 0usize;
-            for e in entries {
-                if !matches_filter(e, &st.active_tag, &search) {
-                    continue;
-                }
-                shown += 1;
-                if list_row(ui, theme, e, st.selected.as_deref() == Some(&e.citekey)).clicked() {
-                    st.selected = Some(e.citekey.clone());
-                    st.buffers_for = None; // re-load edit buffers for the new pick
-                }
-            }
-            if shown == 0 {
+    // Only the matching entries, then row-virtualized: with a large library
+    // (1,292 in the mock) egui would otherwise lay out and lay out a text galley
+    // for every row each frame. `show_rows` runs the closure for just the
+    // visible range (rows are a uniform 56px).
+    let shown: Vec<&EntryView> = entries
+        .iter()
+        .filter(|e| matches_filter(e, &st.active_tag, &search))
+        .collect();
+    if shown.is_empty() {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("No matching entries").color(theme.muted));
                 });
+            });
+        return;
+    }
+    // Rows are flush (each draws its own bottom hairline), so the pitch must be
+    // exactly 56 — `show_rows` reads this spacing to size the virtual range.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, 56.0, shown.len(), |ui, range| {
+            for i in range {
+                let e = shown[i];
+                if list_row(ui, theme, e, st.selected.as_deref() == Some(&e.citekey)).clicked() {
+                    st.selected = Some(e.citekey.clone());
+                    st.buffers_for = None; // re-load edit buffers for the new pick
+                }
             }
         });
 }
