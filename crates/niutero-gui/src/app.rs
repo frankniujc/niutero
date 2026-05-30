@@ -19,8 +19,12 @@ use eframe::egui::{self, Color32, RichText};
 use log::{info, warn};
 use niutero_engine::{self as engine, EntryView, Vault};
 
+use crate::ai::{self, AiAction, AiState};
 use crate::icons::{self, Glyph};
 use crate::library::{self, LibAction, LibState};
+use crate::normalize::{self, NormAction, NormCache, NormView, NormalizeState};
+use crate::overlays::{self, OverlayMsg, TaskState};
+use crate::settings::{self, SettingsAction, SettingsState};
 use crate::theme::{self, Theme};
 
 /// The four tools in the left rail (spec §1).
@@ -71,6 +75,22 @@ pub struct NiuteroApp {
     open_error: Option<String>,
     /// Classic/Reader/Board view-local UI state (selection, filter, lock, …).
     lib: LibState,
+    /// Normalize tool view-local UI state (sub-view, accept/reject, ruleset).
+    norm: NormalizeState,
+    /// Cached engine analysis for the Normalize tool; recomputed lazily and
+    /// invalidated after any apply or a library switch.
+    norm_cache: Option<NormCache>,
+    /// AI Assistant tool state (composer + session turns).
+    ai: AiState,
+    /// Settings tool state (sub-view + edited values).
+    settings: SettingsState,
+    /// Accent swatch index (0 = the theme's own green; see `settings::ACCENTS`).
+    accent_idx: usize,
+    /// Whether the floating AI popup is open, and its composer buffer.
+    ai_popup_open: bool,
+    ai_popup_input: String,
+    /// A running/finished background task shown as the bottom-left toast.
+    task: Option<TaskState>,
     /// Transient one-line confirmation (e.g. "Copied citation"), shown briefly.
     toast: Option<String>,
 }
@@ -111,13 +131,51 @@ impl NiuteroApp {
                 (None, None)
             }
         };
+        // Dev/QA affordance: start on a chosen tool/view (and optionally show the
+        // AI popup or a demo task toast) so each surface can be opened directly
+        // for screenshots and smoke tests. No effect when these vars are unset.
+        let tool = match std::env::var("NIU_TAB").as_deref() {
+            Ok("normalize") => Tool::Normalize,
+            Ok("ai") => Tool::Ai,
+            Ok("settings") => Tool::Settings,
+            _ => Tool::Library,
+        };
+        let lib_view = match std::env::var("NIU_VIEW").as_deref() {
+            Ok("reader") => LibView::Reader,
+            Ok("board") => LibView::Board,
+            _ => LibView::Classic,
+        };
+        let task = std::env::var("NIU_TASK").ok().map(|_| TaskState {
+            label: "Online enrich…".into(),
+            done_label: "Enrich finished".into(),
+            total: 184,
+            start: 0.0,
+            duration: 8.0,
+        });
+        let norm_view = match std::env::var("NIU_NORMVIEW").as_deref() {
+            Ok("review") => NormView::Review,
+            Ok("ruleset") => NormView::Ruleset,
+            Ok("rekey") => NormView::Rekey,
+            _ => NormView::Overview,
+        };
         NiuteroApp {
             dark: false,
-            tool: Tool::Library,
-            lib_view: LibView::Classic,
+            tool,
+            lib_view,
             library,
             open_error,
             lib: LibState::default(),
+            norm: NormalizeState {
+                view: norm_view,
+                ..NormalizeState::default()
+            },
+            norm_cache: None,
+            ai: AiState::default(),
+            settings: SettingsState::default(),
+            accent_idx: 0,
+            ai_popup_open: std::env::var("NIU_POPUP").is_ok(),
+            ai_popup_input: String::new(),
+            task,
             toast: None,
         }
     }
@@ -146,6 +204,9 @@ impl NiuteroApp {
                 self.library = Some(lib);
                 self.open_error = None;
                 self.lib = LibState::default();
+                self.norm = NormalizeState::default();
+                self.norm_cache = None;
+                self.settings = SettingsState::default();
             }
             Err(e) => {
                 warn!("open library: {e}");
@@ -237,7 +298,14 @@ fn library_menu(ui: &mut egui::Ui, theme: &Theme, pick: &mut Option<VaultPick>) 
 
 impl eframe::App for NiuteroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let theme = Theme::of(self.dark);
+        let mut theme = Theme::of(self.dark);
+        // Live accent override (Settings → Appearance); index 0 keeps the
+        // theme's own green (nicer in dark than the raw swatch).
+        if self.accent_idx != 0 {
+            if let Some((r, g, b)) = settings::ACCENTS.get(self.accent_idx) {
+                theme.set_accent(Color32::from_rgb(*r, *g, *b));
+            }
+        }
         theme.apply(ctx);
 
         // Titlebar (top), status (bottom), rail (left), tool body (center).
@@ -267,22 +335,13 @@ impl eframe::App for NiuteroApp {
 
         match self.tool {
             Tool::Library => self.body_library(ctx, &theme),
-            Tool::Normalize => {
-                tool_placeholder(ctx, &theme, "Normalize", "The cleanup engine (G4).")
-            }
-            Tool::Ai => tool_placeholder(
-                ctx,
-                &theme,
-                "AI Assistant",
-                "Chat across your library (G5).",
-            ),
-            Tool::Settings => tool_placeholder(
-                ctx,
-                &theme,
-                "Settings",
-                "Library, workflow, appearance, sync (G5).",
-            ),
+            Tool::Normalize => self.body_normalize(ctx, &theme),
+            Tool::Ai => self.body_ai(ctx, &theme),
+            Tool::Settings => self.body_settings(ctx, &theme),
         }
+
+        // Floating overlays: AI FAB + popup (bottom-right), task toast (bottom-left).
+        self.overlays(ctx, &theme);
 
         // Transient toast (bottom-center).
         if let Some(msg) = self.toast.clone() {
@@ -503,15 +562,11 @@ impl NiuteroApp {
             return;
         }
         let mut actions = Vec::new();
+        let entries = &self.library.as_ref().unwrap().entries;
         match self.lib_view {
-            LibView::Classic => {
-                let entries = &self.library.as_ref().unwrap().entries;
-                library::classic(ctx, theme, entries, &mut self.lib, &mut actions);
-            }
-            LibView::Reader => tool_placeholder(ctx, theme, "Reader", "Reading-first layout (G3)."),
-            LibView::Board => {
-                tool_placeholder(ctx, theme, "Board", "Kanban by reading status (G3).")
-            }
+            LibView::Classic => library::classic(ctx, theme, entries, &mut self.lib, &mut actions),
+            LibView::Reader => library::reader(ctx, theme, entries, &mut self.lib, &mut actions),
+            LibView::Board => library::board(ctx, theme, entries, &mut self.lib, &mut actions),
         }
         for a in actions {
             self.apply_lib_action(a, ctx);
@@ -571,6 +626,20 @@ impl NiuteroApp {
                 }
             }
             LibAction::OpenUrl(u) => ctx.open_url(egui::OpenUrl::new_tab(u)),
+            LibAction::OpenPdf => {
+                let p = engine::pdf_path(&lib.vault, &key);
+                if p.exists() {
+                    let s = p.to_string_lossy().replace('\\', "/");
+                    let url = if s.starts_with('/') {
+                        format!("file://{s}")
+                    } else {
+                        format!("file:///{s}")
+                    };
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                } else {
+                    self.toast = Some("No PDF attached to this entry".into());
+                }
+            }
             LibAction::Cite => match engine::cite(&lib.vault, &key) {
                 Ok(s) => {
                     ctx.copy_text(s);
@@ -587,9 +656,409 @@ impl NiuteroApp {
             },
         }
     }
+
+    // ------------------------------------------------------------- Normalize
+
+    fn body_normalize(&mut self, ctx: &egui::Context, theme: &Theme) {
+        if self.library.is_none() {
+            tool_placeholder(
+                ctx,
+                theme,
+                "Normalize",
+                "Open a library to analyze and clean it.",
+            );
+            return;
+        }
+        self.ensure_norm();
+        let Some(cache) = self.norm_cache.as_ref() else {
+            tool_placeholder(ctx, theme, "Normalize", "Could not analyze the library.");
+            return;
+        };
+        let entries = &self.library.as_ref().unwrap().entries;
+        let mut actions = Vec::new();
+        normalize::normalize(ctx, theme, entries, cache, &mut self.norm, &mut actions);
+        for a in actions {
+            self.apply_norm_action(a, ctx);
+        }
+    }
+
+    /// Compute (once) the offline analysis the Normalize tool renders. Cheap
+    /// for small libraries; cached until invalidated by an apply or a switch.
+    fn ensure_norm(&mut self) {
+        if self.norm_cache.is_some() {
+            return;
+        }
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+        let report = match engine::analyze(&lib.vault) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("analyze: {e}");
+                self.toast = Some(format!("Analyze failed: {e}"));
+                return;
+            }
+        };
+        let diffs = engine::normalize_preview(&lib.vault, None).unwrap_or_default();
+        let rekey = engine::rekey_preview(&lib.vault, None).unwrap_or_default();
+        let pattern = lib
+            .vault
+            .config
+            .citekey_pattern
+            .clone()
+            .unwrap_or_else(|| "{auth}{year}{title.1}{Title.2}".into());
+        let total = report.total;
+        self.norm_cache = Some(NormCache {
+            report,
+            diffs,
+            rekey,
+            pattern,
+            total,
+        });
+    }
+
+    fn apply_norm_action(&mut self, action: NormAction, ctx: &egui::Context) {
+        match action {
+            NormAction::RunOffline => self.norm.view = NormView::Review,
+            NormAction::StartEnrich => {
+                // Online enrich is a network feature (off the base path); here it
+                // surfaces as the background-task toast. The progress is a timed
+                // simulation — wiring the real online fetch is a later wave.
+                let total = self.norm_cache.as_ref().map(|c| c.total).unwrap_or(0);
+                let now = ctx.input(|i| i.time);
+                self.task = Some(TaskState {
+                    label: "Online enrich…".into(),
+                    done_label: "Enrich finished".into(),
+                    total,
+                    start: now,
+                    duration: 6.0,
+                });
+            }
+            NormAction::CopyPatch => {
+                let patch = self
+                    .norm_cache
+                    .as_ref()
+                    .map(|c| build_patch(&c.diffs))
+                    .unwrap_or_default();
+                ctx.copy_text(patch);
+                self.toast = Some("Copied patch".into());
+            }
+            NormAction::ApplyEntry(key) => {
+                let args = self
+                    .norm_cache
+                    .as_ref()
+                    .and_then(|c| c.diffs.iter().find(|d| d.citekey == key))
+                    .map(norm_edit_args);
+                if let Some((set, unset)) = args {
+                    let r = self
+                        .library
+                        .as_ref()
+                        .map(|lib| engine::edit(&lib.vault, &key, &set, &unset, None));
+                    match r {
+                        Some(Ok(())) => {
+                            if let Some(lib) = self.library.as_mut() {
+                                lib.reload();
+                            }
+                            self.lib.refresh();
+                            info!("normalize: applied {key}");
+                        }
+                        Some(Err(e)) => self.toast = Some(format!("Apply failed: {e}")),
+                        None => {}
+                    }
+                }
+            }
+            NormAction::ApplyAll => self.apply_all_norm(),
+            NormAction::ApplyRekey => {
+                let res = self
+                    .library
+                    .as_mut()
+                    .map(|lib| engine::rekey_apply(&mut lib.vault, None));
+                match res {
+                    Some(Ok(changes)) => {
+                        if let Some(lib) = self.library.as_mut() {
+                            lib.reload();
+                        }
+                        // Cite keys changed → the Library selection is stale.
+                        self.lib = LibState::default();
+                        self.norm_cache = None;
+                        let n = changes.len();
+                        self.toast = Some(format!(
+                            "Re-keyed {n} entr{}",
+                            if n == 1 { "y" } else { "ies" }
+                        ));
+                    }
+                    Some(Err(e)) => self.toast = Some(format!("Re-key failed: {e}")),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Apply every staged change not rejected: a single atomic `normalize_apply`
+    /// when nothing is rejected, else `edit` per accepted entry.
+    fn apply_all_norm(&mut self) {
+        let none_rejected = !self.norm.done.values().any(|v| !v);
+        let mut applied = 0usize;
+        let mut error: Option<String> = None;
+
+        if none_rejected {
+            if let Some(lib) = self.library.as_ref() {
+                match engine::normalize_apply(&lib.vault, None) {
+                    Ok(ch) => applied = ch.len(),
+                    Err(e) => error = Some(e),
+                }
+            }
+        } else {
+            let to_apply: Vec<(String, Vec<String>, Vec<String>)> = self
+                .norm_cache
+                .as_ref()
+                .map(|c| {
+                    c.diffs
+                        .iter()
+                        .filter(|d| self.norm.done.get(&d.citekey) != Some(&false))
+                        .map(|d| {
+                            let (s, u) = norm_edit_args(d);
+                            (d.citekey.clone(), s, u)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(lib) = self.library.as_ref() {
+                for (k, s, u) in &to_apply {
+                    match engine::edit(&lib.vault, k, s, u, None) {
+                        Ok(()) => applied += 1,
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        match error {
+            Some(e) => self.toast = Some(format!("Apply failed: {e}")),
+            None => {
+                if let Some(lib) = self.library.as_mut() {
+                    lib.reload();
+                }
+                self.lib.refresh();
+                self.norm_cache = None;
+                self.norm.done.clear();
+                self.norm.view = NormView::Overview;
+                self.toast = Some(format!(
+                    "Applied {applied} change{}",
+                    if applied == 1 { "" } else { "s" }
+                ));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- AI tool
+
+    fn body_ai(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let entries: &[EntryView] = self
+            .library
+            .as_ref()
+            .map(|l| l.entries.as_slice())
+            .unwrap_or(&[]);
+        let mut actions = Vec::new();
+        ai::ai_tab(ctx, theme, entries, &mut self.ai, &mut actions);
+        for a in actions {
+            self.apply_ai_action(a, ctx);
+        }
+    }
+
+    fn apply_ai_action(&mut self, action: AiAction, ctx: &egui::Context) {
+        match action {
+            AiAction::OpenEntry(key) => self.jump_to_entry(key),
+            AiAction::CopyCitations(keys) => {
+                let Some(lib) = self.library.as_ref() else {
+                    return;
+                };
+                let mut out = String::new();
+                for k in &keys {
+                    if let Ok(c) = engine::cite(&lib.vault, k) {
+                        out.push_str(&c);
+                        out.push('\n');
+                    }
+                }
+                let n = keys.len();
+                ctx.copy_text(out);
+                self.toast = Some(format!(
+                    "Copied {n} citation{}",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            AiAction::Toast(m) => self.toast = Some(m),
+        }
+    }
+
+    /// Switch to the Library (Classic) and select `key`.
+    fn jump_to_entry(&mut self, key: String) {
+        self.tool = Tool::Library;
+        self.lib_view = LibView::Classic;
+        self.lib.selected = Some(key);
+        self.lib.refresh();
+    }
+
+    // -------------------------------------------------------- Settings tool
+
+    fn body_settings(&mut self, ctx: &egui::Context, theme: &Theme) {
+        self.ensure_settings_seed();
+        let schema = self
+            .library
+            .as_ref()
+            .map(|l| l.vault.config.schema)
+            .unwrap_or(0);
+        let dark = self.dark;
+        let accent = self.accent_idx;
+        let mut actions = Vec::new();
+        settings::settings(
+            ctx,
+            theme,
+            &mut self.settings,
+            schema,
+            dark,
+            accent,
+            &mut actions,
+        );
+        for a in actions {
+            self.apply_settings_action(a);
+        }
+    }
+
+    /// Seed the editable Settings fields from the open vault, once.
+    fn ensure_settings_seed(&mut self) {
+        if self.settings.seeded {
+            return;
+        }
+        if let Some(lib) = self.library.as_ref() {
+            self.settings.name = lib.vault.config.name.clone();
+            self.settings.pattern = lib
+                .vault
+                .config
+                .citekey_pattern
+                .clone()
+                .unwrap_or_else(|| "{auth}{year}{title.1}{Title.2}".into());
+            if let Ok(p) = engine::sync_prefs(&lib.vault) {
+                self.settings.push = p.push;
+            }
+            self.settings.seeded = true;
+        }
+    }
+
+    fn apply_settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::SetTheme(dark) => self.dark = dark,
+            SettingsAction::SetAccent(i) => self.accent_idx = i,
+            SettingsAction::SetGitRemote(url) => {
+                let r = self
+                    .library
+                    .as_ref()
+                    .map(|lib| engine::connect(&lib.vault, &url));
+                match r {
+                    Some(Ok(())) => {
+                        info!("set git remote → {url}");
+                        self.toast = Some("Set git remote".into());
+                    }
+                    Some(Err(e)) => self.toast = Some(format!("Remote failed: {e}")),
+                    None => {}
+                }
+            }
+            SettingsAction::SetPush(push) => {
+                if let Some(lib) = self.library.as_ref() {
+                    match engine::set_sync_prefs(&lib.vault, None, Some(push)) {
+                        Ok(_) => info!("push-after-commit → {push}"),
+                        Err(e) => self.toast = Some(format!("Sync prefs failed: {e}")),
+                    }
+                }
+            }
+            SettingsAction::Toast(m) => self.toast = Some(m),
+        }
+    }
+
+    // --------------------------------------------------------- overlays
+
+    fn overlays(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let entries: &[EntryView] = self
+            .library
+            .as_ref()
+            .map(|l| l.entries.as_slice())
+            .unwrap_or(&[]);
+        let mut msgs = Vec::new();
+        overlays::overlays(
+            ctx,
+            theme,
+            entries,
+            self.ai_popup_open,
+            self.task.as_ref(),
+            &mut self.ai_popup_input,
+            &mut msgs,
+        );
+        for m in msgs {
+            self.apply_overlay_msg(m);
+        }
+    }
+
+    fn apply_overlay_msg(&mut self, msg: OverlayMsg) {
+        match msg {
+            OverlayMsg::ToggleAi => self.ai_popup_open = !self.ai_popup_open,
+            OverlayMsg::CloseAi => self.ai_popup_open = false,
+            OverlayMsg::OpenAiTab => {
+                self.ai_popup_open = false;
+                self.tool = Tool::Ai;
+            }
+            OverlayMsg::OpenEntry(key) => {
+                self.ai_popup_open = false;
+                self.jump_to_entry(key);
+            }
+            OverlayMsg::Review => {
+                self.task = None;
+                self.tool = Tool::Normalize;
+                self.norm.view = NormView::Review;
+            }
+            OverlayMsg::DismissTask => self.task = None,
+            OverlayMsg::Toast(m) => self.toast = Some(m),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Translate a normalize change into `engine::edit` arguments: `FIELD=VALUE`
+/// for each set, and field names to unset (a change to nothing).
+fn norm_edit_args(d: &niutero_engine::NormChange) -> (Vec<String>, Vec<String>) {
+    let mut set = Vec::new();
+    let mut unset = Vec::new();
+    for c in &d.diffs {
+        match &c.to {
+            Some(v) => set.push(format!("{}={}", c.field, v)),
+            None => unset.push(c.field.clone()),
+        }
+    }
+    (set, unset)
+}
+
+/// Render the staged normalization changes as a human-readable text patch.
+fn build_patch(diffs: &[niutero_engine::NormChange]) -> String {
+    let mut out = String::new();
+    for d in diffs {
+        out.push_str(&format!("@ {}\n", d.citekey));
+        for c in &d.diffs {
+            match (&c.from, &c.to) {
+                (Some(f), Some(t)) => {
+                    out.push_str(&format!("  {}: - {f}\n  {}: + {t}\n", c.field, c.field))
+                }
+                (None, Some(t)) => out.push_str(&format!("  {}: + {t}\n", c.field)),
+                (Some(f), None) => out.push_str(&format!("  {}: - {f}\n", c.field)),
+                (None, None) => {}
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
 
 /// A tool body that fills the central area with a centered placeholder.
 fn tool_placeholder(ctx: &egui::Context, theme: &Theme, title: &str, sub: &str) {

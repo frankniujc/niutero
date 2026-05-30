@@ -115,6 +115,33 @@ impl Theme {
         }
     }
 
+    /// Override the accent (Settings → Appearance swatches): recompute every
+    /// accent-derived token from a chosen base color, preserving the theme's
+    /// tint alphas. `sel`/`accent_tint` stay as washes over the surface.
+    pub fn set_accent(&mut self, base: Color32) {
+        let scale = |c: Color32, f: f32| {
+            Color32::from_rgb(
+                (c.r() as f32 * f) as u8,
+                (c.g() as f32 * f) as u8,
+                (c.b() as f32 * f) as u8,
+            )
+        };
+        let wash = |c: Color32, a: f32| {
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a * 255.0).round() as u8)
+        };
+        let (t1, t2, sel) = if self.dark {
+            (0.13, 0.20, 0.15)
+        } else {
+            (0.10, 0.16, 0.12)
+        };
+        self.accent = base;
+        self.accent_press = scale(base, 0.82);
+        self.accent_tint = wash(base, t1);
+        self.accent_tint_2 = wash(base, t2);
+        self.sel = wash(base, sel);
+        self.sel_line = base;
+    }
+
     /// Push this palette into egui's `Visuals` so default-styled widgets pick up
     /// the right fills, strokes, selection, and text colors.
     pub fn apply(&self, ctx: &egui::Context) {

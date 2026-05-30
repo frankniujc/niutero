@@ -34,6 +34,28 @@ pub enum Glyph {
     Unlock,
     Close,
     ChevronRight,
+    ChevronDown,
+    Rows,
+    More,
+    Quote,
+    Filter,
+    Grid,
+    Send,
+    Check,
+    Copy,
+    Warn,
+    Key,
+    Refresh,
+    CheckCircle,
+    ArrowRight,
+    Expand,
+    Pause,
+    Chat,
+    Sparkle,
+    Trash,
+    Info,
+    Clock,
+    Download,
 }
 
 // Wrap design `d`/element markup into a full SVG with a white stroke (round
@@ -109,6 +131,50 @@ const UNLOCK: &str =
     svg!("<rect x='5' y='11' width='14' height='9' rx='2'/><path d='M8 11V8a4 4 0 0 1 7.5-2'/>");
 const CLOSE: &str = svg!("<path d='M6 6l12 12M18 6L6 18'/>");
 const CHEVRON_RIGHT: &str = svg!("<path d='M9 6l6 6-6 6'/>");
+const CHEVRON_DOWN: &str = svg!("<path d='M6 9l6 6 6-6'/>");
+const ROWS: &str = svg!("<path d='M4 6h16M4 12h16M4 18h16'/>");
+// Three filled dots (overflow) — fill, no stroke.
+const MORE: &str = concat!(
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='#ffffff' stroke='none'>",
+    "<circle cx='5' cy='12' r='1.4'/><circle cx='12' cy='12' r='1.4'/><circle cx='19' cy='12' r='1.4'/>",
+    "</svg>"
+);
+const QUOTE: &str = svg!("<path d='M7 7H4v6h3l-1 4M17 7h-3v6h3l-1 4' stroke-width='1.5'/>");
+const FILTER: &str = svg!("<path d='M3 5h18l-7 8v5l-4 2v-7z'/>");
+const GRID: &str = svg!("<path d='M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z'/>");
+const SEND: &str = svg!("<path d='M5 12l15-7-6 16-3-7z'/>");
+const CHECK: &str = svg!("<path d='M5 12l5 5 9-11'/>");
+const COPY: &str = svg!(
+    "<rect x='9' y='9' width='11' height='11' rx='2'/>",
+    "<path d='M5 15V5a2 2 0 0 1 2-2h8'/>",
+);
+const WARN: &str = svg!(
+    "<path d='M12 4l9 16H3z'/>",
+    "<path d='M12 10v4M12 17.5v.01' stroke-width='1.9'/>",
+);
+const KEY: &str = svg!(
+    "<circle cx='8' cy='8' r='4'/>",
+    "<path d='M11 11l8 8M16 16l2-2M19 19l2-2'/>",
+);
+const REFRESH: &str = svg!(
+    "<path d='M4 11a8 8 0 0 1 13.5-5l2.5 2.5M20 13a8 8 0 0 1-13.5 5L4 15.5M19 4v4h-4M5 20v-4h4'/>"
+);
+const CHECK_CIRCLE: &str = svg!(
+    "<circle cx='12' cy='12' r='8.5'/>",
+    "<path d='M8.5 12l2.5 2.5L16 9'/>",
+);
+const ARROW_RIGHT: &str = svg!("<path d='M5 12h14M13 6l6 6-6 6'/>");
+const EXPAND: &str = svg!("<path d='M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5'/>");
+const PAUSE: &str = svg!("<path d='M8 5v14M16 5v14'/>");
+const CHAT: &str = svg!("<path d='M21 12a8 8 0 0 1-11.5 7.2L4 20l1-4.5A8 8 0 1 1 21 12z'/>");
+const SPARKLE: &str = svg!("<path d='M12 3l1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z'/>");
+const TRASH: &str = svg!("<path d='M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13'/>");
+const INFO: &str = svg!(
+    "<circle cx='12' cy='12' r='8.5'/>",
+    "<path d='M12 11v5M12 8v.01' stroke-width='1.9'/>",
+);
+const CLOCK: &str = svg!("<circle cx='12' cy='12' r='8'/>", "<path d='M12 8v4l3 2'/>",);
+const DOWNLOAD: &str = svg!("<path d='M12 4v11m0 0l-4-4m4 4l4-4M5 19h14'/>");
 
 /// (stable cache uri, SVG markup) for a glyph.
 fn source(g: Glyph) -> (&'static str, &'static str) {
@@ -135,6 +201,28 @@ fn source(g: Glyph) -> (&'static str, &'static str) {
         Glyph::Unlock => ("bytes://niu-unlock.svg", UNLOCK),
         Glyph::Close => ("bytes://niu-close.svg", CLOSE),
         Glyph::ChevronRight => ("bytes://niu-chevron-right.svg", CHEVRON_RIGHT),
+        Glyph::ChevronDown => ("bytes://niu-chevron-down.svg", CHEVRON_DOWN),
+        Glyph::Rows => ("bytes://niu-rows.svg", ROWS),
+        Glyph::More => ("bytes://niu-more.svg", MORE),
+        Glyph::Quote => ("bytes://niu-quote.svg", QUOTE),
+        Glyph::Filter => ("bytes://niu-filter.svg", FILTER),
+        Glyph::Grid => ("bytes://niu-grid.svg", GRID),
+        Glyph::Send => ("bytes://niu-send.svg", SEND),
+        Glyph::Check => ("bytes://niu-check.svg", CHECK),
+        Glyph::Copy => ("bytes://niu-copy.svg", COPY),
+        Glyph::Warn => ("bytes://niu-warn.svg", WARN),
+        Glyph::Key => ("bytes://niu-key.svg", KEY),
+        Glyph::Refresh => ("bytes://niu-refresh.svg", REFRESH),
+        Glyph::CheckCircle => ("bytes://niu-check-circle.svg", CHECK_CIRCLE),
+        Glyph::ArrowRight => ("bytes://niu-arrow-right.svg", ARROW_RIGHT),
+        Glyph::Expand => ("bytes://niu-expand.svg", EXPAND),
+        Glyph::Pause => ("bytes://niu-pause.svg", PAUSE),
+        Glyph::Chat => ("bytes://niu-chat.svg", CHAT),
+        Glyph::Sparkle => ("bytes://niu-sparkle.svg", SPARKLE),
+        Glyph::Trash => ("bytes://niu-trash.svg", TRASH),
+        Glyph::Info => ("bytes://niu-info.svg", INFO),
+        Glyph::Clock => ("bytes://niu-clock.svg", CLOCK),
+        Glyph::Download => ("bytes://niu-download.svg", DOWNLOAD),
     }
 }
 

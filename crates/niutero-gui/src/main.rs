@@ -7,10 +7,15 @@
 // Hide the console window on Windows release builds (it's a GUI app).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod app;
 mod icons;
 mod library;
+mod normalize;
+mod overlays;
+mod settings;
 mod theme;
+mod widgets;
 
 use eframe::egui;
 

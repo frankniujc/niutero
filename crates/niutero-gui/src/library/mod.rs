@@ -1,7 +1,10 @@
-//! Library — Classic 3-pane view (design spec §4·A): a tag-first sidebar, the
-//! item list, and a lock-guarded editable detail panel.
+//! Library — the three layouts of the Library tool (design spec §4): Classic
+//! (this file, §4·A), Reader ([`reader`], §4·B), and Board ([`board`], §4·C).
+//! All three share the tag-first sidebar and the lock-guarded editable detail;
+//! Classic owns the shared helpers (entry formatting, the detail panel, the
+//! small widgets), and the two sibling submodules reuse them via `super::`.
 //!
-//! The view renders from the loaded `Vec<EntryView>` and mutates cheap UI state
+//! Each view renders from the loaded `Vec<EntryView>` and mutates cheap UI state
 //! (`LibState`) in place. Anything that touches the engine (edits, status/stars,
 //! tags, clipboard, links) is returned as a [`LibAction`] for the app to apply
 //! after rendering — this keeps the immutable library borrow and the mutable
@@ -15,15 +18,26 @@ use niutero_engine::{EntryView, Status};
 use crate::icons::{self, Glyph};
 use crate::theme::{self, Theme};
 
+mod board;
+mod reader;
+pub use board::board;
+pub use reader::reader;
+
 /// Cheap, view-local UI state (no engine data).
 pub struct LibState {
     pub selected: Option<String>,
     pub active_tag: Option<String>,
+    /// Reader: filter the card list by reading status (`unread`/`reading`/`done`).
+    pub reading_filter: Option<String>,
     pub search: String,
     /// Detail panel lock — editable only when `false`. Locked by default.
     pub locked: bool,
     pub hide_tags: bool,
     pub hide_detail: bool,
+    /// Reader: collapse the middle card list for a full-width read.
+    pub hide_list: bool,
+    /// Board: whether the slide-in detail drawer is open for `selected`.
+    pub drawer_open: bool,
     /// Edit buffers for the selected entry's text fields, valid while unlocked.
     buffers: BTreeMap<String, String>,
     buffers_for: Option<String>,
@@ -45,10 +59,13 @@ impl Default for LibState {
         LibState {
             selected: None,
             active_tag: None,
+            reading_filter: None,
             search: String::new(),
             locked: true,
             hide_tags: false,
             hide_detail: false,
+            hide_list: false,
+            drawer_open: false,
             buffers: BTreeMap::new(),
             buffers_for: None,
             adding_tag: false,
@@ -66,6 +83,8 @@ pub enum LibAction {
     AddTag(String),
     RemoveTag(String),
     OpenUrl(String),
+    /// Open the entry's attached PDF (`pdfs/<key>.pdf`) in the OS viewer.
+    OpenPdf,
     Cite,
     Bibtex,
 }
@@ -445,30 +464,58 @@ fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> 
 
 // ------------------------------------------------------------------ detail
 
-fn detail_panel(
+/// (Re)load the edit buffers for `e`'s text fields when the selection changed,
+/// so the unlocked `EditField`s start from the entry's current values. Shared by
+/// the Classic detail panel, the Reader pane, and the Board drawer.
+pub(super) fn ensure_buffers(st: &mut LibState, e: &EntryView) {
+    if st.buffers_for.as_deref() == Some(e.citekey.as_str()) {
+        return;
+    }
+    st.buffers.clear();
+    for f in [
+        "title",
+        "author",
+        "booktitle",
+        "journal",
+        "year",
+        "doi",
+        "abstract",
+    ] {
+        st.buffers
+            .insert(f.to_string(), e.fields.get(f).cloned().unwrap_or_default());
+    }
+    st.buffers_for = Some(e.citekey.clone());
+}
+
+/// The accent-tint type pill (icon + uppercase label) used in the Reader pane
+/// header and the Board drawer header.
+pub(super) fn type_badge(ui: &mut egui::Ui, theme: &Theme, e: &EntryView) {
+    let (g, _) = type_glyph(theme, &e.entry_type);
+    egui::Frame::default()
+        .fill(theme.accent_tint)
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::show(ui, g, 14.0, theme.accent);
+                ui.label(
+                    RichText::new(type_label(&e.entry_type).to_uppercase())
+                        .size(11.5)
+                        .strong()
+                        .color(theme.accent),
+                );
+            });
+        });
+}
+
+pub(super) fn detail_panel(
     ui: &mut egui::Ui,
     theme: &Theme,
     e: &EntryView,
     st: &mut LibState,
     actions: &mut Vec<LibAction>,
 ) {
-    // (Re)load edit buffers when the selection or lock changed.
-    if st.buffers_for.as_deref() != Some(e.citekey.as_str()) {
-        st.buffers.clear();
-        for f in [
-            "title",
-            "author",
-            "booktitle",
-            "journal",
-            "year",
-            "doi",
-            "abstract",
-        ] {
-            st.buffers
-                .insert(f.to_string(), e.fields.get(f).cloned().unwrap_or_default());
-        }
-        st.buffers_for = Some(e.citekey.clone());
-    }
+    ensure_buffers(st, e);
     let locked = st.locked;
 
     // header: type badge + lock toggle
@@ -497,7 +544,20 @@ fn detail_panel(
         });
     });
     ui.add_space(8.0);
+    detail_body(ui, theme, e, st, actions);
+}
 
+/// The detail content below the header (title … Cite/BibTeX footer), shared by
+/// the Classic detail panel and the Board drawer (which renders its own header
+/// + close button above this body).
+pub(super) fn detail_body(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    e: &EntryView,
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
+    let locked = st.locked;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -924,7 +984,7 @@ fn status_color(theme: &Theme, status: &str) -> Color32 {
     }
 }
 
-fn ellipsize(s: &str, max: usize) -> String {
+pub(crate) fn ellipsize(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
