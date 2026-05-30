@@ -399,8 +399,14 @@ fn tag_color(name: &str) -> Color32 {
 
 // -------------------------------------------------------------------- list
 
+/// Minimum content width for the list before it scrolls horizontally — enough
+/// for a readable title plus the Creator/Year/clip columns.
+const LIST_MIN_W: f32 = 520.0;
+
 fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
-    // Toolbar: collapse-left · search · collapse-right.
+    // Toolbar: collapse-left · new · add-by-id · search · collapse-right.
+    // The collapse-right button is reserved on the right (the search is width-
+    // bounded) so it can't be pushed off-screen by the search box.
     egui::Frame::default()
         .inner_margin(egui::Margin {
             left: 14,
@@ -410,31 +416,57 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if icon_btn(ui, theme, Glyph::PanelLeft, st.hide_tags).clicked() {
+                if icon_btn(ui, theme, Glyph::PanelLeft, st.hide_tags)
+                    .on_hover_text(if st.hide_tags {
+                        "Show tags panel"
+                    } else {
+                        "Hide tags panel"
+                    })
+                    .clicked()
+                {
                     st.hide_tags = !st.hide_tags;
                 }
-                // New-entry / add-by-identifier: rendered now, wired in a later
-                // wave (each needs a small input dialog).
-                let _ = icon_btn(ui, theme, Glyph::Plus, false).on_hover_text("New entry");
-                let _ = icon_btn(ui, theme, Glyph::Link, false).on_hover_text("Add by DOI / arXiv");
-                // search box fills the middle
-                egui::Frame::default()
-                    .fill(theme.surface_2)
-                    .corner_radius(9.0)
-                    .inner_margin(egui::Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width() - 44.0);
-                        ui.horizontal(|ui| {
-                            icons::show(ui, Glyph::Search, 16.0, theme.muted);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut st.search)
-                                    .hint_text("Search all fields & tags")
-                                    .desired_width(f32::INFINITY)
-                                    .frame(false),
-                            );
-                        });
-                    });
-                if icon_btn(ui, theme, Glyph::PanelRight, st.hide_detail).clicked() {
+                let (dr, _) = ui.allocate_exact_size(egui::vec2(7.0, 20.0), egui::Sense::hover());
+                ui.painter().vline(
+                    dr.center().x,
+                    (dr.center().y - 10.0)..=(dr.center().y + 10.0),
+                    egui::Stroke::new(1.0, theme.border),
+                );
+                // New-entry / add-by-identifier: rendered now, wired in a later wave.
+                let _ = icon_btn(ui, theme, Glyph::Plus, false).on_hover_text("New item");
+                let _ = icon_btn(ui, theme, Glyph::Link, false)
+                    .on_hover_text("Add by identifier (DOI / arXiv)");
+                // search box fills the middle, but bounded so the right toggle fits
+                let search_w = (ui.available_width() - 42.0).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(search_w, 32.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        egui::Frame::default()
+                            .fill(theme.surface_2)
+                            .corner_radius(9.0)
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    icons::show(ui, Glyph::Search, 16.0, theme.muted);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut st.search)
+                                            .hint_text("Search all fields & tags")
+                                            .desired_width(f32::INFINITY)
+                                            .frame(false),
+                                    );
+                                });
+                            });
+                    },
+                );
+                if icon_btn(ui, theme, Glyph::PanelRight, st.hide_detail)
+                    .on_hover_text(if st.hide_detail {
+                        "Show details panel"
+                    } else {
+                        "Hide details panel"
+                    })
+                    .clicked()
+                {
                     st.hide_detail = !st.hide_detail;
                 }
             });
@@ -445,15 +477,7 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         egui::Stroke::new(1.0, theme.border),
     );
 
-    // Sortable column header (TITLE · CREATOR ▾ · YEAR), aligned to the row
-    // columns; clicking CREATOR toggles the sort.
-    list_header(ui, theme, st);
-
     let search = st.search.to_lowercase();
-    // Only the matching entries, optionally sorted, then row-virtualized: with a
-    // large library (1,292 in the mock) egui would otherwise lay out a text
-    // galley for every row each frame. `show_rows` runs the closure for just the
-    // visible range (rows are a uniform 62px).
     let mut shown: Vec<&EntryView> = entries
         .iter()
         .filter(|e| matches_filter(e, &st.active_tag, &search))
@@ -476,80 +500,105 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
             });
         return;
     }
-    // Rows are flush (each draws its own bottom hairline), so the pitch must be
-    // exactly 56 — `show_rows` reads this spacing to size the virtual range.
-    ui.spacing_mut().item_spacing.y = 0.0;
-    egui::ScrollArea::vertical()
+
+    // The header + rows live in one horizontal scroll so a narrow pane scrolls
+    // instead of crowding the columns; the body is vertically row-virtualized
+    // inside (only the visible ~20 of 1,292 rows are built per frame).
+    let viewport_w = ui.available_width();
+    egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
-        .show_rows(ui, 56.0, shown.len(), |ui, range| {
-            for i in range {
-                let e = shown[i];
-                if list_row(ui, theme, e, st.selected.as_deref() == Some(&e.citekey)).clicked() {
-                    st.selected = Some(e.citekey.clone());
-                    st.buffers_for = None; // re-load edit buffers for the new pick
-                }
-            }
+        .show(ui, |ui| {
+            let content_w = viewport_w.max(LIST_MIN_W);
+            ui.set_min_width(content_w);
+            // Sortable column header (TITLE · CREATOR ▾ · YEAR) aligned to the rows.
+            list_header(ui, theme, st, content_w);
+            // Rows are flush (each draws its own bottom hairline), so the pitch
+            // must be exactly 56 — `show_rows` reads this spacing.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let body_h = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("niu-classic-rows")
+                .auto_shrink([false, false])
+                .max_height(body_h)
+                .show_rows(ui, 56.0, shown.len(), |ui, range| {
+                    for i in range {
+                        let e = shown[i];
+                        let sel = st.selected.as_deref() == Some(&e.citekey);
+                        if list_row(ui, theme, content_w, e, sel).clicked() {
+                            st.selected = Some(e.citekey.clone());
+                            st.buffers_for = None; // re-load edit buffers for the new pick
+                        }
+                    }
+                });
         });
 }
 
-/// The list's column x-positions (shared by the header and rows), measured from
-/// the right so the title column flexes. A fixed clip slot keeps columns aligned
-/// whether or not a given row has a PDF.
+/// The list's column geometry (shared by the header and rows). Columns are
+/// fixed-width and left-aligned, anchored to the content's right edge (design
+/// §4·A: Creator 110 · Year 48 · clip 22); the title flexes to fill the rest.
 struct ListCols {
-    creator_right: f32,
-    year_right: f32,
+    title_left: f32,
     title_right: f32,
+    creator_left: f32,
+    year_left: f32,
+    clip_center: f32,
 }
 
 fn list_cols(rect: egui::Rect) -> ListCols {
-    let year_right = rect.right() - 14.0 - 26.0; // right pad + clip slot
-    let creator_right = year_right - 46.0 - 14.0; // year width + gap
-    let title_right = creator_right - 150.0 - 14.0; // creator width + gap
+    let r = rect.right();
+    let clip_left = r - 16.0 - 22.0; // right pad + clip column
+    let year_left = clip_left - 11.0 - 48.0; // gap + year column
+    let creator_left = year_left - 11.0 - 110.0; // gap + creator column
     ListCols {
-        creator_right,
-        year_right,
-        title_right,
+        title_left: rect.left() + 45.0, // 16 pad + 18 icon + 11 gap
+        title_right: creator_left - 11.0,
+        creator_left,
+        year_left,
+        clip_center: clip_left + 11.0,
     }
 }
 
-/// Sortable column header row (spec §4·A).
-fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+/// Sortable column header (TITLE · CREATOR ▾ · YEAR), aligned to the row columns
+/// (spec §4·A). Creator is accent with a chevron; clicking it toggles the sort.
+fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState, content_w: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(content_w, 34.0), egui::Sense::hover());
     let cols = list_cols(rect);
     let cy = rect.center().y;
+    let hfont = egui::FontId::proportional(11.0);
     ui.painter().text(
         egui::pos2(rect.left() + 16.0, cy),
         egui::Align2::LEFT_CENTER,
         "TITLE",
-        egui::FontId::proportional(11.0),
+        hfont.clone(),
         theme.muted,
     );
-    // CREATOR with a sort chevron — clickable to toggle sort (accent when active).
-    let creator_col = if st.sort_by_creator {
-        theme.accent
-    } else {
-        theme.muted
-    };
+    ui.painter().text(
+        egui::pos2(cols.creator_left, cy),
+        egui::Align2::LEFT_CENTER,
+        "CREATOR",
+        hfont.clone(),
+        theme.accent,
+    );
     icons::paint_at(
         ui,
         egui::Rect::from_center_size(
-            egui::pos2(cols.creator_right - 5.0, cy),
+            egui::pos2(cols.creator_left + 56.0, cy),
             egui::vec2(11.0, 11.0),
         ),
         Glyph::ChevronDown,
-        creator_col,
+        theme.accent,
     );
     ui.painter().text(
-        egui::pos2(cols.creator_right - 14.0, cy),
-        egui::Align2::RIGHT_CENTER,
-        "CREATOR",
-        egui::FontId::proportional(11.0),
-        creator_col,
+        egui::pos2(cols.year_left, cy),
+        egui::Align2::LEFT_CENTER,
+        "YEAR",
+        hfont,
+        theme.muted,
     );
+    // Clicking the Creator column toggles the sort.
     let chit = egui::Rect::from_min_max(
-        egui::pos2(cols.creator_right - 80.0, rect.top()),
-        egui::pos2(cols.creator_right + 4.0, rect.bottom()),
+        egui::pos2(cols.creator_left - 4.0, rect.top()),
+        egui::pos2(cols.year_left - 6.0, rect.bottom()),
     );
     if ui
         .interact(chit, ui.id().with("sort-creator"), egui::Sense::click())
@@ -558,25 +607,24 @@ fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
     {
         st.sort_by_creator = !st.sort_by_creator;
     }
-    ui.painter().text(
-        egui::pos2(cols.year_right, cy),
-        egui::Align2::RIGHT_CENTER,
-        "YEAR",
-        egui::FontId::proportional(11.0),
-        theme.muted,
-    );
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),
-        egui::Stroke::new(1.0, theme.border),
+        egui::Stroke::new(1.0, theme.border_2),
     );
 }
 
-/// One 56px list row (spec §4·A): type glyph · serif title with a tag-hash line
-/// underneath · right-aligned CREATOR and YEAR columns · PDF clip.
-fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> egui::Response {
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
+/// One 56px list row (spec §4·A): type glyph · serif title with a colored
+/// tag-hash line under it · left-aligned CREATOR and YEAR columns · PDF clip.
+/// Drawn `content_w` wide so a narrow pane scrolls horizontally.
+fn list_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    content_w: f32,
+    e: &EntryView,
+    selected: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(content_w, 56.0), egui::Sense::click());
     if selected {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::ZERO, theme.sel);
@@ -591,80 +639,80 @@ fn list_row(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> 
     }
     let cols = list_cols(rect);
     let cy = rect.center().y;
-
-    // type glyph
     let (glyph, gcolor) = type_glyph(theme, &e.entry_type);
     icons::paint_at(
         ui,
-        egui::Rect::from_center_size(egui::pos2(rect.left() + 26.0, cy), egui::vec2(20.0, 20.0)),
+        egui::Rect::from_center_size(egui::pos2(rect.left() + 25.0, cy), egui::vec2(18.0, 18.0)),
         glyph,
         gcolor,
     );
 
-    let title_left = rect.left() + 48.0;
-    let title_w = (cols.title_right - title_left).max(80.0);
+    // Title (serif) with the first three tags as colored #hashes underneath.
+    let title_w = (cols.title_right - cols.title_left).max(60.0);
     let title = crate::tex::display(
         e.fields
             .get("title")
             .map(String::as_str)
             .unwrap_or("(untitled)"),
     );
-    let tagline = e
-        .tags
-        .iter()
-        .map(|t| format!("#{}", t.rsplit(':').next().unwrap_or(t)))
-        .collect::<Vec<_>>()
-        .join("  ");
-    let has_tags = !tagline.is_empty();
-
-    // Title (and tag-hash line under it, when present), left block vertically
-    // centered within the row.
+    let tags: Vec<&String> = e.tags.iter().take(3).collect();
+    let has_tags = !tags.is_empty();
     let title_y = if has_tags { cy - 9.0 } else { cy };
     ui.painter().text(
-        egui::pos2(title_left, title_y),
+        egui::pos2(cols.title_left, title_y),
         egui::Align2::LEFT_CENTER,
-        ellipsize(&title, (title_w / 7.4) as usize),
+        ellipsize(&title, (title_w / 7.2) as usize),
         theme::serif(15.5),
         theme.text,
     );
     if has_tags {
-        ui.painter().text(
-            egui::pos2(title_left, cy + 11.0),
-            egui::Align2::LEFT_CENTER,
-            ellipsize(&tagline, (title_w / 6.6) as usize),
-            egui::FontId::proportional(12.0),
-            theme.muted,
-        );
+        let mut x = cols.title_left;
+        for t in &tags {
+            let label = format!("#{}", t.rsplit(':').next().unwrap_or(t));
+            let gal = ui.painter().layout_no_wrap(
+                label.clone(),
+                egui::FontId::proportional(10.5),
+                tag_color(t),
+            );
+            let w = gal.size().x;
+            if x + w > cols.title_right {
+                break;
+            }
+            ui.painter().text(
+                egui::pos2(x, cy + 11.0),
+                egui::Align2::LEFT_CENTER,
+                &label,
+                egui::FontId::proportional(10.5),
+                tag_color(t),
+            );
+            x += w + 8.0;
+        }
     }
 
-    // CREATOR and YEAR columns (right-aligned), vertically centered.
-    let creator = creator_of(e);
+    // CREATOR and YEAR columns (left-aligned in fixed-width slots).
     ui.painter().text(
-        egui::pos2(cols.creator_right, cy),
-        egui::Align2::RIGHT_CENTER,
-        ellipsize(&creator, 20),
+        egui::pos2(cols.creator_left, cy),
+        egui::Align2::LEFT_CENTER,
+        ellipsize(&creator_of(e), 16),
         egui::FontId::proportional(13.0),
         theme.text_2,
     );
     let year = e.fields.get("year").map(String::as_str).unwrap_or("");
     ui.painter().text(
-        egui::pos2(cols.year_right, cy),
-        egui::Align2::RIGHT_CENTER,
+        egui::pos2(cols.year_left, cy),
+        egui::Align2::LEFT_CENTER,
         year,
         egui::FontId::proportional(13.0),
         theme.text_2,
     );
 
-    // PDF clip on the far right.
+    // PDF clip (in the entry type's color), else nothing.
     if has_pdf(e) {
         icons::paint_at(
             ui,
-            egui::Rect::from_center_size(
-                egui::pos2(rect.right() - 16.0, cy),
-                egui::vec2(16.0, 16.0),
-            ),
+            egui::Rect::from_center_size(egui::pos2(cols.clip_center, cy), egui::vec2(16.0, 16.0)),
             Glyph::Attach,
-            theme.faint,
+            gcolor,
         );
     }
     ui.painter().hline(
