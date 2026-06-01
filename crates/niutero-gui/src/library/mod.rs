@@ -23,6 +23,41 @@ mod reader;
 pub use board::board;
 pub use reader::reader;
 
+/// Which Classic-list column the rows are sorted by (spec §4·A header).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKey {
+    /// File / import order — the `.bib`'s own order, no reordering.
+    #[default]
+    None,
+    Title,
+    Creator,
+    Year,
+}
+
+/// The Classic list sort: a column plus a direction. Clicking a column header
+/// cycles that column ascending → descending → off (back to file order).
+#[derive(Clone, Copy, Default)]
+pub struct SortState {
+    pub key: SortKey,
+    /// `true` = descending (Z→A, newest→oldest); `false` = ascending.
+    pub desc: bool,
+}
+
+impl SortState {
+    /// Advance the sort when `key`'s header is clicked: a fresh column starts
+    /// ascending, the active column flips to descending, then clears.
+    fn click(&mut self, key: SortKey) {
+        if self.key != key {
+            self.key = key;
+            self.desc = false;
+        } else if !self.desc {
+            self.desc = true;
+        } else {
+            *self = SortState::default();
+        }
+    }
+}
+
 /// Cheap, view-local UI state (no engine data).
 pub struct LibState {
     pub selected: Option<String>,
@@ -38,8 +73,14 @@ pub struct LibState {
     pub hide_list: bool,
     /// Board: whether the slide-in detail drawer is open for `selected`.
     pub drawer_open: bool,
-    /// Classic: sort the list by creator (CREATOR ▾ column header toggle).
-    pub sort_by_creator: bool,
+    /// Classic: which column the list is sorted by, and the direction.
+    pub sort: SortState,
+    /// Cached Classic row order — indices into the loaded entries — plus a
+    /// signature of the inputs that produced it. Filtering + sorting de-TeX's
+    /// every title/author, so this runs only when an input changes (search,
+    /// tag, sort, or a library reload), never on a plain scroll frame.
+    shown_cache: Vec<usize>,
+    shown_sig: Option<u64>,
     /// Classic: tag-tree namespace groups the user has collapsed.
     collapsed_ns: HashSet<String>,
     /// Edit buffers for the selected entry's text fields, valid while unlocked.
@@ -70,7 +111,9 @@ impl Default for LibState {
             hide_detail: false,
             hide_list: false,
             drawer_open: false,
-            sort_by_creator: false,
+            sort: SortState::default(),
+            shown_cache: Vec::new(),
+            shown_sig: None,
             collapsed_ns: HashSet::new(),
             buffers: BTreeMap::new(),
             buffers_for: None,
@@ -119,8 +162,9 @@ pub fn classic(
     // correctly between the two side panels.
     if !hide_tags {
         egui::SidePanel::left("niu-tags")
-            .exact_width(232.0)
-            .resizable(false)
+            .default_width(232.0)
+            .width_range(190.0..=360.0)
+            .resizable(true)
             .frame(
                 egui::Frame::default()
                     .fill(theme.surface)
@@ -137,8 +181,9 @@ pub fn classic(
     // Detail panel (right).
     if !hide_detail {
         egui::SidePanel::right("niu-detail")
-            .exact_width(384.0)
-            .resizable(false)
+            .default_width(384.0)
+            .width_range(320.0..=560.0)
+            .resizable(true)
             // No inner margin — `detail_panel` lays out its own pinned footer +
             // padded scroll via nested panels.
             .frame(egui::Frame::default().fill(theme.surface))
@@ -475,19 +520,19 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         egui::Stroke::new(1.0, theme.border),
     );
 
+    // Recompute the filtered+sorted order only when an input changed; on a plain
+    // scroll the signature is stable, so we reuse the cache (no per-frame de-TeX).
     let search = st.search.to_lowercase();
-    let mut shown: Vec<&EntryView> = entries
-        .iter()
-        .filter(|e| matches_filter(e, &st.active_tag, &search))
-        .collect();
-    if st.sort_by_creator {
-        // Key once (creator_of allocates) rather than in every comparison.
-        let mut keyed: Vec<(String, &EntryView)> =
-            shown.into_iter().map(|e| (creator_of(e), e)).collect();
-        keyed.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-        shown = keyed.into_iter().map(|(_, e)| e).collect();
+    let sig = order_sig(entries, &st.active_tag, &search, st.sort);
+    if st.shown_sig != Some(sig) {
+        st.shown_cache = compute_order(entries, &st.active_tag, &search, st.sort);
+        st.shown_sig = Some(sig);
     }
-    if shown.is_empty() {
+    // Borrow the order out of `st` so the row closure can still mutate `st`
+    // (selection); restored before returning.
+    let order = std::mem::take(&mut st.shown_cache);
+
+    if order.is_empty() {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -496,6 +541,7 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                     ui.label(RichText::new("No matching entries").color(theme.muted));
                 });
             });
+        st.shown_cache = order;
         return;
     }
 
@@ -508,7 +554,7 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
         .show(ui, |ui| {
             let content_w = viewport_w.max(LIST_MIN_W);
             ui.set_min_width(content_w);
-            // Sortable column header (TITLE · CREATOR ▾ · YEAR) aligned to the rows.
+            // Sortable column header (TITLE · CREATOR · YEAR) aligned to the rows.
             list_header(ui, theme, st, content_w);
             // Rows are flush (each draws its own bottom hairline), so the pitch
             // must be exactly 56 — `show_rows` reads this spacing.
@@ -518,9 +564,9 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                 .id_salt("niu-classic-rows")
                 .auto_shrink([false, false])
                 .max_height(body_h)
-                .show_rows(ui, 56.0, shown.len(), |ui, range| {
+                .show_rows(ui, 56.0, order.len(), |ui, range| {
                     for i in range {
-                        let e = shown[i];
+                        let e = &entries[order[i]];
                         let sel = st.selected.as_deref() == Some(&e.citekey);
                         if list_row(ui, theme, content_w, e, sel).clicked() {
                             st.selected = Some(e.citekey.clone());
@@ -529,6 +575,7 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                     }
                 });
         });
+    st.shown_cache = order;
 }
 
 /// The list's column geometry (shared by the header and rows). Columns are
@@ -556,60 +603,84 @@ fn list_cols(rect: egui::Rect) -> ListCols {
     }
 }
 
-/// Sortable column header (TITLE · CREATOR ▾ · YEAR), aligned to the row columns
-/// (spec §4·A). Creator is accent with a chevron; clicking it toggles the sort.
+/// Sortable column header (TITLE · CREATOR · YEAR), aligned to the row columns
+/// (spec §4·A). Every column is clickable; the active sort column is accent and
+/// carries an up/down chevron, the rest are muted.
 fn list_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState, content_w: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(content_w, 34.0), egui::Sense::hover());
     let cols = list_cols(rect);
     let cy = rect.center().y;
-    let hfont = egui::FontId::proportional(11.0);
-    ui.painter().text(
-        egui::pos2(rect.left() + 16.0, cy),
-        egui::Align2::LEFT_CENTER,
-        "TITLE",
-        hfont.clone(),
-        theme.muted,
-    );
-    ui.painter().text(
-        egui::pos2(cols.creator_left, cy),
-        egui::Align2::LEFT_CENTER,
-        "CREATOR",
-        hfont.clone(),
-        theme.accent,
-    );
-    icons::paint_at(
-        ui,
-        egui::Rect::from_center_size(
-            egui::pos2(cols.creator_left + 56.0, cy),
-            egui::vec2(11.0, 11.0),
+    let top = rect.top();
+    let bot = rect.bottom();
+    // (label, left x, SortKey, hit rect) for each column.
+    let columns = [
+        (
+            "TITLE",
+            rect.left() + 16.0,
+            SortKey::Title,
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), top),
+                egui::pos2(cols.creator_left - 8.0, bot),
+            ),
         ),
-        Glyph::ChevronDown,
-        theme.accent,
-    );
-    ui.painter().text(
-        egui::pos2(cols.year_left, cy),
-        egui::Align2::LEFT_CENTER,
-        "YEAR",
-        hfont,
-        theme.muted,
-    );
-    // Clicking the Creator column toggles the sort.
-    let chit = egui::Rect::from_min_max(
-        egui::pos2(cols.creator_left - 4.0, rect.top()),
-        egui::pos2(cols.year_left - 6.0, rect.bottom()),
-    );
-    if ui
-        .interact(chit, ui.id().with("sort-creator"), egui::Sense::click())
-        .on_hover_text("Sort by creator")
-        .clicked()
-    {
-        st.sort_by_creator = !st.sort_by_creator;
+        (
+            "CREATOR",
+            cols.creator_left,
+            SortKey::Creator,
+            egui::Rect::from_min_max(
+                egui::pos2(cols.creator_left - 4.0, top),
+                egui::pos2(cols.year_left - 6.0, bot),
+            ),
+        ),
+        (
+            "YEAR",
+            cols.year_left,
+            SortKey::Year,
+            egui::Rect::from_min_max(
+                egui::pos2(cols.year_left - 4.0, top),
+                egui::pos2(cols.clip_center - 8.0, bot),
+            ),
+        ),
+    ];
+    let hfont = egui::FontId::proportional(11.0);
+    for (label, x, key, hit) in columns {
+        let active = st.sort.key == key;
+        let color = if active { theme.accent } else { theme.muted };
+        ui.painter().text(
+            egui::pos2(x, cy),
+            egui::Align2::LEFT_CENTER,
+            label,
+            hfont.clone(),
+            color,
+        );
+        if active {
+            let w = ui
+                .painter()
+                .layout_no_wrap(label.to_string(), hfont.clone(), color)
+                .size()
+                .x;
+            let g = if st.sort.desc {
+                Glyph::ChevronDown
+            } else {
+                Glyph::ChevronUp
+            };
+            icons::paint_at(
+                ui,
+                egui::Rect::from_center_size(egui::pos2(x + w + 6.0, cy), egui::vec2(11.0, 11.0)),
+                g,
+                theme.accent,
+            );
+        }
+        let resp = ui
+            .interact(hit, ui.id().with(("sort", label)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("Sort by {}", label.to_lowercase()));
+        if resp.clicked() {
+            st.sort.click(key);
+        }
     }
-    ui.painter().hline(
-        rect.x_range(),
-        rect.bottom(),
-        egui::Stroke::new(1.0, theme.border_2),
-    );
+    ui.painter()
+        .hline(rect.x_range(), bot, egui::Stroke::new(1.0, theme.border_2));
 }
 
 /// One 56px list row (spec §4·A): type glyph · serif title with a colored
@@ -1347,6 +1418,72 @@ fn matches_search(e: &EntryView, q: &str) -> bool {
     e.fields.values().any(|v| v.to_lowercase().contains(q))
 }
 
+/// Compute the visible row order: filter to the active tag/search, then sort by
+/// the active column. Returns indices into `entries`. `SortKey::None` keeps the
+/// `.bib`'s own order. Keys are built once per entry (`sort_by_cached_key`).
+/// Cached by the caller — this is the de-TeX-heavy work kept off scroll frames.
+fn compute_order(
+    entries: &[EntryView],
+    active_tag: &Option<String>,
+    search: &str,
+    sort: SortState,
+) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..entries.len())
+        .filter(|&i| matches_filter(&entries[i], active_tag, search))
+        .collect();
+    match sort.key {
+        SortKey::None => return idx,
+        SortKey::Title => idx.sort_by_cached_key(|&i| title_of(&entries[i]).to_lowercase()),
+        // Surname of the first author, then year, so same-author entries are
+        // chronological within the alphabetical block.
+        SortKey::Creator => idx.sort_by_cached_key(|&i| {
+            let last = authors_vec(&entries[i])
+                .first()
+                .map(|a| last_name(a))
+                .unwrap_or_default();
+            (last.to_lowercase(), year_of(&entries[i]))
+        }),
+        SortKey::Year => idx.sort_by_cached_key(|&i| year_of(&entries[i])),
+    }
+    if sort.desc {
+        idx.reverse();
+    }
+    idx
+}
+
+/// A cheap signature of everything that determines the row order. When it's
+/// unchanged frame-to-frame (e.g. during a scroll) the cached order is reused.
+/// The entries' data pointer + length stand in for "the library reloaded", so
+/// any edit (which replaces the `Vec`) busts the cache.
+fn order_sig(entries: &[EntryView], tag: &Option<String>, search: &str, sort: SortState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (entries.as_ptr() as usize).hash(&mut h);
+    entries.len().hash(&mut h);
+    tag.hash(&mut h);
+    search.hash(&mut h);
+    (sort.key as u8).hash(&mut h);
+    sort.desc.hash(&mut h);
+    h.finish()
+}
+
+/// De-TeX'd title for sorting (matches what the row shows).
+fn title_of(e: &EntryView) -> String {
+    crate::tex::display(e.fields.get("title").map(String::as_str).unwrap_or(""))
+}
+
+/// The entry's year as a number for sorting; missing/non-numeric years sort as
+/// `0` (first ascending, last descending).
+fn year_of(e: &EntryView) -> i32 {
+    e.fields
+        .get("year")
+        .and_then(|y| {
+            let digits: String = y.chars().filter(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
 fn creator_of(e: &EntryView) -> String {
     let authors = authors_vec(e);
     match authors.len() {
@@ -1380,12 +1517,18 @@ fn authors_line(e: &EntryView) -> String {
     }
 }
 
+/// The surname of one author, handling both BibTeX name orderings:
+/// `"Last, First"` → `Last`, and `"First Middle Last"` → `Last` (the last
+/// whitespace-separated token). This is what the Creator column shows and what
+/// the creator sort orders by — so `"John Smith"` sorts under **S**, not **J**.
 fn last_name(author: &str) -> String {
-    author
-        .split(',')
-        .next()
-        .unwrap_or(author)
-        .trim()
+    let a = author.trim();
+    if let Some((last, _first)) = a.split_once(',') {
+        return last.trim().to_string();
+    }
+    a.rsplit(char::is_whitespace)
+        .find(|t| !t.is_empty())
+        .unwrap_or(a)
         .to_string()
 }
 
