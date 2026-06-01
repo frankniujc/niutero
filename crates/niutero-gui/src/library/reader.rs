@@ -96,17 +96,20 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
             }
             ui.add_space(10.0);
 
-            for (label, tags) in super::tag_groups(entries) {
-                section_label(ui, theme, &label);
+            super::ensure_tag_groups(st, entries);
+            let groups = std::mem::take(&mut st.tag_groups_cache);
+            for (label, tags) in &groups {
+                section_label(ui, theme, label);
                 for (full, value, count, color) in tags {
                     let on = st.active_tag.as_deref() == Some(full.as_str());
-                    if tag_row(ui, theme, &value, color, on, count) {
+                    if tag_row(ui, theme, value, *color, on, *count) {
                         st.active_tag = if on { None } else { Some(full.clone()) };
                         st.reading_filter = None;
                     }
                 }
                 ui.add_space(8.0);
             }
+            st.tag_groups_cache = groups;
 
             // Reading status — display + filter (Reader-only section, spec §4·B).
             section_label(ui, theme, "Reading status");
@@ -255,8 +258,19 @@ fn card_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                 });
         });
 
-    let q = st.search.to_lowercase();
-    let shown: Vec<&EntryView> = entries.iter().filter(|e| reader_match(e, st, &q)).collect();
+    // Search scan is cached; the tag + reading-status post-filters are cheap and
+    // run live on top of it (no per-frame field lowercasing).
+    super::ensure_search_cache(st, entries);
+    let shown: Vec<usize> = st
+        .search_cache
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let e = &entries[i];
+            st.active_tag.as_ref().is_none_or(|t| e.tags.contains(t))
+                && st.reading_filter.as_ref().is_none_or(|s| &e.status == s)
+        })
+        .collect();
 
     egui::Frame::default()
         .inner_margin(egui::Margin {
@@ -273,44 +287,81 @@ fn card_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                         .color(theme.muted),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let _ =
-                        super::icon_btn(ui, theme, Glyph::Filter, false).on_hover_text("Filter");
+                    filter_menu(ui, theme, st);
                 });
             });
         });
 
+    if shown.is_empty() {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No matching entries").color(theme.muted));
+                });
+            });
+        return;
+    }
+
+    // Virtualized card list: only the visible cards are built per frame (a large
+    // library would otherwise lay out hundreds of card frames every frame). Cards
+    // are a fixed height (single-line titles) so `show_rows` can place them.
+    let row_h = CARD_H + CARD_GAP;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Frame::default()
-                .inner_margin(egui::Margin {
-                    left: 12,
-                    right: 12,
-                    top: 0,
-                    bottom: 12,
-                })
-                .show(ui, |ui| {
-                    if shown.is_empty() {
-                        ui.add_space(40.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("No matching entries").color(theme.muted));
-                        });
-                    }
-                    for e in shown {
-                        let sel = st.selected.as_deref() == Some(&e.citekey);
-                        if item_card(ui, theme, e, sel) {
-                            st.selected = Some(e.citekey.clone());
-                            st.buffers_for = None; // reload edit buffers for the new pick
-                        }
-                    }
-                });
+        .show_rows(ui, row_h, shown.len(), |ui, range| {
+            for i in range {
+                let e = &entries[shown[i]];
+                let sel = st.selected.as_deref() == Some(&e.citekey);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_h),
+                    egui::Sense::hover(),
+                );
+                let card_rect = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(12.0, 0.0),
+                    egui::vec2((rect.width() - 24.0).max(0.0), CARD_H),
+                );
+                let mut card_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(card_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                if item_card(&mut card_ui, theme, e, sel) {
+                    st.selected = Some(e.citekey.clone());
+                    st.buffers_for = None; // reload edit buffers for the new pick
+                }
+            }
         });
 }
 
-fn reader_match(e: &EntryView, st: &LibState, q: &str) -> bool {
-    st.active_tag.as_ref().is_none_or(|t| e.tags.contains(t))
-        && st.reading_filter.as_ref().is_none_or(|s| &e.status == s)
-        && super::matches_search(e, q)
+/// Fixed reader-card geometry, so the list can be row-virtualized.
+const CARD_H: f32 = 92.0;
+const CARD_GAP: f32 = 8.0;
+
+/// The Filter button: a compact quick-filter that cycles the reading-status
+/// facet (All → Unread → Reading → Read → All), mirroring the sidebar's status
+/// rows in one control. Active state tints the icon; the tooltip names it.
+fn filter_menu(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
+    let on = st.reading_filter.is_some();
+    let hint = match st.reading_filter.as_deref() {
+        Some("unread") => "Filter: Unread — click to cycle",
+        Some("reading") => "Filter: Reading — click to cycle",
+        Some("done") => "Filter: Read — click to cycle",
+        _ => "Filter by reading status",
+    };
+    if super::icon_btn(ui, theme, Glyph::Filter, on)
+        .on_hover_text(hint)
+        .clicked()
+    {
+        st.reading_filter = match st.reading_filter.as_deref() {
+            None => Some("unread".into()),
+            Some("unread") => Some("reading".into()),
+            Some("reading") => Some("done".into()),
+            _ => None,
+        };
+        st.active_tag = None;
+    }
 }
 
 /// A paper card: type badge · status · 2-line serif title · creator.
@@ -367,10 +418,15 @@ fn item_card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) ->
                     .map(String::as_str)
                     .unwrap_or("(untitled)"),
             );
-            ui.label(
-                RichText::new(super::ellipsize(&title, 110))
-                    .font(theme::serif(16.0))
-                    .color(theme.text),
+            // Single line (truncated) so the card height is fixed for the
+            // virtualized list; the full title shows in the reading pane.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(super::ellipsize(&title, 64))
+                        .font(theme::serif(16.0))
+                        .color(theme.text),
+                )
+                .truncate(),
             );
             ui.add_space(5.0);
             ui.label(

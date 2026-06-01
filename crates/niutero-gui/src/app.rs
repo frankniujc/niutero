@@ -14,12 +14,16 @@
 //! write never overlap.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 use log::{info, warn};
-use niutero_engine::{self as engine, EntryView, Vault};
+use niutero_engine::{self as engine, AddSource, EntryView, Vault};
 
 use crate::ai::{self, AiAction, AiState};
+use crate::dialog::{self, Dialog, DialogOutcome};
 use crate::icons::{self, Glyph};
 use crate::library::{self, LibAction, LibState};
 use crate::normalize::{self, NormAction, NormCache, NormView, NormalizeState};
@@ -102,6 +106,30 @@ pub struct NiuteroApp {
     /// `None` when no library is open or the vault isn't a git repo. Refreshed
     /// on library (re)load and after each edit — never recomputed per frame.
     git: Option<engine::GitStatus>,
+    /// The open modal dialog (new entry / add-by-DOI), if any.
+    dialog: Option<Dialog>,
+    /// A running off-thread job (Online enrich / Sync / DOI import). Network and
+    /// LLM calls must never block the UI thread, so they run on a worker that
+    /// reports back over this channel; the UI polls it each frame.
+    bg: Option<BgHandle>,
+}
+
+/// A message from a background worker thread to the UI.
+enum BgMsg {
+    /// Units completed so far (drives the task toast's bar).
+    Progress(usize),
+    /// The job finished; the string is a one-line result summary.
+    Done(String),
+    /// The job failed; the string is shown as a toast.
+    Failed(String),
+}
+
+/// The UI's handle on a running background job: the receiving end of its channel
+/// plus a cooperative cancel flag the worker checks (so a long multi-entry job
+/// can be stopped, and a library switch can detach the job).
+struct BgHandle {
+    rx: mpsc::Receiver<BgMsg>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl NiuteroApp {
@@ -154,12 +182,10 @@ impl NiuteroApp {
             Ok("board") => LibView::Board,
             _ => LibView::Classic,
         };
-        let task = std::env::var("NIU_TASK").ok().map(|_| TaskState {
-            label: "Online enrich…".into(),
-            done_label: "Enrich finished".into(),
-            total: 184,
-            start: 0.0,
-            duration: 8.0,
+        let task = std::env::var("NIU_TASK").ok().map(|_| {
+            let mut t = TaskState::running("Online enrich…", "Enrich finished", 184);
+            t.done = 92; // a static mid-progress demo for screenshots
+            t
         });
         let norm_view = match std::env::var("NIU_NORMVIEW").as_deref() {
             Ok("review") => NormView::Review,
@@ -170,6 +196,12 @@ impl NiuteroApp {
         let git = library
             .as_ref()
             .and_then(|l| engine::git_status(&l.vault.root));
+        // Dev/QA: open a dialog on boot for screenshots/smoke (NIU_DIALOG=new|doi).
+        let dialog = match std::env::var("NIU_DIALOG").as_deref() {
+            Ok("new") => Some(Dialog::new_entry(None)),
+            Ok("doi") => Some(Dialog::add_by_doi()),
+            _ => None,
+        };
         NiuteroApp {
             dark: false,
             tool,
@@ -192,6 +224,8 @@ impl NiuteroApp {
             toast_shown: None,
             toast_deadline: None,
             git,
+            dialog,
+            bg: None,
         }
     }
 
@@ -219,6 +253,13 @@ impl NiuteroApp {
     /// Open `path` as the active library, resetting view state. On failure the
     /// error shows in the empty state + a toast (the old library is dropped).
     fn switch_to(&mut self, path: PathBuf) {
+        // Detach any in-flight background job from the *previous* library: signal
+        // it to stop and drop our handle so its completion can't refresh/lock the
+        // new library (its disk write, if any, still finishes harmlessly).
+        if let Some(bg) = self.bg.take() {
+            bg.cancel.store(true, Ordering::Relaxed);
+        }
+        self.task = None;
         match Library::load(&path) {
             Ok(lib) => {
                 info!(
@@ -413,7 +454,10 @@ impl eframe::App for NiuteroApp {
                     .fill(theme.surface)
                     .inner_margin(egui::Margin::symmetric(0, 12)),
             )
-            .show(ctx, |ui| self.tool_rail(ui, &theme));
+            .show(ctx, |ui| self.tool_rail(ui, &theme, ctx));
+
+        // Drain background-worker messages (Online enrich / Sync / DOI import).
+        self.poll_background(ctx);
 
         match self.tool {
             Tool::Library => self.body_library(ctx, &theme),
@@ -458,6 +502,16 @@ impl eframe::App for NiuteroApp {
                             ui.label(RichText::new(msg).color(theme.bg).size(12.5));
                         });
                 });
+        }
+
+        // Modal dialog (new entry / add-by-DOI), drawn above everything.
+        self.dialog_step(ctx, &theme);
+
+        // While a background job runs the worker calls `request_repaint` on each
+        // message; this is just a low-frequency safety net (not a per-frame spin)
+        // in case a wake-up is missed.
+        if self.bg.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 }
@@ -657,7 +711,7 @@ impl NiuteroApp {
         });
     }
 
-    fn tool_rail(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+    fn tool_rail(&mut self, ui: &mut egui::Ui, theme: &Theme, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
             ui.add_space(2.0);
             niu_mark(ui, theme, 30.0);
@@ -677,10 +731,16 @@ impl NiuteroApp {
                 ui.add_space(4.0);
             }
         });
-        // Sync pinned to the bottom (commit & push — wired in a later wave).
+        // Sync pinned to the bottom: commit & push (pull/merge first) over git.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             ui.add_space(2.0);
-            let _ = rail_button(ui, theme, Glyph::Sync, false).on_hover_text("Sync");
+            let running = self.bg.is_some();
+            if rail_button(ui, theme, Glyph::Sync, running)
+                .on_hover_text("Sync (commit & push)")
+                .clicked()
+            {
+                self.start_sync(ctx);
+            }
         });
     }
 
@@ -704,7 +764,13 @@ impl NiuteroApp {
             LibView::Board => library::board(ctx, theme, entries, &mut self.lib, &mut actions),
         }
         for a in actions {
-            self.apply_lib_action(a, ctx);
+            match a {
+                // Dialog-opening actions don't need a selection, so they're
+                // handled here rather than in `apply_lib_action`.
+                LibAction::NewEntry(status) => self.dialog = Some(Dialog::new_entry(status)),
+                LibAction::AddByDoi => self.dialog = Some(Dialog::add_by_doi()),
+                other => self.apply_lib_action(other, ctx),
+            }
         }
     }
 
@@ -716,6 +782,10 @@ impl NiuteroApp {
         let Some(key) = self.lib.selected.clone() else {
             return;
         };
+        // Set by the arms that write to the .bib, so we refresh the cached git
+        // state only after a real mutation (read-only actions like Cite/OpenUrl
+        // would otherwise spawn git subprocesses on every click).
+        let mut dirtied = false;
         match action {
             LibAction::Edit(field, value) => {
                 let (set, unset): (Vec<String>, Vec<String>) = if value.trim().is_empty() {
@@ -728,6 +798,7 @@ impl NiuteroApp {
                         info!("edit {key}.{field}");
                         lib.reload();
                         self.lib.refresh();
+                        dirtied = true;
                     }
                     Err(e) => self.toast = Some(format!("Edit failed: {e}")),
                 }
@@ -737,6 +808,7 @@ impl NiuteroApp {
                     self.toast = Some(format!("Status failed: {e}"));
                 } else {
                     lib.reload();
+                    dirtied = true;
                 }
             }
             LibAction::SetStars(n) => {
@@ -744,6 +816,7 @@ impl NiuteroApp {
                     self.toast = Some(format!("Stars failed: {e}"));
                 } else {
                     lib.reload();
+                    dirtied = true;
                 }
             }
             LibAction::AddTag(t) => {
@@ -751,6 +824,7 @@ impl NiuteroApp {
                     self.toast = Some(format!("Tag failed: {e}"));
                 } else {
                     lib.reload();
+                    dirtied = true;
                 }
             }
             LibAction::RemoveTag(t) => {
@@ -758,6 +832,7 @@ impl NiuteroApp {
                     self.toast = Some(format!("Untag failed: {e}"));
                 } else {
                     lib.reload();
+                    dirtied = true;
                 }
             }
             LibAction::OpenUrl(u) => ctx.open_url(egui::OpenUrl::new_tab(u)),
@@ -789,10 +864,14 @@ impl NiuteroApp {
                 }
                 Err(e) => self.toast = Some(e),
             },
+            // Handled in `body_library` (they open a dialog, need no selection).
+            LibAction::NewEntry(_) | LibAction::AddByDoi => {}
         }
-        // Mutating actions write through to the .bib, dirtying the git work
-        // tree; refresh the cached state so the status bar stays truthful.
-        self.git = engine::git_status(&lib.vault.root);
+        // Only a real .bib mutation dirties the git work tree; refresh the cached
+        // status then (not on read-only Cite/BibTeX/Open actions).
+        if dirtied {
+            self.git = engine::git_status(&lib.vault.root);
+        }
     }
 
     // ------------------------------------------------------------- Normalize
@@ -858,19 +937,26 @@ impl NiuteroApp {
     fn apply_norm_action(&mut self, action: NormAction, ctx: &egui::Context) {
         match action {
             NormAction::RunOffline => self.norm.view = NormView::Review,
-            NormAction::StartEnrich => {
-                // Online enrich is a network feature (off the base path); here it
-                // surfaces as the background-task toast. The progress is a timed
-                // simulation — wiring the real online fetch is a later wave.
-                let total = self.norm_cache.as_ref().map(|c| c.total).unwrap_or(0);
-                let now = ctx.input(|i| i.time);
-                self.task = Some(TaskState {
-                    label: "Online enrich…".into(),
-                    done_label: "Enrich finished".into(),
-                    total,
-                    start: now,
-                    duration: 6.0,
-                });
+            NormAction::StartEnrich => self.start_enrich(ctx),
+            NormAction::RefreshRekey => {
+                let res = self
+                    .library
+                    .as_ref()
+                    .map(|lib| engine::rekey_preview(&lib.vault, None));
+                match res {
+                    Some(Ok(rekey)) => {
+                        let changed = rekey.len();
+                        if let Some(c) = self.norm_cache.as_mut() {
+                            c.rekey = rekey;
+                        }
+                        self.toast = Some(format!(
+                            "{changed} key{} would change",
+                            if changed == 1 { "" } else { "s" }
+                        ));
+                    }
+                    Some(Err(e)) => self.toast = Some(format!("Re-key preview failed: {e}")),
+                    None => {}
+                }
             }
             NormAction::CopyPatch => {
                 let patch = self
@@ -895,6 +981,7 @@ impl NiuteroApp {
                         // Cite keys changed → the Library selection is stale.
                         self.lib = LibState::default();
                         self.norm_cache = None;
+                        self.refresh_git();
                         let n = changes.len();
                         self.toast = Some(format!(
                             "Re-keyed {n} entr{}",
@@ -960,11 +1047,333 @@ impl NiuteroApp {
                 self.norm_cache = None;
                 self.norm.done.clear();
                 self.norm.view = NormView::Overview;
+                self.refresh_git();
                 self.toast = Some(format!(
                     "Applied {applied} change{}",
                     if applied == 1 { "" } else { "s" }
                 ));
             }
+        }
+    }
+
+    // -------------------------------------------------- dialogs & background
+
+    /// Render the open modal dialog (if any) and act on its outcome.
+    fn dialog_step(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let Some(mut dialog) = self.dialog.take() else {
+            return;
+        };
+        match dialog::dialog_ui(ctx, theme, &mut dialog) {
+            DialogOutcome::Keep => self.dialog = Some(dialog),
+            DialogOutcome::Cancel => {}
+            DialogOutcome::CreateEntry => {
+                if let Dialog::NewEntry(f) = &dialog {
+                    // On failure (e.g. a duplicate key) keep the dialog open so
+                    // the user can fix the input.
+                    if !self.create_entry(f) {
+                        self.dialog = Some(dialog);
+                    }
+                }
+            }
+            DialogOutcome::FetchDoi => {
+                let doi = match &dialog {
+                    Dialog::AddByDoi(f) => f.doi.trim().to_string(),
+                    _ => String::new(),
+                };
+                if doi.is_empty() {
+                    self.toast = Some("Enter a DOI to fetch".into());
+                    self.dialog = Some(dialog);
+                } else if !self.start_doi_import(doi, ctx) {
+                    // Busy / no library — keep the dialog so the typed DOI isn't lost.
+                    self.dialog = Some(dialog);
+                }
+            }
+            DialogOutcome::ImportFile => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("BibTeX", &["bib"])
+                    .pick_file()
+                {
+                    self.import_bib_file(&path);
+                } else {
+                    self.dialog = Some(dialog); // picker cancelled — keep dialog
+                }
+            }
+        }
+    }
+
+    /// Create an entry from the dialog fields via `engine::add`. Returns whether
+    /// it succeeded (so the caller can keep the dialog open on failure).
+    fn create_entry(&mut self, f: &dialog::NewEntryForm) -> bool {
+        let Some(lib) = self.library.as_mut() else {
+            return true;
+        };
+        let mut fields = Vec::new();
+        let mut push = |name: &str, val: &str| {
+            let v = val.trim();
+            if !v.is_empty() {
+                fields.push(format!("{name}={v}"));
+            }
+        };
+        push("title", &f.title);
+        push("author", &f.author);
+        push("year", &f.year);
+        // The venue field maps to journal for articles, booktitle otherwise.
+        let venue_field = if f.type_ == "article" {
+            "journal"
+        } else {
+            "booktitle"
+        };
+        push(venue_field, &f.venue);
+        push("doi", &f.doi);
+
+        let src = AddSource::Fields {
+            type_: f.type_.clone(),
+            key: f.key.trim().to_string(),
+            fields,
+        };
+        match engine::add(&lib.vault, src) {
+            Ok(keys) => {
+                let key = keys.into_iter().next();
+                if let (Some(k), Some(status)) = (key.as_ref(), f.status) {
+                    let _ = engine::set_status(&mut lib.vault, k, status);
+                }
+                lib.reload();
+                self.lib.refresh();
+                if let Some(k) = key {
+                    self.lib.selected = Some(k);
+                }
+                self.git = engine::git_status(&lib.vault.root);
+                self.norm_cache = None;
+                self.toast = Some("Added entry".into());
+                true
+            }
+            Err(e) => {
+                self.toast = Some(format!("Add failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Import every entry from a local `.bib` file (offline). Renames on cite-key
+    /// clashes so an import never overwrites existing entries.
+    fn import_bib_file(&mut self, path: &std::path::Path) {
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        match engine::import(&lib.vault, path, engine::DupPolicy::Rename) {
+            Ok(rep) => {
+                lib.reload();
+                self.lib.refresh();
+                self.git = engine::git_status(&lib.vault.root);
+                self.norm_cache = None;
+                self.toast = Some(format!(
+                    "Imported {} · renamed {} · skipped {}",
+                    rep.added,
+                    rep.renamed.len(),
+                    rep.skipped
+                ));
+            }
+            Err(e) => self.toast = Some(format!("Import failed: {e}")),
+        }
+    }
+
+    /// Start the Online-enrich background job: fetch missing metadata from
+    /// doi.org for every entry that has a DOI. Runs on a worker thread (network
+    /// I/O must never block the UI) that reopens the vault from its path.
+    fn start_enrich(&mut self, ctx: &egui::Context) {
+        if self.bg.is_some() {
+            self.toast = Some("A background task is already running".into());
+            return;
+        }
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+        let root = lib.vault.root.clone();
+        // Match the engine's `entry_doi` rule (doi field, or a url with the exact
+        // doi.org prefix) so the toast total reflects what `enrich` will accept.
+        let keys: Vec<String> = lib
+            .entries
+            .iter()
+            .filter(|e| {
+                e.fields.get("doi").is_some_and(|d| !d.trim().is_empty())
+                    || e.fields.get("url").is_some_and(|u| {
+                        let u = u.trim();
+                        u.starts_with("https://doi.org/") || u.starts_with("http://doi.org/")
+                    })
+            })
+            .map(|e| e.citekey.clone())
+            .collect();
+        let total = keys.len();
+        if total == 0 {
+            self.toast = Some("No entries with a DOI to enrich".into());
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let v = match engine::open(&root) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Failed(e));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let mut filled = 0usize;
+            let mut processed = 0usize;
+            for k in keys.iter() {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                processed += 1;
+                if let Ok(f) = engine::enrich(&v, k) {
+                    if !f.is_empty() {
+                        filled += 1;
+                    }
+                }
+                let _ = tx.send(BgMsg::Progress(processed));
+                ctx.request_repaint();
+            }
+            let summary = if processed < total {
+                format!("Enrich stopped — {filled} filled ({processed}/{total})")
+            } else {
+                format!("Enriched {filled} of {total} entries")
+            };
+            let _ = tx.send(BgMsg::Done(summary));
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running(
+            "Online enrich…",
+            "Enrich finished",
+            total,
+        ));
+        self.bg = Some(BgHandle { rx, cancel });
+    }
+
+    /// Start a Sync (commit & push, pulling/merging first) on a worker thread.
+    fn start_sync(&mut self, ctx: &egui::Context) {
+        if self.bg.is_some() {
+            self.toast = Some("A background task is already running".into());
+            return;
+        }
+        let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) else {
+            self.toast = Some("Open a library first".into());
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root).and_then(|v| engine::sync(&v, None)) {
+                Ok(engine::SyncStatus::Synced { committed, merged }) => {
+                    let extra = match (committed, merged) {
+                        (true, true) => " · committed · merged",
+                        (true, false) => " · committed",
+                        (false, true) => " · merged",
+                        (false, false) => " · already up to date",
+                    };
+                    BgMsg::Done(format!("Synced{extra}"))
+                }
+                Ok(engine::SyncStatus::Conflict) => {
+                    BgMsg::Failed("Sync conflict — resolve it manually".into())
+                }
+                Err(e) => BgMsg::Failed(format!("Sync failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running("Syncing…", "Synced", 1));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    /// Fetch a single entry by DOI from doi.org on a worker thread. Returns
+    /// whether the job actually started (so the caller can keep the dialog open
+    /// with the typed DOI if it didn't).
+    fn start_doi_import(&mut self, doi: String, ctx: &egui::Context) -> bool {
+        if self.bg.is_some() {
+            self.toast = Some("A background task is already running".into());
+            return false;
+        }
+        let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) else {
+            self.toast = Some("Open a library first".into());
+            return false;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root)
+                .and_then(|v| engine::import_doi(&v, &doi, engine::DupPolicy::Skip))
+            {
+                Ok(rep) if rep.added > 0 => BgMsg::Done(format!("Imported {} from DOI", rep.added)),
+                Ok(_) => BgMsg::Done("Already in the library".into()),
+                Err(e) => BgMsg::Failed(format!("DOI fetch failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running("Fetching DOI…", "DOI imported", 1));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        true
+    }
+
+    /// Drain the background worker's channel, updating the task toast and, on
+    /// completion, reloading the library so new/enriched entries appear.
+    fn poll_background(&mut self, _ctx: &egui::Context) {
+        let msgs: Vec<BgMsg> = self
+            .bg
+            .as_ref()
+            .map(|b| b.rx.try_iter().collect())
+            .unwrap_or_default();
+        if msgs.is_empty() {
+            return;
+        }
+        let mut reload = false;
+        let mut terminal = false;
+        for m in msgs {
+            match m {
+                BgMsg::Progress(n) => {
+                    if let Some(t) = self.task.as_mut() {
+                        t.done = n;
+                    }
+                }
+                BgMsg::Done(summary) => {
+                    if let Some(t) = self.task.as_mut() {
+                        t.done = t.total;
+                        t.finished = true;
+                        t.summary = Some(summary);
+                    }
+                    self.bg = None;
+                    reload = true;
+                    terminal = true;
+                }
+                BgMsg::Failed(e) => {
+                    self.toast = Some(e);
+                    self.task = None;
+                    self.bg = None;
+                    terminal = true;
+                }
+            }
+        }
+        // On success the entries changed → reload the in-memory view.
+        if reload {
+            if let Some(lib) = self.library.as_mut() {
+                lib.reload();
+            }
+            self.lib.refresh();
+            self.norm_cache = None;
+        }
+        // Refresh git on ANY completion — a Sync that committed locally but failed
+        // to push (Err) still dirtied/advanced the work tree, so the status bar
+        // must not keep showing the pre-sync state.
+        if terminal {
+            self.refresh_git();
         }
     }
 
@@ -1128,12 +1537,15 @@ impl NiuteroApp {
                 self.ai_popup_open = false;
                 self.jump_to_entry(key);
             }
-            OverlayMsg::Review => {
-                self.task = None;
-                self.tool = Tool::Normalize;
-                self.norm.view = NormView::Review;
-            }
             OverlayMsg::DismissTask => self.task = None,
+            OverlayMsg::CancelTask => {
+                // Signal the worker to stop; keep `bg` so it isn't double-started,
+                // and hide the toast now (the worker clears `bg` when it exits).
+                if let Some(bg) = self.bg.as_ref() {
+                    bg.cancel.store(true, Ordering::Relaxed);
+                }
+                self.task = None;
+            }
             OverlayMsg::Toast(m) => self.toast = Some(m),
         }
     }
@@ -1252,7 +1664,11 @@ fn win_control(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph, danger: bool) -> 
     let h = ui.max_rect().height();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, h), egui::Sense::click());
     let glyph_color = if resp.hovered() {
-        if danger { Color32::WHITE } else { theme.text }
+        if danger {
+            Color32::WHITE
+        } else {
+            theme.text
+        }
     } else {
         theme.text_2
     };

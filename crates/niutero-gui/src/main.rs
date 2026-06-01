@@ -9,6 +9,7 @@
 
 mod ai;
 mod app;
+mod dialog;
 mod icons;
 mod library;
 mod normalize;

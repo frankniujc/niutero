@@ -244,6 +244,49 @@ pub fn tab_header(ui: &mut egui::Ui, theme: &Theme, title: &str, subtitle: &str,
     ui.add_space(20.0);
 }
 
+/// A virtualized, **variable-height** vertical list, rendered inside the current
+/// (already-scrolling) `ui`. Only items whose row intersects the viewport are
+/// built; the rest just reserve their cached height, so a list of thousands of
+/// rich cards costs ~one screenful of widgets per frame.
+///
+/// Unlike `ScrollArea::show_rows` (which needs a uniform row height), this
+/// measures each item the first time it's on-screen and caches the height in
+/// `heights` (caller-owned, persisted across frames). `estimate` seeds rows that
+/// haven't been measured yet; `gap` is the space added below each item.
+pub fn virtual_list(
+    ui: &mut egui::Ui,
+    count: usize,
+    gap: f32,
+    estimate: f32,
+    heights: &mut Vec<f32>,
+    mut item: impl FnMut(&mut egui::Ui, usize),
+) {
+    if heights.len() != count {
+        // The list changed shape — reseed (heights re-measure as rows display).
+        heights.clear();
+        heights.resize(count, estimate);
+    }
+    let width = ui.available_width();
+    let clip = ui.clip_rect();
+    let margin = 64.0; // build slightly beyond the viewport to avoid edge popping
+    for (i, slot) in heights.iter_mut().enumerate() {
+        let h = *slot;
+        let top = ui.cursor().min.y;
+        if top + h < clip.top() - margin || top > clip.bottom() + margin {
+            // Off-screen: just reserve the row's (cached) height.
+            ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+        } else {
+            // On-screen: build it, and refine the cached height from the actual.
+            let measured = ui.scope(|ui| item(ui, i)).response.rect.height();
+            if (measured - h).abs() > 1.0 {
+                *slot = measured;
+                ui.ctx().request_repaint(); // next frame positions/culls accurately
+            }
+        }
+        ui.add_space(gap);
+    }
+}
+
 /// Center a fixed-width content column (the tabs use a 880px reading column).
 pub fn centered_column<R>(
     ui: &mut egui::Ui,

@@ -10,12 +10,40 @@
 //!
 //! Always display-only — the stored `.bib` value is never modified.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use eframe::egui::{self, Color32, FontId, RichText};
 use niutero_engine::texdisplay;
 
-/// Plain Tier-A display string (braces stripped, accents/specials decoded).
+thread_local! {
+    /// Memoized de-TeX results, keyed by the raw field string. The views render
+    /// from an immutable snapshot, so the same titles/authors are de-TeX'd on
+    /// every frame; without this, scrolling a large Reader/Board (no row
+    /// virtualization) re-parses hundreds of strings per frame. The GUI runs on
+    /// one thread, so a thread-local is safe and lock-free; it's bounded so a
+    /// pathological library can't grow it without limit.
+    static DISPLAY_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Plain Tier-A display string (braces stripped, accents/specials decoded),
+/// memoized so the de-TeX runs once per distinct input rather than per frame.
 pub fn display(s: &str) -> String {
-    texdisplay::to_display(s)
+    DISPLAY_CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(s) {
+            return hit.clone();
+        }
+        let out = texdisplay::to_display(s);
+        let mut map = cache.borrow_mut();
+        // Bound the cache: a library has thousands of distinct fields at most;
+        // if we somehow blow past that, drop it wholesale (simpler than an LRU,
+        // and the next frames just re-warm the visible rows).
+        if map.len() >= 16_384 {
+            map.clear();
+        }
+        map.insert(s.to_owned(), out.clone());
+        out
+    })
 }
 
 /// Render `text` as styled runs in `font`/`color` (Tier B). Plain text takes a

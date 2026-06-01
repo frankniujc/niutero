@@ -15,23 +15,40 @@ use crate::icons::{self, Glyph};
 use crate::theme::{self, Theme};
 use crate::widgets;
 
-/// A simulated background task (e.g. Online enrich). Progress is derived from
-/// elapsed time so the toast animates without a real worker thread.
+/// A real background task (Online enrich, Sync, DOI import). Progress is driven
+/// by messages from the worker thread (see `app`'s `BgMsg` polling), so the
+/// toast reflects actual work rather than a timer.
 pub struct TaskState {
     pub label: String,
     pub done_label: String,
     pub total: usize,
-    /// `ctx.input().time` when the task started, and how long the demo runs.
-    pub start: f64,
-    pub duration: f64,
+    /// Units completed so far (drives the bar); `finished` flips when the worker
+    /// signals completion. `summary` is the worker's final one-line result.
+    pub done: usize,
+    pub finished: bool,
+    pub summary: Option<String>,
 }
 
 impl TaskState {
-    pub fn progress(&self, now: f64) -> f32 {
-        if self.duration <= 0.0 {
+    /// A freshly-started task at 0 progress.
+    pub fn running(label: impl Into<String>, done_label: impl Into<String>, total: usize) -> Self {
+        TaskState {
+            label: label.into(),
+            done_label: done_label.into(),
+            total,
+            done: 0,
+            finished: false,
+            summary: None,
+        }
+    }
+
+    pub fn progress(&self) -> f32 {
+        if self.finished {
             1.0
+        } else if self.total == 0 {
+            0.0
         } else {
-            (((now - self.start) / self.duration) as f32).clamp(0.0, 1.0)
+            (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
         }
     }
 }
@@ -42,8 +59,9 @@ pub enum OverlayMsg {
     OpenAiTab,
     CloseAi,
     OpenEntry(String),
-    Review,
     DismissTask,
+    /// Request cancellation of the running background job.
+    CancelTask,
     Toast(String),
 }
 
@@ -301,13 +319,9 @@ fn popup_panel(
 // -------------------------------------------------------------- task toast
 
 fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<OverlayMsg>) {
-    let now = ui.ctx().input(|i| i.time);
-    let pct = t.progress(now);
-    let done = pct >= 1.0;
-    let count = (pct * t.total as f32).round() as usize;
-    if !done {
-        ui.ctx().request_repaint(); // keep the bar animating
-    }
+    let pct = t.progress();
+    let done = t.finished;
+    let count = t.done;
 
     egui::Frame::default()
         .fill(theme.surface)
@@ -338,7 +352,9 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
                     let title = if done { &t.done_label } else { &t.label };
                     ui.label(RichText::new(title).size(13.5).strong().color(theme.text));
                     let sub = if done {
-                        format!("All {} entries processed.", t.total)
+                        t.summary
+                            .clone()
+                            .unwrap_or_else(|| format!("All {} entries processed.", t.total))
                     } else {
                         format!("{count} / {} entries", t.total)
                     };
@@ -372,10 +388,7 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
             // actions
             if done {
                 ui.horizontal(|ui| {
-                    if widgets::button(ui, theme, None, "Review changes", true, 28.0).clicked() {
-                        msgs.push(OverlayMsg::Review);
-                    }
-                    if widgets::button(ui, theme, None, "Dismiss", false, 28.0).clicked() {
+                    if widgets::button(ui, theme, None, "Dismiss", true, 28.0).clicked() {
                         msgs.push(OverlayMsg::DismissTask);
                     }
                 });
@@ -390,15 +403,13 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Run in background")
-                                        .size(11.5)
-                                        .color(theme.muted),
+                                    RichText::new("Cancel").size(11.5).color(theme.muted),
                                 )
                                 .frame(false),
                             )
                             .clicked()
                         {
-                            msgs.push(OverlayMsg::DismissTask);
+                            msgs.push(OverlayMsg::CancelTask);
                         }
                     });
                 });

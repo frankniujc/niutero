@@ -82,6 +82,11 @@ pub struct NormalizeState {
     pub done: HashMap<String, bool>,
     /// Local ruleset toggles (display-only; see module doc).
     pub rules: [bool; 6],
+    /// Measured row heights for the virtualized Review / Re-key lists (so only
+    /// on-screen cards/rows are built each frame). Reseeded when the list size
+    /// changes; see [`widgets::virtual_list`].
+    pub review_heights: Vec<f32>,
+    pub rekey_heights: Vec<f32>,
 }
 
 impl Default for NormalizeState {
@@ -91,6 +96,8 @@ impl Default for NormalizeState {
             picked: None,
             done: HashMap::new(),
             rules: RULES.map(|r| r.3),
+            review_heights: Vec::new(),
+            rekey_heights: Vec::new(),
         }
     }
 }
@@ -116,6 +123,8 @@ pub enum NormAction {
     CopyPatch,
     /// Rewrite citation keys from the pattern (`engine::rekey_apply`).
     ApplyRekey,
+    /// Recompute the re-key preview from the current library (`rekey_preview`).
+    RefreshRekey,
 }
 
 /// Render the Normalize tool.
@@ -173,7 +182,7 @@ pub fn normalize(
                                 NormView::Overview => overview(ui, theme, cache, st, actions),
                                 NormView::Review => review(ui, theme, entries, cache, st, actions),
                                 NormView::Ruleset => ruleset(ui, theme, st),
-                                NormView::Rekey => rekey(ui, theme, cache, actions),
+                                NormView::Rekey => rekey(ui, theme, cache, st, actions),
                             });
                         });
                 });
@@ -448,10 +457,13 @@ fn review(
         return;
     }
 
-    for d in &cache.diffs {
-        diff_card(ui, theme, entries, d, st);
-        ui.add_space(16.0);
-    }
+    // Virtualized: only the on-screen diff cards are built per frame (each also
+    // does an entry lookup, so building them all would be O(diffs × entries)).
+    let mut heights = std::mem::take(&mut st.review_heights);
+    widgets::virtual_list(ui, cache.diffs.len(), 16.0, 150.0, &mut heights, |ui, i| {
+        diff_card(ui, theme, entries, &cache.diffs[i], st);
+    });
+    st.review_heights = heights;
 }
 
 fn diff_card(
@@ -638,7 +650,13 @@ fn ruleset(ui: &mut egui::Ui, theme: &Theme, st: &mut NormalizeState) {
 
 // -------------------------------------------------------------------- Re-key
 
-fn rekey(ui: &mut egui::Ui, theme: &Theme, cache: &NormCache, actions: &mut Vec<NormAction>) {
+fn rekey(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    cache: &NormCache,
+    st: &mut NormalizeState,
+    actions: &mut Vec<NormAction>,
+) {
     let clashes = cache.rekey.iter().filter(|r| r.disambiguated).count();
     widgets::tab_header(
         ui,
@@ -718,16 +736,22 @@ fn rekey(ui: &mut egui::Ui, theme: &Theme, cache: &NormCache, actions: &mut Vec<
                     );
                 });
         }
-        for (i, r) in cache.rekey.iter().enumerate() {
+        // Virtualized: "Preview all" can list the whole library, so only the
+        // on-screen rows are built per frame.
+        let n = cache.rekey.len();
+        let mut heights = std::mem::take(&mut st.rekey_heights);
+        widgets::virtual_list(ui, n, 0.0, 46.0, &mut heights, |ui, i| {
+            let r = &cache.rekey[i];
             rekey_row(ui, theme, &r.citekey, &r.new_key, r.disambiguated);
-            if i + 1 < cache.rekey.len() {
+            if i + 1 < n {
                 ui.painter().hline(
                     ui.max_rect().x_range(),
                     ui.min_rect().bottom(),
                     egui::Stroke::new(1.0, theme.border_2),
                 );
             }
-        }
+        });
+        st.rekey_heights = heights;
     });
     ui.add_space(18.0);
 
@@ -737,7 +761,9 @@ fn rekey(ui: &mut egui::Ui, theme: &Theme, cache: &NormCache, actions: &mut Vec<
             actions.push(NormAction::ApplyRekey);
         }
         let label = format!("Preview all {}", cache.total);
-        let _ = widgets::button(ui, theme, None, &label, false, 32.0);
+        if widgets::button(ui, theme, Some(Glyph::Refresh), &label, false, 32.0).clicked() {
+            actions.push(NormAction::RefreshRekey);
+        }
     });
 }
 

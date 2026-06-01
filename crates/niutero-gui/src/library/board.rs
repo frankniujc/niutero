@@ -9,7 +9,7 @@
 //! columns is not part of its control inventory.)
 
 use eframe::egui::{self, Color32, RichText};
-use niutero_engine::EntryView;
+use niutero_engine::{EntryView, Status};
 
 use super::{LibAction, LibState};
 use crate::icons::{self, Glyph};
@@ -21,6 +21,19 @@ const COLUMNS: [(&str, &str); 3] = [
     ("reading", "Reading"),
     ("done", "Read"),
 ];
+
+/// Fixed board-card geometry, so columns can be row-virtualized.
+const CARD_H: f32 = 126.0;
+const CARD_GAP: f32 = 11.0;
+
+/// The reading [`Status`] a column's key maps to (for "add into this column").
+fn status_of(key: &str) -> Status {
+    match key {
+        "reading" => Status::Reading,
+        "done" => Status::Done,
+        _ => Status::Unread,
+    }
+}
 
 /// Render the Board view. Queued engine actions go into `actions`.
 pub fn board(
@@ -51,19 +64,29 @@ pub fn board(
     egui::CentralPanel::default()
         .frame(egui::Frame::default().fill(theme.bg))
         .show(ctx, |ui| {
-            header_bar(ui, theme, entries, st);
+            header_bar(ui, theme, entries, st, actions);
             ui.painter().hline(
                 ui.max_rect().x_range(),
                 ui.min_rect().bottom(),
                 egui::Stroke::new(1.0, theme.border),
             );
-            columns(ui, theme, entries, st);
+            if st.board_grid {
+                columns(ui, theme, entries, st, actions);
+            } else {
+                list_view(ui, theme, entries, st, actions);
+            }
         });
 }
 
 // ----------------------------------------------------------------- header bar
 
-fn header_bar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
+fn header_bar(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    entries: &[EntryView],
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
     egui::Frame::default()
         .inner_margin(egui::Margin {
             left: 22,
@@ -112,21 +135,34 @@ fn header_bar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut 
                     });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Add (primary, mock — new-entry needs an input dialog, a later wave)
-                    let _ = pri_btn(ui, theme, Glyph::Plus, "Add")
-                        .on_hover_text("New entry (coming soon)");
+                    // Add (primary) → the shared new-entry dialog.
+                    if pri_btn(ui, theme, Glyph::Plus, "Add")
+                        .on_hover_text("New entry")
+                        .clicked()
+                    {
+                        actions.push(LibAction::NewEntry(None));
+                    }
                     ui.add_space(6.0);
-                    // layout toggle (grid active / rows — list view is a later wave)
+                    // Layout toggle: kanban grid ↔ single-column list.
+                    let grid = st.board_grid;
                     egui::Frame::default()
                         .fill(theme.surface_2)
                         .corner_radius(9.0)
                         .inner_margin(3)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let _ = seg_icon(ui, theme, Glyph::Rows, false)
-                                    .on_hover_text("List view (coming soon)");
-                                let _ = seg_icon(ui, theme, Glyph::Grid, true)
-                                    .on_hover_text("Board view");
+                                if seg_icon(ui, theme, Glyph::Rows, !grid)
+                                    .on_hover_text("List view")
+                                    .clicked()
+                                {
+                                    st.board_grid = false;
+                                }
+                                if seg_icon(ui, theme, Glyph::Grid, grid)
+                                    .on_hover_text("Board view")
+                                    .clicked()
+                                {
+                                    st.board_grid = true;
+                                }
                             });
                         });
                 });
@@ -136,14 +172,22 @@ fn header_bar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut 
 
 // -------------------------------------------------------------------- columns
 
-fn columns(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
-    let q = st.search.to_lowercase();
+fn columns(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    entries: &[EntryView],
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
+    // Search scan cached; the per-column status split is a cheap live filter.
+    super::ensure_search_cache(st, entries);
     let cards: Vec<Vec<&EntryView>> = COLUMNS
         .iter()
         .map(|(key, _)| {
-            entries
+            st.search_cache
                 .iter()
-                .filter(|e| &e.status == key && super::matches_search(e, &q))
+                .map(|&i| &entries[i])
+                .filter(|e| &e.status == key)
                 .collect()
         })
         .collect();
@@ -153,7 +197,7 @@ fn columns(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut Lib
         .show(ui, |ui| {
             ui.columns(3, |cols| {
                 for (i, (key, label)) in COLUMNS.iter().enumerate() {
-                    column(&mut cols[i], theme, key, label, &cards[i], st);
+                    column(&mut cols[i], theme, key, label, &cards[i], st, actions);
                 }
             });
         });
@@ -166,6 +210,7 @@ fn column(
     label: &str,
     cards: &[&EntryView],
     st: &mut LibState,
+    actions: &mut Vec<LibAction>,
 ) {
     // header: dot + label + count + "+"
     ui.horizontal(|ui| {
@@ -181,26 +226,109 @@ fn column(
                 .color(theme.muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let _ = super::icon_btn(ui, theme, Glyph::Plus, false)
-                .on_hover_text("Add paper here (coming soon)");
+            if super::icon_btn(ui, theme, Glyph::Plus, false)
+                .on_hover_text("Add paper here")
+                .clicked()
+            {
+                actions.push(LibAction::NewEntry(Some(status_of(key))));
+            }
         });
     });
     ui.add_space(8.0);
 
+    // Virtualized column: only visible cards build per frame. The trailing
+    // "+ Add paper" affordance is rendered as one extra virtual row.
+    let row_h = CARD_H + CARD_GAP;
+    let n = cards.len();
     egui::ScrollArea::vertical()
         .id_salt(("niu-board-col", key))
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for e in cards {
+        .show_rows(ui, row_h, n + 1, |ui, range| {
+            for i in range {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_h),
+                    egui::Sense::hover(),
+                );
+                if i == n {
+                    if add_paper(ui, theme, rect) {
+                        actions.push(LibAction::NewEntry(Some(status_of(key))));
+                    }
+                    continue;
+                }
+                let e = cards[i];
                 let sel = st.selected.as_deref() == Some(&e.citekey) && st.drawer_open;
-                if card(ui, theme, e, sel) {
+                let card_rect =
+                    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), CARD_H));
+                let mut card_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(card_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                if card(&mut card_ui, theme, e, sel) {
                     st.selected = Some(e.citekey.clone());
                     st.drawer_open = true;
                     st.buffers_for = None;
                 }
             }
-            // dashed "Add paper" (mock)
-            add_paper(ui, theme);
+        });
+}
+
+/// The Board's list layout (the Rows toggle): a single virtualized column of
+/// every matching entry, full-width, same cards as the grid.
+fn list_view(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    entries: &[EntryView],
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
+    super::ensure_search_cache(st, entries);
+    let shown: Vec<usize> = st.search_cache.clone();
+    egui::Frame::default()
+        .inner_margin(egui::Margin::symmetric(22, 16))
+        .show(ui, |ui| {
+            if shown.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No matching entries").color(theme.muted));
+                });
+                return;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if pri_btn(ui, theme, Glyph::Plus, "Add")
+                    .on_hover_text("New entry")
+                    .clicked()
+                {
+                    actions.push(LibAction::NewEntry(None));
+                }
+            });
+            ui.add_space(8.0);
+            let row_h = CARD_H + CARD_GAP;
+            egui::ScrollArea::vertical()
+                .id_salt("niu-board-list")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, shown.len(), |ui, range| {
+                    let w = ui.available_width().min(720.0);
+                    for i in range {
+                        let e = &entries[shown[i]];
+                        let sel = st.selected.as_deref() == Some(&e.citekey) && st.drawer_open;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::hover(),
+                        );
+                        let card_rect = egui::Rect::from_min_size(rect.min, egui::vec2(w, CARD_H));
+                        let mut card_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(card_rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        if card(&mut card_ui, theme, e, sel) {
+                            st.selected = Some(e.citekey.clone());
+                            st.drawer_open = true;
+                            st.buffers_for = None;
+                        }
+                    }
+                });
         });
 }
 
@@ -259,17 +387,20 @@ fn card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> bool
                 });
             });
             ui.add_space(7.0);
-            // title (serif, clamped)
+            // title (serif, single line so the card height is fixed)
             let title = crate::tex::display(
                 e.fields
                     .get("title")
                     .map(String::as_str)
                     .unwrap_or("(untitled)"),
             );
-            ui.label(
-                RichText::new(super::ellipsize(&title, 96))
-                    .font(theme::serif(16.5))
-                    .color(theme.text),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(super::ellipsize(&title, 72))
+                        .font(theme::serif(16.5))
+                        .color(theme.text),
+                )
+                .truncate(),
             );
             ui.add_space(6.0);
             ui.label(
@@ -300,13 +431,16 @@ fn card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> bool
         ui.id().with(("board-card", &e.citekey)),
         egui::Sense::click(),
     );
-    ui.add_space(11.0);
     r.clicked()
 }
 
-fn add_paper(ui: &mut egui::Ui, theme: &Theme) {
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
+/// The dashed "+ Add paper" affordance, painted into the top of `row_rect`.
+/// Returns whether it was clicked.
+fn add_paper(ui: &mut egui::Ui, theme: &Theme, row_rect: egui::Rect) -> bool {
+    let rect = egui::Rect::from_min_size(row_rect.min, egui::vec2(row_rect.width(), 40.0));
+    let resp = ui
+        .interact(rect, ui.id().with("board-add-paper"), egui::Sense::click())
+        .on_hover_text("Add paper here");
     let stroke = egui::Stroke::new(
         1.0,
         if resp.hovered() {
@@ -329,7 +463,7 @@ fn add_paper(ui: &mut egui::Ui, theme: &Theme) {
         egui::FontId::proportional(12.5),
         theme.muted,
     );
-    let _ = resp.on_hover_text("Add paper here (coming soon)");
+    resp.clicked()
 }
 
 // --------------------------------------------------------------------- drawer

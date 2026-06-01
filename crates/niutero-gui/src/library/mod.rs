@@ -73,6 +73,8 @@ pub struct LibState {
     pub hide_list: bool,
     /// Board: whether the slide-in detail drawer is open for `selected`.
     pub drawer_open: bool,
+    /// Board: `true` = kanban grid (default), `false` = a single-column list.
+    pub board_grid: bool,
     /// Classic: which column the list is sorted by, and the direction.
     pub sort: SortState,
     /// Cached Classic row order — indices into the loaded entries — plus a
@@ -81,6 +83,16 @@ pub struct LibState {
     /// tag, sort, or a library reload), never on a plain scroll frame.
     shown_cache: Vec<usize>,
     shown_sig: Option<u64>,
+    /// Reader/Board: indices matching the search box, cached so the
+    /// O(entries×fields) field scan runs once per (search, library) change rather
+    /// than every frame. The cheap tag/status post-filters run live on top.
+    search_cache: Vec<usize>,
+    search_sig: Option<u64>,
+    /// Cached tag tree (namespace groups + counts) for the sidebars, rebuilt only
+    /// when the library changes rather than every frame (it scans every entry's
+    /// tags and clones strings).
+    tag_groups_cache: Vec<TagGroup>,
+    tag_groups_sig: Option<u64>,
     /// Classic: tag-tree namespace groups the user has collapsed.
     collapsed_ns: HashSet<String>,
     /// Edit buffers for the selected entry's text fields, valid while unlocked.
@@ -111,9 +123,14 @@ impl Default for LibState {
             hide_detail: false,
             hide_list: false,
             drawer_open: false,
+            board_grid: true,
             sort: SortState::default(),
             shown_cache: Vec::new(),
             shown_sig: None,
+            search_cache: Vec::new(),
+            search_sig: None,
+            tag_groups_cache: Vec::new(),
+            tag_groups_sig: None,
             collapsed_ns: HashSet::new(),
             buffers: BTreeMap::new(),
             buffers_for: None,
@@ -136,6 +153,11 @@ pub enum LibAction {
     OpenPdf,
     Cite,
     Bibtex,
+    /// Open the "new entry" dialog; `Some(status)` pre-files it into a Board
+    /// column's reading status.
+    NewEntry(Option<Status>),
+    /// Open the "add by DOI / import a .bib file" dialog.
+    AddByDoi,
 }
 
 /// Render the Classic view. Returns nothing; queued engine actions go into
@@ -207,7 +229,7 @@ pub fn classic(
     // Item list (center).
     egui::CentralPanel::default()
         .frame(egui::Frame::default().fill(theme.bg))
-        .show(ctx, |ui| item_list(ui, theme, entries, st));
+        .show(ctx, |ui| item_list(ui, theme, entries, st, actions));
 }
 
 // ----------------------------------------------------------------- sidebar
@@ -222,13 +244,15 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
 
     // TAGS section header with the AI auto-tag (✦) and new-tag (+) buttons.
     // Both open popovers in the design; rendered now, wired in a later wave.
-    tags_header(ui, theme);
+    tags_header(ui, theme, st);
 
-    for (label, tags) in tag_groups(entries) {
-        let collapsed = st.collapsed_ns.contains(&label);
-        if group_header(ui, theme, &label, tags.len(), collapsed) {
+    ensure_tag_groups(st, entries);
+    let groups = std::mem::take(&mut st.tag_groups_cache);
+    for (label, tags) in &groups {
+        let collapsed = st.collapsed_ns.contains(label);
+        if group_header(ui, theme, label, tags.len(), collapsed) {
             if collapsed {
-                st.collapsed_ns.remove(&label);
+                st.collapsed_ns.remove(label);
             } else {
                 st.collapsed_ns.insert(label.clone());
             }
@@ -252,12 +276,12 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
             ui.painter().rect_filled(
                 egui::Rect::from_center_size(dot, egui::vec2(8.0, 8.0)),
                 egui::CornerRadius::same(3),
-                color,
+                *color,
             );
             ui.painter().text(
                 rect.left_center() + egui::vec2(34.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                &value,
+                value,
                 egui::FontId::proportional(13.0),
                 if on { theme.text } else { theme.text_2 },
             );
@@ -274,6 +298,7 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
         }
         ui.add_space(6.0);
     }
+    st.tag_groups_cache = groups;
 }
 
 /// "All Entries" row with a leading library icon. Returns whether clicked.
@@ -314,13 +339,25 @@ fn all_entries_row(ui: &mut egui::Ui, theme: &Theme, on: bool, count: usize) -> 
 }
 
 /// "TAGS" section header with ✦ (AI auto-tag) and + (new tag) buttons.
-fn tags_header(ui: &mut egui::Ui, theme: &Theme) {
+fn tags_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
     ui.horizontal(|ui| {
         ui.add_space(2.0);
         ui.label(RichText::new("TAGS").size(11.0).strong().color(theme.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let _ = mini_icon_btn(ui, theme, Glyph::Plus).on_hover_text("New tag");
-            let _ = mini_icon_btn(ui, theme, Glyph::Sparkle).on_hover_text("Auto-tag with AI");
+            // "+ New tag" is a shortcut to the detail panel's tag editor: it opens
+            // the inline add-tag input on the selected entry (tags are per-entry —
+            // there's no standalone tag object).
+            if mini_icon_btn(ui, theme, Glyph::Plus)
+                .on_hover_text("Add a tag to the selected entry")
+                .clicked()
+            {
+                st.hide_detail = false;
+                st.locked = false;
+                st.adding_tag = true;
+            }
+            // Auto-tag is LLM-backed (Anthropic API) — deferred with the AI tab.
+            let _ = mini_icon_btn(ui, theme, Glyph::Sparkle)
+                .on_hover_text("Auto-tag with AI (needs a connected model)");
         });
     });
     ui.add_space(2.0);
@@ -382,6 +419,21 @@ fn mini_icon_btn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Respon
 type TagEntry = (String, String, usize, Color32);
 /// A namespace group: (display label, its tags).
 type TagGroup = (String, Vec<TagEntry>);
+
+/// (Re)compute `st.tag_groups_cache` only when the library changed, so the
+/// sidebars don't rebuild the whole tag tree (scan + string clones over every
+/// entry) on every frame.
+pub(super) fn ensure_tag_groups(st: &mut LibState, entries: &[EntryView]) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (entries.as_ptr() as usize).hash(&mut h);
+    entries.len().hash(&mut h);
+    let sig = h.finish();
+    if st.tag_groups_sig != Some(sig) {
+        st.tag_groups_cache = tag_groups(entries);
+        st.tag_groups_sig = Some(sig);
+    }
+}
 
 /// Group the library's distinct tags by namespace (`topics:` → "Topics", …).
 fn tag_groups(entries: &[EntryView]) -> Vec<TagGroup> {
@@ -446,7 +498,13 @@ fn tag_color(name: &str) -> Color32 {
 /// for a readable title plus the Creator/Year/clip columns.
 const LIST_MIN_W: f32 = 520.0;
 
-fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
+fn item_list(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    entries: &[EntryView],
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
     // Toolbar: collapse-left · new · add-by-id · search · collapse-right.
     // The collapse-right button is reserved on the right (the search is width-
     // bounded) so it can't be pushed off-screen by the search box.
@@ -475,10 +533,19 @@ fn item_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                     (dr.center().y - 10.0)..=(dr.center().y + 10.0),
                     egui::Stroke::new(1.0, theme.border),
                 );
-                // New-entry / add-by-identifier: rendered now, wired in a later wave.
-                let _ = icon_btn(ui, theme, Glyph::Plus, false).on_hover_text("New item");
-                let _ = icon_btn(ui, theme, Glyph::Link, false)
-                    .on_hover_text("Add by identifier (DOI / arXiv)");
+                // New entry / add-by-identifier → the shared dialogs.
+                if icon_btn(ui, theme, Glyph::Plus, false)
+                    .on_hover_text("New entry")
+                    .clicked()
+                {
+                    actions.push(LibAction::NewEntry(None));
+                }
+                if icon_btn(ui, theme, Glyph::Link, false)
+                    .on_hover_text("Add by DOI / import a .bib file")
+                    .clicked()
+                {
+                    actions.push(LibAction::AddByDoi);
+                }
                 // search box fills the middle, but bounded so the right toggle fits
                 let search_w = (ui.available_width() - 42.0).max(80.0);
                 ui.allocate_ui_with_layout(
@@ -1449,6 +1516,27 @@ fn compute_order(
         idx.reverse();
     }
     idx
+}
+
+/// (Re)compute `st.search_cache` — the indices matching the search box — only
+/// when the search text or the library changed. The de-TeX-free but still
+/// O(entries×fields) lowercasing scan in [`matches_search`] would otherwise run
+/// on every Reader/Board frame; callers then apply cheap tag/status post-filters
+/// on top of the cached set. Mirrors Classic's [`compute_order`] cache.
+pub(super) fn ensure_search_cache(st: &mut LibState, entries: &[EntryView]) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (entries.as_ptr() as usize).hash(&mut h);
+    entries.len().hash(&mut h);
+    st.search.hash(&mut h);
+    let sig = h.finish();
+    if st.search_sig != Some(sig) {
+        let q = st.search.to_lowercase();
+        st.search_cache = (0..entries.len())
+            .filter(|&i| matches_search(&entries[i], &q))
+            .collect();
+        st.search_sig = Some(sig);
+    }
 }
 
 /// A cheap signature of everything that determines the row order. When it's
