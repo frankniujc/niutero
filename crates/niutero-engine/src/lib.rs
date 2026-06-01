@@ -727,6 +727,30 @@ pub fn recent_vaults() -> Result<Vec<RecentVault>, String> {
         .collect())
 }
 
+/// A snapshot of a vault's git state for the status bar. [`git_status`] returns
+/// `None` when the vault isn't a git work tree (or `git` is unavailable), so the
+/// caller can show nothing rather than a fabricated branch/dirty indicator.
+#[derive(Debug, Clone)]
+pub struct GitStatus {
+    /// The current branch, or `None` in detached-HEAD state.
+    pub branch: Option<String>,
+    /// Whether the working tree has uncommitted changes.
+    pub dirty: bool,
+}
+
+/// Git branch + dirty state for the vault rooted at `root`, or `None` if it
+/// isn't a git repository. Shells out to `git` (two cheap commands) — fine to
+/// call on library (re)load, but not every frame.
+pub fn git_status(root: &Path) -> Option<GitStatus> {
+    if !git::is_repo(root) {
+        return None;
+    }
+    Some(GitStatus {
+        branch: git::current_branch(root),
+        dirty: git::is_dirty(root),
+    })
+}
+
 /// Record that a vault was just opened. **Best-effort**: a machine with no
 /// resolvable config dir, or an unwritable registry, must never make `open`
 /// fail — recency tracking is a convenience, not part of the data path. The CLI

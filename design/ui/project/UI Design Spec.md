@@ -83,7 +83,7 @@ down to a favicon.
 
 ```
 ┌───────────────────────────────────────────────── titlebar ─────────────┐
-│ ● ● ●   N Niutero — BibVault     [Classic·Reader·Board]        ☾ theme  │
+│ N Niutero — BibVault     [Classic·Reader·Board]      ☾ theme   ─ □ ✕ │
 ├──────┬──────────────────────────────────────────────────────────────────┤
 │ rail │                                                                    │
 │  N   │                       active tool body                            │
@@ -97,8 +97,9 @@ down to a favicon.
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Titlebar:** traffic-light dots (decorative), logo + "Niutero — {library}",
-  a centered **view switcher** (Library only), and a **theme toggle**.
+- **Titlebar:** logo + "Niutero — {library}", a centered **view switcher**
+  (Library only), a **theme toggle**, and **Windows window controls**
+  (minimize / maximize / close) flush to the top-right.
 - **Tool rail:** logo, four tool buttons (active = accent tint + 3px marker),
   and a **Sync** button pinned to the bottom.
 - **Status bar:** read-only — connector address (left), git branch + modified
@@ -261,7 +262,7 @@ segmented control · **text** = text input · **textarea** = multi-line input ·
 | icon-btn | Rail · Settings | Go to Settings tool |
 | icon-btn | Rail · Sync (bottom) | Commit & push library (mock) |
 | icon-btn | AI FAB (bottom-right) | Open/close AI popup |
-| — | 3 traffic-light dots | Decorative |
+| icon-btn | Win controls (titlebar, right) | Minimize / maximize / close (decorative) |
 | — | Status bar | Read-only (connector, git, count) |
 
 > A separate top-right **Light/Dark** pill exists outside the window (canvas

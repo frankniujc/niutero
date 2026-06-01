@@ -12,8 +12,8 @@
 //   • Settings rail button   — switch to Settings (onNav('settings')).
 //   • Sync button (bottom)   — push/pull the git-backed library (decorative here).
 // WindowChrome titlebar:
-//   • 3 traffic-light dots   — macOS window close/min/zoom (decorative).
 //   • Theme toggle (sun/moon)— flip light <-> dark for the whole app.
+//   • Win controls (right)   — minimize / maximize / close (decorative; Windows-style).
 //   • `center` slot          — hosts the Library view switcher (see FullApp).
 // StatusBar (bottom): read-only status — connector address, git branch,
 //   modified flag, entry count. No interactive buttons.
@@ -66,7 +66,6 @@
   /* window titlebar */
   .niu-tb{height:38px;flex:0 0 38px;display:flex;align-items:center;gap:8px;padding:0 14px;
     background:var(--surface);border-bottom:1px solid var(--border);}
-  .niu-dot{width:11px;height:11px;border-radius:50%;}
   .niu-tb-title{font-size:12.5px;font-weight:600;color:var(--text-2);letter-spacing:.01em;
     margin-left:6px;display:flex;align-items:center;gap:7px;}
   .niu-body{flex:1;display:flex;min-height:0;}
@@ -95,6 +94,13 @@
   .niu-icbtn{width:32px;height:32px;border-radius:8px;border:1px solid transparent;background:transparent;
     color:var(--muted);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:background .12s,color .12s;}
   .niu-icbtn:hover{background:var(--surface-2);color:var(--text);}
+  /* Windows window controls: flush to the top-right edge, full titlebar height,
+     no radius (the rounded window corner clips the close button). */
+  .niu-wctls{display:flex;align-items:stretch;height:38px;margin-left:6px;margin-right:-14px;}
+  .niu-wctl{width:46px;height:38px;border:none;background:transparent;color:var(--text-2);
+    display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:background .12s,color .12s;}
+  .niu-wctl:hover{background:var(--surface-2);color:var(--text);}
+  .niu-wctl.close:hover{background:#E81123;color:#fff;}
   .niu-search{flex:1;height:34px;display:flex;align-items:center;gap:9px;padding:0 12px;border-radius:9px;
     background:var(--surface-2);border:1px solid transparent;color:var(--muted);transition:border-color .14s,background .14s;}
   .niu-search:focus-within{border-color:var(--accent);background:var(--surface);}
@@ -216,6 +222,10 @@ const Icon = {
   arrowRight: (p={}) => I({ ...p, children: React.createElement('path', { d: 'M5 12h14M13 6l6 6-6 6' }) }),
   trash: (p={}) => I({ ...p, children: React.createElement('path', { d: 'M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13' }) }),
   close: (p={}) => I({ ...p, children: React.createElement('path', { d: 'M6 6l12 12M18 6L6 18' }) }),
+  // Windows window-control glyphs (thinner stroke, square corners to read as OS chrome).
+  winMin: (p={}) => I({ ...p, w: 1.3, children: React.createElement('path', { d: 'M5 12h14', strokeLinecap: 'square' }) }),
+  winMax: (p={}) => I({ ...p, w: 1.3, children: React.createElement('rect', { x: 5.5, y: 5.5, width: 13, height: 13, rx: 0.5, strokeLinejoin: 'miter' }) }),
+  winClose: (p={}) => I({ ...p, w: 1.3, children: React.createElement('path', { d: 'M6 6l12 12M18 6L6 18', strokeLinecap: 'square' }) }),
   chat: (p={}) => I({ ...p, children: React.createElement('path', { d: 'M21 12a8 8 0 0 1-11.5 7.2L4 20l1-4.5A8 8 0 1 1 21 12z' }) }),
   expand: (p={}) => I({ ...p, children: React.createElement('path', { d: 'M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5' }) }),
   pause: (p={}) => I({ ...p, children: React.createElement('path', { d: 'M8 5v14M16 5v14' }) }),
@@ -418,10 +428,7 @@ function WindowChrome({ theme, setTheme, children, libName, active, onNav, entri
   return React.createElement('div', { className: 'niu', 'data-theme': theme, style: { width: '100%', height: '100%' } },
     React.createElement('div', { className: 'niu-win', style: { position: 'relative' } },
       React.createElement('div', { className: 'niu-tb' },
-        React.createElement('div', { className: 'niu-dot', style: { background: '#F0584E' } }),
-        React.createElement('div', { className: 'niu-dot', style: { background: '#F5BC4F' } }),
-        React.createElement('div', { className: 'niu-dot', style: { background: '#5FC159' } }),
-        React.createElement('div', { className: 'niu-tb-title' },
+        React.createElement('div', { className: 'niu-tb-title', style: { marginLeft: 0 } },
           React.createElement('span', { style: { display: 'inline-flex', width: 20, height: 20, borderRadius: 6, background: 'var(--accent)', color: '#fff', alignItems: 'center', justifyContent: 'center', flex: '0 0 auto', overflow: 'hidden' } },
             React.createElement('span', { style: { fontFamily: 'var(--serif)', fontWeight: 500, fontSize: 13, lineHeight: 1, transform: 'translateY(1px)' } }, 'N')),
           React.createElement('span', { style: { fontFamily: 'var(--serif)', fontWeight: 500, color: 'var(--text)', marginLeft: 7 } }, 'Niutero'),
@@ -435,6 +442,12 @@ function WindowChrome({ theme, setTheme, children, libName, active, onNav, entri
           className: 'niu-icbtn', title: 'Toggle theme',
           onClick: () => setTheme(theme === 'dark' ? 'light' : 'dark'),
         }, theme === 'dark' ? Icon.sun({ s: 17 }) : Icon.moon({ s: 17 })),
+        // Windows window controls (decorative in the mockup): minimize / maximize / close.
+        React.createElement('div', { className: 'niu-wctls' },
+          React.createElement('button', { className: 'niu-wctl', title: 'Minimize' }, Icon.winMin({ s: 15 })),
+          React.createElement('button', { className: 'niu-wctl', title: 'Maximize' }, Icon.winMax({ s: 14 })),
+          React.createElement('button', { className: 'niu-wctl close', title: 'Close' }, Icon.winClose({ s: 15 })),
+        ),
       ),
       React.createElement('div', { className: 'niu-body' },
         React.createElement(ToolRail, { active: active || 'library', onNav }),

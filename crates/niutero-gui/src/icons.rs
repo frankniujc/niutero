@@ -28,13 +28,17 @@ pub enum Glyph {
     Star,
     StarFilled,
     Doc,
+    Folder,
     Book,
     Attach,
     Lock,
     Unlock,
     Close,
+    WinMinimize,
+    WinMaximize,
     ChevronRight,
     ChevronDown,
+    ChevronUp,
     Rows,
     More,
     Quote,
@@ -120,6 +124,9 @@ const DOC: &str = svg!(
     "<path d='M6 3h8l4 4v14H6z'/>",
     "<path d='M14 3v4h4M9 13h6M9 17h6' stroke-width='1.3'/>"
 );
+const FOLDER: &str = svg!(
+    "<path d='M4 6.5A1.5 1.5 0 0 1 5.5 5h3.3a1.5 1.5 0 0 1 1.2.6L11.2 7H18.5A1.5 1.5 0 0 1 20 8.5V17.5A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z'/>",
+);
 const BOOK: &str = svg!(
     "<path d='M4 5a2 2 0 0 1 2-2h6v16H6a2 2 0 0 0-2 2zM20 5a2 2 0 0 0-2-2h-6v16h6a2 2 0 0 1 2 2z'/>",
 );
@@ -131,8 +138,13 @@ const LOCK: &str =
 const UNLOCK: &str =
     svg!("<rect x='5' y='11' width='14' height='9' rx='2'/><path d='M8 11V8a4 4 0 0 1 7.5-2'/>");
 const CLOSE: &str = svg!("<path d='M6 6l12 12M18 6L6 18'/>");
+// Windows window-control glyphs: thinner stroke + square corners to read as OS chrome.
+const WIN_MINIMIZE: &str = svg!("<path d='M5 12h14' stroke-width='1.3' stroke-linecap='square'/>");
+const WIN_MAXIMIZE: &str =
+    svg!("<rect x='5.5' y='5.5' width='13' height='13' rx='1' stroke-width='1.3' stroke-linejoin='miter'/>");
 const CHEVRON_RIGHT: &str = svg!("<path d='M9 6l6 6-6 6'/>");
 const CHEVRON_DOWN: &str = svg!("<path d='M6 9l6 6 6-6'/>");
+const CHEVRON_UP: &str = svg!("<path d='M6 15l6-6 6 6'/>");
 const ROWS: &str = svg!("<path d='M4 6h16M4 12h16M4 18h16'/>");
 // Three filled dots (overflow) — fill, no stroke.
 const MORE: &str = concat!(
@@ -204,13 +216,17 @@ fn source(g: Glyph) -> (&'static str, &'static str) {
         Glyph::Star => ("bytes://niu-star.svg", STAR),
         Glyph::StarFilled => ("bytes://niu-star-filled.svg", STAR_FILLED),
         Glyph::Doc => ("bytes://niu-doc.svg", DOC),
+        Glyph::Folder => ("bytes://niu-folder.svg", FOLDER),
         Glyph::Book => ("bytes://niu-book.svg", BOOK),
         Glyph::Attach => ("bytes://niu-attach.svg", ATTACH),
         Glyph::Lock => ("bytes://niu-lock.svg", LOCK),
         Glyph::Unlock => ("bytes://niu-unlock.svg", UNLOCK),
         Glyph::Close => ("bytes://niu-close.svg", CLOSE),
+        Glyph::WinMinimize => ("bytes://niu-win-minimize.svg", WIN_MINIMIZE),
+        Glyph::WinMaximize => ("bytes://niu-win-maximize.svg", WIN_MAXIMIZE),
         Glyph::ChevronRight => ("bytes://niu-chevron-right.svg", CHEVRON_RIGHT),
         Glyph::ChevronDown => ("bytes://niu-chevron-down.svg", CHEVRON_DOWN),
+        Glyph::ChevronUp => ("bytes://niu-chevron-up.svg", CHEVRON_UP),
         Glyph::Rows => ("bytes://niu-rows.svg", ROWS),
         Glyph::More => ("bytes://niu-more.svg", MORE),
         Glyph::Quote => ("bytes://niu-quote.svg", QUOTE),

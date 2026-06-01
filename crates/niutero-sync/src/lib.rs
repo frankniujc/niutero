@@ -25,6 +25,23 @@ pub fn is_repo(dir: &Path) -> bool {
     run(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|o| o.status.success())
 }
 
+/// The current branch name (e.g. `"main"`). `None` if `dir` isn't a repo, `git`
+/// is unavailable, or HEAD is detached (which reports the literal `"HEAD"`).
+pub fn current_branch(dir: &Path) -> Option<String> {
+    let name = ok(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    (name != "HEAD").then_some(name)
+}
+
+/// Whether the working tree has uncommitted changes — tracked modifications,
+/// staged changes, or untracked files. `false` if the tree is clean, `dir`
+/// isn't a repo, or `git` is unavailable.
+pub fn is_dirty(dir: &Path) -> bool {
+    ok(dir, &["status", "--porcelain"]).is_ok_and(|s| !s.trim().is_empty())
+}
+
 /// `git init` in `dir`.
 pub fn init(dir: &Path) -> Result<(), String> {
     ok(dir, &["init"]).map(|_| ())
@@ -255,6 +272,27 @@ mod tests {
             remote_url(d.path(), "origin").as_deref(),
             Some("https://example.com/other.git")
         );
+    }
+
+    #[test]
+    fn branch_and_dirty_reflect_the_working_tree() {
+        if !git_available() {
+            return;
+        }
+        let d = repo();
+        // Fresh repo, no commits: a non-repo dir has no branch/dirty signal.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(current_branch(plain.path()), None);
+        assert!(!is_dirty(plain.path()));
+
+        // Untracked file → dirty.
+        std::fs::write(d.path().join("a.txt"), "hi").unwrap();
+        assert!(is_dirty(d.path()));
+        // After committing, the tree is clean again and a branch exists.
+        commit_all(d.path(), "first").unwrap();
+        assert!(!is_dirty(d.path()));
+        let branch = current_branch(d.path()).expect("a branch after first commit");
+        assert!(matches!(branch.as_str(), "main" | "master"));
     }
 
     #[test]

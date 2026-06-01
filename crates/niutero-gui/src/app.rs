@@ -93,6 +93,15 @@ pub struct NiuteroApp {
     task: Option<TaskState>,
     /// Transient one-line confirmation (e.g. "Copied citation"), shown briefly.
     toast: Option<String>,
+    /// Auto-dismiss bookkeeping for `toast`: the message currently being timed
+    /// and the `ctx` time at which it should vanish. A change in `toast` (re)arms
+    /// the deadline, so the many `self.toast = Some(..)` sites stay timer-free.
+    toast_shown: Option<String>,
+    toast_deadline: Option<f64>,
+    /// Cached git branch/dirty state of the open vault, for the status bar.
+    /// `None` when no library is open or the vault isn't a git repo. Refreshed
+    /// on library (re)load and after each edit — never recomputed per frame.
+    git: Option<engine::GitStatus>,
 }
 
 impl NiuteroApp {
@@ -158,6 +167,9 @@ impl NiuteroApp {
             Ok("rekey") => NormView::Rekey,
             _ => NormView::Overview,
         };
+        let git = library
+            .as_ref()
+            .and_then(|l| engine::git_status(&l.vault.root));
         NiuteroApp {
             dark: false,
             tool,
@@ -177,7 +189,20 @@ impl NiuteroApp {
             ai_popup_input: String::new(),
             task,
             toast: None,
+            toast_shown: None,
+            toast_deadline: None,
+            git,
         }
+    }
+
+    /// Recompute the cached git branch/dirty state from the open vault. Cheap
+    /// enough for load/edit boundaries (two `git` calls), but must not run per
+    /// frame. `None` when no library is open or the vault isn't a git repo.
+    fn refresh_git(&mut self) {
+        self.git = self
+            .library
+            .as_ref()
+            .and_then(|l| engine::git_status(&l.vault.root));
     }
 
     fn lib_name(&self) -> String {
@@ -215,6 +240,7 @@ impl NiuteroApp {
                 self.library = None;
             }
         }
+        self.refresh_git();
     }
 
     /// Apply a library pick from the titlebar menu / empty state.
@@ -240,9 +266,43 @@ fn pick_folder(title: &str) -> Option<PathBuf> {
     rfd::FileDialog::new().set_title(title).pick_folder()
 }
 
+/// Display a path with the user's home directory collapsed to `~` (keeping
+/// native separators) — the status bar shows `~\papers\bibvault` rather than a
+/// long absolute path. Falls back to the full path when it isn't under home.
+fn compact_path(p: &std::path::Path) -> String {
+    if let Some(home) = home_dir() {
+        if let Ok(rest) = p.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display());
+        }
+    }
+    p.display().to_string()
+}
+
+/// The user's home directory from the environment (`USERPROFILE` on Windows,
+/// `HOME` elsewhere). `None` if neither is set.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
 /// The library switcher menu: recent libraries + open/new.
-fn library_menu(ui: &mut egui::Ui, theme: &Theme, pick: &mut Option<VaultPick>) {
-    ui.set_min_width(280.0);
+///
+/// Each recent row carries a small "×" that *unbinds* the vault from this
+/// machine's registry ([`engine::forget_vault`]) — it removes the entry from the
+/// recent list only and never touches the vault folder on disk. Forgetting is
+/// done inline (the menu stays open) so several stale test vaults can be cleared
+/// in one pass; `toast` carries any error back to the caller.
+fn library_menu(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    pick: &mut Option<VaultPick>,
+    toast: &mut Option<String>,
+) {
+    ui.set_min_width(300.0);
     ui.label(
         RichText::new("RECENT LIBRARIES")
             .size(10.5)
@@ -260,12 +320,34 @@ fn library_menu(ui: &mut egui::Ui, theme: &Theme, pick: &mut Option<VaultPick>) 
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("(library)");
-        let resp = ui
-            .add(egui::Button::new(RichText::new(name).size(13.0).color(theme.text)).frame(false))
-            .on_hover_text(rv.path.display().to_string());
-        if resp.clicked() {
-            *pick = Some(VaultPick::Open(rv.path.clone()));
-        }
+        ui.horizontal(|ui| {
+            let resp = ui
+                .add(
+                    egui::Button::new(RichText::new(name).size(13.0).color(theme.text))
+                        .frame(false),
+                )
+                .on_hover_text(rv.path.display().to_string());
+            if resp.clicked() {
+                *pick = Some(VaultPick::Open(rv.path.clone()));
+            }
+            // Unbind "×" pinned to the right edge — registry-only, no file delete.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let x = ui
+                    .add(
+                        icons::image(Glyph::Close, theme.faint)
+                            .fit_to_exact_size(egui::Vec2::splat(13.0))
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Remove from recent — unbinds it here, keeps all files");
+                if x.clicked() {
+                    if let Err(e) = engine::forget_vault(&rv.path) {
+                        *toast = Some(e);
+                    } else {
+                        *toast = Some(format!("Removed “{name}” from recent"));
+                    }
+                }
+            });
+        });
     }
     ui.separator();
     if ui
@@ -343,6 +425,26 @@ impl eframe::App for NiuteroApp {
         // Floating overlays: AI FAB + popup (bottom-right), task toast (bottom-left).
         self.overlays(ctx, &theme);
 
+        // Auto-dismiss the transient toast ~2.5s after it appears. A new message
+        // is detected by comparing against the one last shown, which (re)arms the
+        // deadline; we request a repaint so it clears on its own without needing
+        // further interaction (egui otherwise idles between input events).
+        let now = ctx.input(|i| i.time);
+        if self.toast != self.toast_shown {
+            self.toast_shown = self.toast.clone();
+            self.toast_deadline = self.toast.as_ref().map(|_| now + 2.5);
+        }
+        if let Some(deadline) = self.toast_deadline {
+            let remaining = deadline - now;
+            if remaining <= 0.0 {
+                self.toast = None;
+                self.toast_shown = None;
+                self.toast_deadline = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+            }
+        }
+
         // Transient toast (bottom-center).
         if let Some(msg) = self.toast.clone() {
             egui::Area::new("niu-toast".into())
@@ -382,10 +484,9 @@ impl NiuteroApp {
         );
 
         let mut pick: Option<VaultPick> = None;
+        let mut menu_toast: Option<String> = None;
         ui.horizontal_centered(|ui| {
-            ui.add_space(2.0);
-            self.window_controls(ui);
-            ui.add_space(8.0);
+            ui.add_space(14.0);
             niu_mark(ui, theme, 20.0);
             ui.add_space(7.0);
             ui.label(
@@ -400,7 +501,7 @@ impl NiuteroApp {
                 RichText::new(self.lib_name())
                     .color(theme.text_2)
                     .size(12.5),
-                |ui| library_menu(ui, theme, &mut pick),
+                |ui| library_menu(ui, theme, &mut pick, &mut menu_toast),
             );
 
             // centered view switcher (Library only)
@@ -411,6 +512,8 @@ impl NiuteroApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.window_controls(ui, theme);
+                ui.add_space(4.0);
                 let g = if self.dark { Glyph::Sun } else { Glyph::Moon };
                 if icbtn(ui, theme, g).on_hover_text("Toggle theme").clicked() {
                     self.dark = !self.dark;
@@ -421,42 +524,38 @@ impl NiuteroApp {
         if let Some(p) = pick {
             self.apply_vault_pick(p);
         }
+        if menu_toast.is_some() {
+            self.toast = menu_toast;
+        }
     }
 
-    /// macOS-style traffic lights — functional in a frameless window.
-    fn window_controls(&self, ui: &mut egui::Ui) {
-        let dot = |ui: &mut egui::Ui, color: Color32| -> egui::Response {
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::click());
-            let c = if resp.hovered() {
-                color
-            } else {
-                color.gamma_multiply(0.92)
-            };
-            ui.painter().circle_filled(rect.center(), 5.5, c);
-            resp
-        };
-        if dot(ui, Color32::from_rgb(0xF0, 0x58, 0x4E))
+    /// Windows-style window controls — minimize / maximize / close, flush to the
+    /// top-right of the titlebar. Functional in this frameless window. Called
+    /// inside a right-to-left layout, so the first button added sits rightmost:
+    /// Close (rightmost) → Maximize → Minimize.
+    fn window_controls(&self, ui: &mut egui::Ui, theme: &Theme) {
+        // Buttons abut with no gap, like native Windows controls.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if win_control(ui, theme, Glyph::Close, true)
             .on_hover_text("Close")
             .clicked()
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        ui.add_space(4.0);
-        if dot(ui, Color32::from_rgb(0xF5, 0xBC, 0x4F))
-            .on_hover_text("Minimize")
-            .clicked()
-        {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-        }
-        ui.add_space(4.0);
-        if dot(ui, Color32::from_rgb(0x5F, 0xC1, 0x59))
-            .on_hover_text("Zoom")
+        if win_control(ui, theme, Glyph::WinMaximize, false)
+            .on_hover_text("Maximize")
             .clicked()
         {
             let max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+        }
+        if win_control(ui, theme, Glyph::WinMinimize, false)
+            .on_hover_text("Minimize")
+            .clicked()
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
     }
 
@@ -517,29 +616,43 @@ impl NiuteroApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.horizontal_centered(|ui| {
-            let dot = ui
-                .allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover())
-                .0;
-            ui.painter().circle_filled(dot.center(), 3.5, theme.accent);
-            ui.label(
-                RichText::new("connector · 127.0.0.1:23510")
-                    .font(theme::mono(11.0))
-                    .color(theme.muted),
-            );
+            // Left: the open library's real folder path. Nothing when none open.
+            if let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) {
+                icons::show(ui, Glyph::Folder, 13.0, theme.muted);
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(compact_path(&root))
+                        .font(theme::mono(11.0))
+                        .color(theme.muted),
+                )
+                .on_hover_text(root.display().to_string());
+            }
+            // Right: git branch + dirty + entry count — all real. The git half is
+            // omitted entirely when the vault isn't a git repository.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let sep = |ui: &mut egui::Ui| {
+                    ui.label(RichText::new("·").color(theme.faint));
+                };
                 ui.label(
                     RichText::new(format!("{} entries", self.entry_count()))
                         .color(theme.muted)
                         .size(11.5),
                 );
-                ui.label(RichText::new("·").color(theme.faint));
-                ui.label(RichText::new("modified").color(theme.text_2).size(11.5));
-                ui.label(
-                    RichText::new("main")
-                        .font(theme::mono(11.0))
-                        .color(theme.muted),
-                );
-                icons::show(ui, Glyph::Branch, 13.0, theme.muted);
+                if let Some(git) = self.git.as_ref() {
+                    if git.dirty {
+                        sep(ui);
+                        ui.label(RichText::new("modified").color(theme.text_2).size(11.5));
+                    }
+                    if let Some(branch) = git.branch.as_deref() {
+                        sep(ui);
+                        ui.label(
+                            RichText::new(branch.to_owned())
+                                .font(theme::mono(11.0))
+                                .color(theme.muted),
+                        );
+                        icons::show(ui, Glyph::Branch, 13.0, theme.muted);
+                    }
+                }
             });
         });
     }
@@ -677,6 +790,9 @@ impl NiuteroApp {
                 Err(e) => self.toast = Some(e),
             },
         }
+        // Mutating actions write through to the .bib, dirtying the git work
+        // tree; refresh the cached state so the status bar stays truthful.
+        self.git = engine::git_status(&lib.vault.root);
     }
 
     // ------------------------------------------------------------- Normalize
@@ -1126,6 +1242,31 @@ fn icbtn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
             .rect_filled(rect, egui::CornerRadius::same(8), theme.surface_2);
     }
     icons::paint_at(ui, rect.shrink(8.0), glyph, theme.muted);
+    resp
+}
+
+/// A Windows-style window control: full titlebar height, square corners, flush
+/// to its neighbours. `danger` (the close button) hovers Windows-red with a
+/// white glyph; the others hover with the neutral surface tint.
+fn win_control(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph, danger: bool) -> egui::Response {
+    let h = ui.max_rect().height();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, h), egui::Sense::click());
+    let glyph_color = if resp.hovered() {
+        if danger { Color32::WHITE } else { theme.text }
+    } else {
+        theme.text_2
+    };
+    if resp.hovered() {
+        let bg = if danger {
+            Color32::from_rgb(0xE8, 0x11, 0x23)
+        } else {
+            theme.surface_2
+        };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(0), bg);
+    }
+    let g = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(16.0));
+    icons::paint_at(ui, g, glyph, glyph_color);
     resp
 }
 
