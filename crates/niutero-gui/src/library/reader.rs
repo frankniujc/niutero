@@ -53,7 +53,7 @@ pub fn reader(
             .exact_width(340.0)
             .resizable(false)
             .frame(egui::Frame::default().fill(theme.bg))
-            .show(ctx, |ui| card_list(ui, theme, entries, st));
+            .show(ctx, |ui| card_list(ui, theme, entries, st, actions));
     }
 
     egui::CentralPanel::default()
@@ -99,7 +99,7 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
             super::ensure_tag_groups(st, entries);
             let groups = std::mem::take(&mut st.tag_groups_cache);
             for (label, tags) in &groups {
-                section_label(ui, theme, label);
+                crate::widgets::section_label(ui, theme, label, 4.0, 2.0);
                 for (full, value, count, color) in tags {
                     let on = st.active_tag.as_deref() == Some(full.as_str());
                     if tag_row(ui, theme, value, *color, on, *count) {
@@ -112,7 +112,7 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
             st.tag_groups_cache = groups;
 
             // Reading status — display + filter (Reader-only section, spec §4·B).
-            section_label(ui, theme, "Reading status");
+            crate::widgets::section_label(ui, theme, "Reading status", 4.0, 2.0);
             for (label, key) in [
                 ("Unread", "unread"),
                 ("Reading", "reading"),
@@ -127,17 +127,6 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
                 }
             }
         });
-}
-
-fn section_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(text.to_uppercase())
-            .size(11.0)
-            .strong()
-            .color(theme.muted),
-    );
-    ui.add_space(2.0);
 }
 
 /// A 34px nav row with an optional leading icon (used for "All Entries").
@@ -231,7 +220,13 @@ fn tag_row(
 
 // ----------------------------------------------------------------- card list
 
-fn card_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut LibState) {
+fn card_list(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    entries: &[EntryView],
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
     // Header: search box + a status line ("N items · sorted by date added").
     egui::Frame::default()
         .inner_margin(egui::Margin {
@@ -327,10 +322,12 @@ fn card_list(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mut L
                         .max_rect(card_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
-                if item_card(&mut card_ui, theme, e, sel) {
+                let resp = item_card(&mut card_ui, theme, e, sel);
+                if resp.clicked() || resp.secondary_clicked() {
                     st.selected = Some(e.citekey.clone());
                     st.buffers_for = None; // reload edit buffers for the new pick
                 }
+                resp.context_menu(|ui| super::entry_context_menu(ui, e, actions));
             }
         });
 }
@@ -364,8 +361,9 @@ fn filter_menu(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
     }
 }
 
-/// A paper card: type badge · status · 2-line serif title · creator.
-fn item_card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> bool {
+/// A paper card: type badge · status · 2-line serif title · creator. Returns
+/// its click `Response` (for selection + context menu).
+fn item_card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> egui::Response {
     let resp = egui::Frame::default()
         .fill(if selected {
             theme.accent_tint
@@ -435,13 +433,11 @@ fn item_card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) ->
                     .color(theme.text_2),
             );
         });
-    let r = ui.interact(
+    ui.interact(
         resp.response.rect,
         ui.id().with(("reader-card", &e.citekey)),
         egui::Sense::click(),
-    );
-    ui.add_space(8.0);
-    r.clicked()
+    )
 }
 
 // ---------------------------------------------------------------- reading pane

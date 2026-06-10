@@ -8,7 +8,7 @@
 use eframe::egui::{self, Color32, RichText};
 
 use crate::icons::{self, Glyph};
-use crate::theme::Theme;
+use crate::theme::{self, Theme};
 
 /// A vertical `SubNav` item (38px): optional icon · label · optional count
 /// badge. Active = accent-tint fill + accent text. Returns whether clicked.
@@ -304,4 +304,137 @@ pub fn centered_column<R>(
         });
     });
     out.unwrap()
+}
+
+// ------------------------------------------------- shared tiny helpers
+// One canonical copy each of the small helpers that had drifted into several
+// modules (app titlebar, overlays, tags, settings, library views); the copies
+// differed only in dimensions, which are parameters here.
+
+/// A transparent square icon button: `size`×`size`, glyph inset by `inset` on
+/// every side, soft surface tint on hover (titlebar / modal / popup chrome).
+pub fn icbtn(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    glyph: Glyph,
+    size: f32,
+    inset: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(8), theme.surface_2);
+    }
+    icons::paint_at(ui, rect.shrink(inset), glyph, theme.muted);
+    resp
+}
+
+/// A primary pill button (accent fill, white icon + label).
+pub fn pri_btn(ui: &mut egui::Ui, theme: &Theme, icon: Glyph, label: &str) -> egui::Response {
+    egui::Frame::default()
+        .fill(theme.accent)
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(12, 7))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::show(ui, icon, 16.0, Color32::WHITE);
+                ui.label(
+                    RichText::new(label)
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+            });
+        })
+        .response
+        .interact(egui::Sense::click())
+}
+
+/// A `size`×`size` color swatch (8px radius); when `on`, a same-color ring is
+/// drawn `ring` outside the rect. Returns whether clicked.
+pub fn swatch(ui: &mut egui::Ui, c: Color32, on: bool, size: f32, ring: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(8), c);
+    if on {
+        ui.painter().rect_stroke(
+            rect.expand(ring),
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(2.0, c),
+            egui::StrokeKind::Outside,
+        );
+    }
+    resp.clicked()
+}
+
+/// An uppercase 11px section label, with `above`/`below` spacing around it.
+pub fn section_label(ui: &mut egui::Ui, theme: &Theme, text: &str, above: f32, below: f32) {
+    ui.add_space(above);
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(11.0)
+            .strong()
+            .color(theme.muted),
+    );
+    ui.add_space(below);
+}
+
+/// "y" / "ies" suffix for an entry count ("entr{}").
+pub fn plural_y(n: usize) -> &'static str {
+    if n == 1 {
+        "y"
+    } else {
+        "ies"
+    }
+}
+
+/// A bordered single-line text input (`niu-mono` when `mono`). Returns the edit
+/// `Response` so the caller can persist on `lost_focus()`.
+pub fn text_input(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut String,
+    mono: bool,
+) -> egui::Response {
+    framed_input(ui, theme, buf, mono, false, "")
+}
+
+/// A masked text input for secrets (API keys / tokens) — [`text_input`] with
+/// the mono font and `.password(true)`.
+pub fn password_input(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut String,
+    hint: &str,
+) -> egui::Response {
+    framed_input(ui, theme, buf, true, true, hint)
+}
+
+fn framed_input(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut String,
+    mono: bool,
+    password: bool,
+    hint: &str,
+) -> egui::Response {
+    let mut resp = None;
+    egui::Frame::default()
+        .fill(theme.surface)
+        .stroke(egui::Stroke::new(1.0, theme.border))
+        .corner_radius(9.0)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(280.0);
+            let mut te = egui::TextEdit::singleline(buf)
+                .password(password)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY)
+                .frame(false);
+            if mono {
+                te = te.font(theme::mono(12.5));
+            }
+            resp = Some(ui.add(te));
+        });
+    resp.unwrap()
 }

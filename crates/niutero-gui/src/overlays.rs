@@ -4,8 +4,9 @@
 //!
 //! These are pure chrome over app state; user intent comes back as
 //! [`OverlayMsg`]s the app applies (toggle popup, open the full AI tab, jump to
-//! Review, dismiss the task, …). The popup chat is the same honest preview as
-//! the AI tab — citation chips jump to real entries.
+//! Review, dismiss the task, …). The popup chat renders the same live
+//! conversation as the AI tab (they share `ai`) — citation chips jump to real
+//! entries, and sending asks the model off-thread.
 
 use eframe::egui::{self, Color32, RichText};
 use niutero_engine::EntryView;
@@ -59,14 +60,17 @@ pub enum OverlayMsg {
     OpenAiTab,
     CloseAi,
     OpenEntry(String),
+    /// Ask the model a question from the popup composer (grounded, off-thread).
+    Ask(String),
     DismissTask,
     /// Request cancellation of the running background job.
     CancelTask,
-    Toast(String),
 }
 
 /// Draw the overlays. `ai_open` is the popup's open state; `task` the running
-/// background task (if any); `popup_input` the popup composer buffer.
+/// background task (if any); `popup_input` the popup composer buffer; `ai` the
+/// shared chat state (the popup renders the same conversation as the AI tab).
+#[allow(clippy::too_many_arguments)]
 pub fn overlays(
     ctx: &egui::Context,
     theme: &Theme,
@@ -74,13 +78,16 @@ pub fn overlays(
     ai_open: bool,
     task: Option<&TaskState>,
     popup_input: &mut String,
+    ai: &ai::AiState,
     msgs: &mut Vec<OverlayMsg>,
 ) {
     // AI popup panel (above the FAB), when open.
     if ai_open {
         egui::Area::new("niu-ai-popup".into())
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-22.0, -104.0))
-            .show(ctx, |ui| popup_panel(ui, theme, entries, popup_input, msgs));
+            .show(ctx, |ui| {
+                popup_panel(ui, theme, entries, popup_input, ai, msgs)
+            });
     }
 
     // FAB (bottom-right).
@@ -116,6 +123,7 @@ fn popup_panel(
     theme: &Theme,
     entries: &[EntryView],
     input: &mut String,
+    ai: &ai::AiState,
     msgs: &mut Vec<OverlayMsg>,
 ) {
     egui::Frame::default()
@@ -160,10 +168,11 @@ fn popup_panel(
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if icbtn(ui, theme, Glyph::Close).clicked() {
+                                    if widgets::icbtn(ui, theme, Glyph::Close, 28.0, 7.0).clicked()
+                                    {
                                         msgs.push(OverlayMsg::CloseAi);
                                     }
-                                    if icbtn(ui, theme, Glyph::Expand)
+                                    if widgets::icbtn(ui, theme, Glyph::Expand, 28.0, 7.0)
                                         .on_hover_text("Open full tab")
                                         .clicked()
                                     {
@@ -179,92 +188,16 @@ fn popup_panel(
                     egui::Stroke::new(1.0, theme.border_2),
                 );
 
-                // chat (scroll), fills the middle
-                let cited = ai::grounding_entries(entries);
+                // chat (scroll), fills the middle — the same live conversation as
+                // the full AI tab (they share `ai`).
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height(330.0)
+                    .stick_to_bottom(true)
                     .show(ui, |ui| {
                         egui::Frame::default()
                             .inner_margin(egui::Margin::same(16))
-                            .show(ui, |ui| {
-                                ai::user_bubble(
-                                    ui,
-                                    theme,
-                                    "Any SAE unlearning papers I haven't tagged yet?",
-                                );
-                                ui.add_space(16.0);
-                                ai::assistant_row(ui, theme, |ui| {
-                                    if cited.is_empty() {
-                                        ui.label(
-                                            RichText::new("Nothing in the library yet.")
-                                                .size(13.5)
-                                                .color(theme.text),
-                                        );
-                                        return;
-                                    }
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} match but could use ",
-                                            cited.len()
-                                        ))
-                                        .size(13.5)
-                                        .color(theme.text),
-                                    );
-                                    ui.label(
-                                        RichText::new("wf:to-cite")
-                                            .size(13.5)
-                                            .strong()
-                                            .color(theme.accent),
-                                    );
-                                    ui.add_space(6.0);
-                                    for e in &cited {
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new("•").color(theme.muted));
-                                            if ai::cite_chip(ui, theme, &ai::cite_label(e))
-                                                .clicked()
-                                            {
-                                                msgs.push(OverlayMsg::OpenEntry(e.citekey.clone()));
-                                            }
-                                        });
-                                    }
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new("Want me to tag them?")
-                                            .size(13.5)
-                                            .color(theme.text),
-                                    );
-                                    ui.add_space(11.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        if widgets::button(
-                                            ui,
-                                            theme,
-                                            Some(Glyph::Tag),
-                                            "Tag both",
-                                            false,
-                                            28.0,
-                                        )
-                                        .clicked()
-                                        {
-                                            msgs.push(OverlayMsg::Toast(
-                                                "Bulk-tag needs a connected model (preview)".into(),
-                                            ));
-                                        }
-                                        if widgets::button(
-                                            ui,
-                                            theme,
-                                            None,
-                                            "Show in list",
-                                            false,
-                                            28.0,
-                                        )
-                                        .clicked()
-                                        {
-                                            msgs.push(OverlayMsg::OpenAiTab);
-                                        }
-                                    });
-                                });
-                            });
+                            .show(ui, |ui| popup_thread(ui, theme, entries, ai, msgs));
                     });
 
                 // footer input
@@ -287,12 +220,14 @@ fn popup_panel(
                             })
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.add(
+                                    let te = ui.add(
                                         egui::TextEdit::singleline(input)
                                             .hint_text("Ask across your library…")
                                             .desired_width(f32::INFINITY)
                                             .frame(false),
                                     );
+                                    let entered = te.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
                                     let (r, resp) = ui.allocate_exact_size(
                                         egui::vec2(32.0, 32.0),
                                         egui::Sense::click(),
@@ -303,17 +238,72 @@ fn popup_panel(
                                         theme.accent,
                                     );
                                     icons::paint_at(ui, r.shrink(9.0), Glyph::Send, Color32::WHITE);
-                                    if resp.clicked() && !input.trim().is_empty() {
-                                        msgs.push(OverlayMsg::Toast(
-                                            "No model connected yet (preview)".into(),
-                                        ));
-                                        input.clear();
+                                    if (resp.clicked() || entered) && !input.trim().is_empty() {
+                                        // Don't clear here: the app may refuse
+                                        // the ask (busy / no library) and the
+                                        // typed question must survive that. It
+                                        // clears the buffer once the job starts.
+                                        msgs.push(OverlayMsg::Ask(input.trim().to_string()));
                                     }
                                 });
                             });
                     });
             });
         });
+}
+
+/// The popup's compact rendering of the shared chat: empty-state hint, then the
+/// real turns (assistant answers surface citation chips), then a pending spinner.
+fn popup_thread(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    entries: &[EntryView],
+    ai: &ai::AiState,
+    msgs: &mut Vec<OverlayMsg>,
+) {
+    if ai.turns.is_empty() && !ai.pending {
+        ai::assistant_row(ui, theme, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Ask anything about your {} entries — I answer from your library.",
+                    entries.len()
+                ))
+                .size(13.5)
+                .color(theme.text),
+            );
+        });
+        return;
+    }
+    for t in &ai.turns {
+        if t.user {
+            ai::user_bubble(ui, theme, &t.text);
+        } else {
+            ai::assistant_row(ui, theme, |ui| {
+                ui.label(RichText::new(&t.text).size(13.5).color(theme.text));
+                let cited = ai::cited_in(&t.text, entries);
+                if !cited.is_empty() {
+                    ui.add_space(7.0);
+                    for e in &cited {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("•").color(theme.muted));
+                            if ai::cite_chip(ui, theme, &ai::cite_label(e)).clicked() {
+                                msgs.push(OverlayMsg::OpenEntry(e.citekey.clone()));
+                            }
+                        });
+                    }
+                }
+            });
+        }
+        ui.add_space(14.0);
+    }
+    if ai.pending {
+        ai::assistant_row(ui, theme, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(theme.accent));
+                ui.label(RichText::new("Thinking…").size(13.0).color(theme.muted));
+            });
+        });
+    }
 }
 
 // -------------------------------------------------------------- task toast
@@ -362,7 +352,7 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if done {
-                        if icbtn(ui, theme, Glyph::Close).clicked() {
+                        if widgets::icbtn(ui, theme, Glyph::Close, 28.0, 7.0).clicked() {
                             msgs.push(OverlayMsg::DismissTask);
                         }
                     } else {
@@ -415,15 +405,4 @@ fn task_toast(ui: &mut egui::Ui, theme: &Theme, t: &TaskState, msgs: &mut Vec<Ov
                 });
             }
         });
-}
-
-/// A 28×28 transparent icon button (popup/toast chrome).
-fn icbtn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(8), theme.surface_2);
-    }
-    icons::paint_at(ui, rect.shrink(7.0), glyph, theme.muted);
-    resp
 }

@@ -13,6 +13,26 @@ use crate::widgets;
 pub enum Dialog {
     NewEntry(NewEntryForm),
     AddByDoi(AddByDoiForm),
+    /// Confirm deleting an entry (`title` for the prompt).
+    ConfirmDelete {
+        key: String,
+        title: String,
+    },
+    /// Confirm a destructive whole-vocabulary tag operation (delete / merge):
+    /// one click rewrites every carrying entry's sidecar with no undo, so it
+    /// gets the same confirmation the entry delete does.
+    ConfirmTagOp {
+        title: String,
+        body: String,
+        confirm_label: String,
+        op: TagOp,
+    },
+}
+
+/// The tag operation pending confirmation in [`Dialog::ConfirmTagOp`].
+pub enum TagOp {
+    Delete(String),
+    Merge { from: String, into: String },
 }
 
 impl Dialog {
@@ -21,6 +41,17 @@ impl Dialog {
     }
     pub fn add_by_doi() -> Self {
         Dialog::AddByDoi(AddByDoiForm::default())
+    }
+    pub fn confirm_delete(key: String, title: String) -> Self {
+        Dialog::ConfirmDelete { key, title }
+    }
+    pub fn confirm_tag_op(title: String, body: String, confirm_label: String, op: TagOp) -> Self {
+        Dialog::ConfirmTagOp {
+            title,
+            body,
+            confirm_label,
+            op,
+        }
     }
 }
 
@@ -68,6 +99,10 @@ pub enum DialogOutcome {
     FetchDoi,
     /// Pick and import a local `.bib` file.
     ImportFile,
+    /// Confirm deletion of the entry in [`Dialog::ConfirmDelete`].
+    Delete,
+    /// Confirm the tag operation in [`Dialog::ConfirmTagOp`].
+    ApplyTagOp,
 }
 
 /// The common BibTeX entry types offered in the new-entry type picker.
@@ -87,6 +122,13 @@ pub fn dialog_ui(ctx: &egui::Context, theme: &Theme, dialog: &mut Dialog) -> Dia
         match dialog {
             Dialog::NewEntry(f) => new_entry_form(ui, theme, f),
             Dialog::AddByDoi(f) => add_by_doi_form(ui, theme, f),
+            Dialog::ConfirmDelete { title, .. } => confirm_delete_form(ui, theme, title),
+            Dialog::ConfirmTagOp {
+                title,
+                body,
+                confirm_label,
+                ..
+            } => confirm_tag_op_form(ui, theme, title, body, confirm_label),
         }
     });
     // Click-outside / Esc cancels, unless a button already decided the outcome.
@@ -197,6 +239,86 @@ fn add_by_doi_form(ui: &mut egui::Ui, theme: &Theme, f: &mut AddByDoiForm) -> Di
             }
             if (fetch || submit_doi) && !f.doi.trim().is_empty() {
                 outcome = DialogOutcome::FetchDoi;
+            }
+        });
+    });
+    outcome
+}
+
+fn confirm_delete_form(ui: &mut egui::Ui, theme: &Theme, title: &str) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Keep;
+    ui.label(
+        RichText::new("Delete entry?")
+            .size(17.0)
+            .strong()
+            .color(theme.text),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(crate::library::ellipsize(title, 80))
+            .font(crate::theme::serif(15.0))
+            .color(theme.text),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new("This removes it from references.bib and its tags/notes/status. It cannot be undone here.")
+            .size(12.0)
+            .color(theme.muted),
+    );
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Danger button: rose fill so it doesn't read as a safe primary action.
+            let del = egui::Button::new(
+                RichText::new("Delete")
+                    .size(13.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(theme.rose)
+            .corner_radius(8.0)
+            .min_size(egui::vec2(0.0, 32.0));
+            if ui.add(del).clicked() {
+                outcome = DialogOutcome::Delete;
+            }
+            if widgets::button(ui, theme, None, "Cancel", false, 32.0).clicked() {
+                outcome = DialogOutcome::Cancel;
+            }
+        });
+    });
+    outcome
+}
+
+/// Confirm a tag-vocabulary delete/merge: same shape as the entry delete —
+/// rose danger button, body explains the blast radius (entry count).
+fn confirm_tag_op_form(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    title: &str,
+    body: &str,
+    confirm_label: &str,
+) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Keep;
+    ui.label(RichText::new(title).size(17.0).strong().color(theme.text));
+    ui.add_space(6.0);
+    ui.label(RichText::new(body).size(12.5).color(theme.muted));
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let go = egui::Button::new(
+                RichText::new(confirm_label)
+                    .size(13.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(theme.rose)
+            .corner_radius(8.0)
+            .min_size(egui::vec2(0.0, 32.0));
+            if ui.add(go).clicked() {
+                outcome = DialogOutcome::ApplyTagOp;
+            }
+            if widgets::button(ui, theme, None, "Cancel", false, 32.0).clicked() {
+                outcome = DialogOutcome::Cancel;
             }
         });
     });

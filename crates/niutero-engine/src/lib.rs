@@ -8,8 +8,21 @@
 
 use std::path::{Path, PathBuf};
 
+mod ai;
 mod connector;
-pub use connector::serve_connector;
+mod sync_ops;
+mod tags;
+
+pub use ai::{
+    ai_config, ai_test, apply_tag_merges, ask, organize_tags, set_ai_config, suggest_tags,
+    update_ai_config, MergeApplied, OrganizePlan, TagMerge, TagSuggestion, DEFAULT_MODEL,
+};
+pub use connector::{connector_token, serve_connector};
+pub use sync_ops::{connect, history, sync, HistoryCommit, SyncStatus};
+pub use tags::{
+    current_note, current_tags, delete_tag, list_tags, rename_tag, set_note, set_stars, set_status,
+    set_tags, set_tags_bulk,
+};
 
 /// Test-only: one process-wide lock guarding the `$NIUTERO_REGISTRY` env var, so
 /// every registry-touching test in this crate (the engine tests *and* the
@@ -25,7 +38,7 @@ pub(crate) mod test_registry_env {
 }
 
 use indexmap::IndexMap;
-use niutero_bib::{entries, entry_line_span, parse, to_bibtex_entries, BibItem};
+use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
 use niutero_core::filter::Facets;
 use niutero_core::{dedup, filter, texscan, BibEntry, KeyPattern};
 use niutero_norm::{normalize_entry, NormConfig};
@@ -34,7 +47,9 @@ use serde::{Deserialize, Serialize};
 
 pub use niutero_core::texdisplay;
 pub use niutero_core::texscan::TexReport;
-pub use niutero_vault::{EntryMeta, ExportTarget, Registry, Status, SyncPrefs, Vault, View};
+pub use niutero_vault::{
+    AiConfig, EntryMeta, ExportTarget, Registry, Status, SyncPrefs, Vault, View,
+};
 
 /// An owned, serializable view of an entry plus its sidecar tags/notes — the
 /// stable shape the CLI's `--json` emits and a GUI consumes.
@@ -202,92 +217,6 @@ pub fn rm(v: &mut Vault, citekey: &str) -> Result<(), String> {
             .map_err(|e| format!("update sidecar: {e}"))?;
     }
     Ok(())
-}
-
-// ------------------------------------------------ tags / notes (sidecar only)
-
-/// Current tags for an entry (errors if the entry is absent).
-pub fn current_tags(v: &Vault, citekey: &str) -> Result<Vec<String>, String> {
-    entry_exists(v, citekey)?;
-    Ok(v.meta
-        .get(citekey)
-        .map(|m| m.tags.clone())
-        .unwrap_or_default())
-}
-
-/// Add and/or remove tags on an entry; returns the resulting tag set (sorted,
-/// deduped). Writes only the sidecar — `references.bib` is never touched.
-pub fn set_tags(
-    v: &mut Vault,
-    citekey: &str,
-    add: &[String],
-    remove: &[String],
-) -> Result<Vec<String>, String> {
-    let _lock = lock_vault(v)?;
-    entry_exists(v, citekey)?;
-    {
-        let meta = v.meta.entry(citekey.to_string()).or_default();
-        for t in add {
-            if !t.is_empty() && !meta.tags.iter().any(|x| x == t) {
-                meta.tags.push(t.clone());
-            }
-        }
-        meta.tags.retain(|t| !remove.iter().any(|r| r == t));
-        meta.tags.sort();
-        meta.tags.dedup();
-    }
-    let result = v
-        .meta
-        .get(citekey)
-        .map(|m| m.tags.clone())
-        .unwrap_or_default();
-    prune_meta(v, citekey);
-    save_sidecar(v)?;
-    Ok(result)
-}
-
-/// Current note for an entry (empty string if none; errors if the entry is absent).
-pub fn current_note(v: &Vault, citekey: &str) -> Result<String, String> {
-    entry_exists(v, citekey)?;
-    Ok(v.meta
-        .get(citekey)
-        .map(|m| m.note.clone())
-        .unwrap_or_default())
-}
-
-/// Set (`Some`) or clear (`None`) an entry's note. Sidecar only.
-pub fn set_note(v: &mut Vault, citekey: &str, note: Option<String>) -> Result<(), String> {
-    let _lock = lock_vault(v)?;
-    entry_exists(v, citekey)?;
-    v.meta.entry(citekey.to_string()).or_default().note = note.unwrap_or_default();
-    prune_meta(v, citekey);
-    save_sidecar(v)
-}
-
-/// Set an entry's reading status. `Unread` is the default and is stored as
-/// *absent* so `meta.json` stays minimal. Sidecar only.
-pub fn set_status(v: &mut Vault, citekey: &str, status: Status) -> Result<(), String> {
-    let _lock = lock_vault(v)?;
-    entry_exists(v, citekey)?;
-    let stored = (status != Status::Unread).then_some(status);
-    v.meta.entry(citekey.to_string()).or_default().status = stored;
-    prune_meta(v, citekey);
-    save_sidecar(v)
-}
-
-/// Set (`1..=5`) or clear (`0`/`None`) an entry's star rating. Rejects ratings
-/// above 5. Sidecar only.
-pub fn set_stars(v: &mut Vault, citekey: &str, stars: Option<u8>) -> Result<(), String> {
-    let _lock = lock_vault(v)?;
-    entry_exists(v, citekey)?;
-    let stored = match stars {
-        Some(0) | None => None,
-        Some(n) if n <= 5 => Some(n),
-        Some(n) => return Err(format!("stars must be between 0 and 5, got {n}")),
-    };
-    v.meta.entry(citekey.to_string()).or_default().stars = stored;
-    prune_meta(v, citekey);
-    save_sidecar(v)
 }
 
 // ------------------------------------------------------------- saved views
@@ -567,75 +496,6 @@ fn ensure_pdfs_gitignored(v: &Vault) -> Result<(), String> {
     }
     next.push_str("pdfs/\n");
     std::fs::write(&path, next).map_err(|e| format!("write .gitignore: {e}"))
-}
-
-// --------------------------------------------------------------- AI assist
-
-/// **Online (LLM).** Ask Claude to suggest tags for an entry, drawing on the
-/// library's existing tag vocabulary so suggestions reuse the user's namespaces
-/// (`topics:`/`wf:`/…). Suggestion-only — it returns tags to review, it does NOT
-/// apply them (use `tag --add`). Needs `$ANTHROPIC_API_KEY` and network access.
-pub fn suggest_tags(v: &Vault, citekey: &str) -> Result<Vec<String>, String> {
-    let view = show(v, citekey)?; // errors if the entry is absent
-    let (system, user) = tag_prompt(&view, &tag_vocabulary(v));
-    let text = niutero_online::anthropic_text(SUGGEST_MODEL, &system, &user)?;
-    Ok(parse_tag_list(&text))
-}
-
-/// A small, fast model is plenty for tagging.
-const SUGGEST_MODEL: &str = "claude-haiku-4-5-20251001";
-
-/// Every distinct tag in use across the library, sorted.
-fn tag_vocabulary(v: &Vault) -> Vec<String> {
-    let mut tags: Vec<String> = v.meta.values().flat_map(|m| m.tags.clone()).collect();
-    tags.sort();
-    tags.dedup();
-    tags
-}
-
-/// Build the (system, user) prompts for tag suggestion. Pure.
-fn tag_prompt(view: &EntryView, vocab: &[String]) -> (String, String) {
-    let system = "You tag bibliography entries for a researcher's library. Reply with ONLY a \
-        comma-separated list of tags, reusing the existing vocabulary and its namespaces (e.g. \
-        topics:foo, wf:bar) where they fit; propose a new namespaced tag only when nothing fits. \
-        No prose."
-        .to_string();
-    let field = |name: &str| view.fields.get(name).map(String::as_str).unwrap_or("");
-    let venue = if field("booktitle").is_empty() {
-        field("journal")
-    } else {
-        field("booktitle")
-    };
-    let user = format!(
-        "Existing tags: {}\n\nEntry:\n  title: {}\n  author: {}\n  venue: {}\n\nSuggest up to 5 tags.",
-        if vocab.is_empty() {
-            "(none yet)".to_string()
-        } else {
-            vocab.join(", ")
-        },
-        field("title"),
-        field("author"),
-        venue,
-    );
-    (system, user)
-}
-
-/// Parse an LLM tag list (comma- or newline-separated, possibly bulleted or
-/// quoted) into clean, deduplicated tags. Pure.
-fn parse_tag_list(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for raw in text.split([',', '\n']) {
-        let t = raw
-            .trim()
-            .trim_start_matches(['-', '*', '•'])
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
-            .trim();
-        if !t.is_empty() && t.chars().count() <= 60 && !out.iter().any(|x| x == t) {
-            out.push(t.to_string());
-        }
-    }
-    out
 }
 
 /// Write the entries matching `filter` to a standalone `.bib` at `out`.
@@ -956,266 +816,6 @@ pub fn set_sync_prefs(
         rec.sync.clone()
     })
     .map_err(|e| format!("update registry: {e}"))
-}
-
-// ------------------------------------------------------------------- sync
-
-/// Outcome of a [`sync`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum SyncStatus {
-    /// Pulled and pushed cleanly. `committed` = local changes were committed;
-    /// `merged` = a pull conflict was auto-resolved by a structured 3-way merge.
-    Synced { committed: bool, merged: bool },
-    /// A pull conflict could not be auto-resolved (real field conflict, or a
-    /// non-`references.bib` file conflicted); the merge was aborted.
-    Conflict,
-}
-
-/// Initialize git in the vault (if needed), point `origin` at `url`, and pin
-/// the repo's line-ending behavior so `references.bib` stays byte-identical
-/// across platforms (the source-of-truth invariant).
-pub fn connect(v: &Vault, url: &str) -> Result<(), String> {
-    let _lock = lock_vault(v)?;
-    if !git::is_repo(&v.root) {
-        git::init(&v.root)?;
-    }
-    git::set_remote(&v.root, "origin", url)?;
-    ensure_repo_hygiene(v)
-}
-
-/// What every niutero repo needs to keep the `.bib` byte-stable: a
-/// `.gitattributes` forcing LF, and `core.autocrlf=false` locally. Idempotent
-/// and safe to call on every sync.
-fn ensure_repo_hygiene(v: &Vault) -> Result<(), String> {
-    let path = v.root.join(".gitattributes");
-    if !path.exists() {
-        std::fs::write(path, GITATTRIBUTES).map_err(|e| format!("write .gitattributes: {e}"))?;
-    }
-    // gitattributes is the real guarantee; autocrlf is belt-and-suspenders, so
-    // don't fail the whole operation if this one config write hiccups.
-    let _ = git::set_config(&v.root, "core.autocrlf", "false");
-    Ok(())
-}
-
-/// `references.bib` (and everything else) is committed with LF endings on every
-/// platform, so the source of truth never churns on a Windows checkout.
-const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
-
-/// Commit local changes, pull, then push. Requires a git repo with an `origin`
-/// remote (set up via [`connect`]). On a pull conflict it attempts a structured
-/// entry-level 3-way merge of `references.bib`; if that resolves cleanly the
-/// merge is committed and the sync proceeds, otherwise the merge is aborted and
-/// [`SyncStatus::Conflict`] is returned (never a half-merged tree).
-pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
-    let _lock = lock_vault(v)?;
-    if !git::is_repo(&v.root) {
-        return Err("not a git repository — run `niutero-cli connect <url>` first".into());
-    }
-    if git::remote_url(&v.root, "origin").is_none() {
-        return Err("no 'origin' remote — run `niutero-cli connect <url>` first".into());
-    }
-    ensure_repo_hygiene(v)?;
-    // Machine-local sync strategy (#48): pull/push are per-machine toggles.
-    let prefs = sync_prefs(v)?;
-    let message = message.unwrap_or_else(|| auto_commit_message(v));
-    let committed = git::commit_all(&v.root, &message)?;
-    let mut merged = false;
-    if prefs.pull && git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict
-    {
-        // A merge is now in progress; resolve it or leave a clean tree.
-        match try_resolve_merge(v) {
-            Ok(true) => merged = true,
-            Ok(false) => {
-                git::abort_merge(&v.root)?;
-                return Ok(SyncStatus::Conflict);
-            }
-            Err(e) => {
-                let _ = git::abort_merge(&v.root); // best effort; surface the real error
-                return Err(e);
-            }
-        }
-    }
-    if prefs.push {
-        git::push(&v.root)?;
-    }
-    Ok(SyncStatus::Synced { committed, merged })
-}
-
-/// Try to auto-resolve an in-progress merge by 3-way merging the *entries* of
-/// `references.bib` (the structured resolver). Returns `Ok(true)` if it resolved
-/// and committed the merge, `Ok(false)` if it can't — in which case the caller
-/// aborts so the user resolves by hand.
-///
-/// It is deliberately conservative: it auto-resolves only when it can prove the
-/// result is correct, and bails (Ok(false)) otherwise. It declines when
-/// * anything other than `references.bib` conflicted (e.g. a sidecar);
-/// * the file was modify/deleted whole on a side (a stage is missing) — taking a
-///   missing stage as an empty library would silently delete the other side's
-///   entries;
-/// * the two sides disagree on the verbatim blocks (`@string`/`@preamble`/
-///   `@comment`/free text). Those aren't entry-keyed, so we only merge entries
-///   when both sides left the verbatim identical — never silently picking or
-///   duplicating a `@string`;
-/// * the entry-level 3-way merge reports any conflict.
-fn try_resolve_merge(v: &Vault) -> Result<bool, String> {
-    let conflicted = git::conflicted_paths(&v.root);
-    if conflicted.iter().any(|p| p != "references.bib") || conflicted.is_empty() {
-        return Ok(false);
-    }
-
-    // Require all three stages as real blobs. A missing stage means one side
-    // deleted the whole file (a modify/delete), which we must not auto-resolve.
-    let (Some(base_txt), Some(ours_txt), Some(theirs_txt)) = (
-        git::merge_stage(&v.root, 1, "references.bib"),
-        git::merge_stage(&v.root, 2, "references.bib"),
-        git::merge_stage(&v.root, 3, "references.bib"),
-    ) else {
-        return Ok(false);
-    };
-    let (base_items, ours_items, theirs_items) =
-        (parse(&base_txt), parse(&ours_txt), parse(&theirs_txt));
-
-    // Verbatim blocks have no cite key to merge on, so only proceed when both
-    // sides agree on them; otherwise the verbatim is itself in conflict.
-    let verbatim = |items: &[BibItem]| -> Vec<String> {
-        items
-            .iter()
-            .filter_map(|it| match it {
-                BibItem::Verbatim(s) => Some(s.clone()),
-                BibItem::Entry(_) => None,
-            })
-            .collect()
-    };
-    let ours_verbatim = verbatim(&ours_items);
-    if ours_verbatim != verbatim(&theirs_items) {
-        return Ok(false);
-    }
-
-    let collect = |items: &[BibItem]| entries(items).cloned().collect::<Vec<BibEntry>>();
-    let result = niutero_core::merge::merge(
-        &collect(&base_items),
-        &collect(&ours_items),
-        &collect(&theirs_items),
-    );
-    if !result.is_clean() {
-        return Ok(false);
-    }
-
-    // Rebuild: the (agreed-upon) verbatim blocks, then the merged entries.
-    let mut items: Vec<BibItem> = ours_items
-        .into_iter()
-        .filter(|it| matches!(it, BibItem::Verbatim(_)))
-        .collect();
-    items.extend(result.merged.into_iter().map(BibItem::Entry));
-    write_items(v, &items)?;
-    git::finalize_merge(&v.root)?;
-    Ok(true)
-}
-
-/// A commit message describing what changed in `references.bib` since `HEAD`,
-/// at the granularity of entries (e.g. `niutero: 3 added, 1 changed`).
-fn auto_commit_message(v: &Vault) -> String {
-    let working = std::fs::read_to_string(v.bib_path()).unwrap_or_default();
-    match git::file_at_head(&v.root, "references.bib") {
-        None => "niutero: initial import".to_string(),
-        Some(head) => entry_diff(&head, &working).message(),
-    }
-}
-
-/// Entry-level delta between two `.bib` texts (by cite key + content equality).
-struct EntryDiff {
-    added: usize,
-    changed: usize,
-    removed: usize,
-}
-
-impl EntryDiff {
-    fn message(&self) -> String {
-        let mut parts = Vec::new();
-        if self.added > 0 {
-            parts.push(format!("{} added", self.added));
-        }
-        if self.changed > 0 {
-            parts.push(format!("{} changed", self.changed));
-        }
-        if self.removed > 0 {
-            parts.push(format!("{} removed", self.removed));
-        }
-        if parts.is_empty() {
-            // entries unchanged — only sidecar (tags/notes) or formatting moved
-            "niutero: update metadata".to_string()
-        } else {
-            format!("niutero: {}", parts.join(", "))
-        }
-    }
-}
-
-fn entry_diff(old: &str, new: &str) -> EntryDiff {
-    fn by_key(s: &str) -> std::collections::HashMap<String, BibEntry> {
-        entries(&parse(s))
-            .map(|e| (e.citekey.clone(), e.clone()))
-            .collect()
-    }
-    let (o, n) = (by_key(old), by_key(new));
-    EntryDiff {
-        added: n.keys().filter(|k| !o.contains_key(*k)).count(),
-        removed: o.keys().filter(|k| !n.contains_key(*k)).count(),
-        changed: n
-            .iter()
-            .filter(|(k, v)| o.get(*k).is_some_and(|ov| ov != *v))
-            .count(),
-    }
-}
-
-// ---------------------------------------------------------------- history
-
-/// One commit in an entry's history — the stable shape `history --json` emits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct HistoryCommit {
-    pub hash: String,
-    pub author: String,
-    pub date: String,
-    pub subject: String,
-}
-
-/// The commits that touched one entry, newest first.
-///
-/// `git log -L` numbers lines against the committed `HEAD`, so we locate the
-/// entry's span in `HEAD`'s `references.bib` — not the working tree, whose
-/// uncommitted edits could shift (or remove) the entry and make the range
-/// wrong. Because the lookup is HEAD-driven, an entry deleted from the working
-/// tree but still present in the last commit can still have its history shown;
-/// the working tree is consulted only to give a precise error when the entry
-/// isn't in HEAD (added-but-not-synced vs. no such entry at all).
-pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
-    if !git::is_repo(&v.root) {
-        return Err("not a git repository — run `niutero-cli connect <url>` first".into());
-    }
-    let head = git::file_at_head(&v.root, "references.bib").ok_or_else(|| {
-        "references.bib has no committed history yet — run `niutero-cli sync` first".to_string()
-    })?;
-    let (start, end) = match entry_line_span(&head, citekey) {
-        Some(span) => span,
-        // Not in the last commit: distinguish "added locally, not synced yet"
-        // from "no such entry" by consulting the working tree.
-        None => {
-            let exists = entries(&read_items(v)?).any(|e| e.citekey == citekey);
-            return Err(if exists {
-                format!("'{citekey}' isn't in the last commit yet — run `niutero-cli sync` first")
-            } else {
-                format!("no entry with cite key '{citekey}'")
-            });
-        }
-    };
-    Ok(git::log_lines(&v.root, "references.bib", start, end)?
-        .into_iter()
-        .map(|c| HistoryCommit {
-            hash: c.hash,
-            author: c.author,
-            date: c.date,
-            subject: c.subject,
-        })
-        .collect())
 }
 
 // ------------------------------------------------------------------ rekey
@@ -1812,7 +1412,7 @@ fn letter_suffix(mut n: usize) -> String {
     chars.iter().rev().collect()
 }
 
-fn entry_exists(v: &Vault, citekey: &str) -> Result<(), String> {
+pub(crate) fn entry_exists(v: &Vault, citekey: &str) -> Result<(), String> {
     let items = read_items(v)?;
     if entries(&items).any(|e| e.citekey == citekey) {
         Ok(())
@@ -1822,29 +1422,29 @@ fn entry_exists(v: &Vault, citekey: &str) -> Result<(), String> {
 }
 
 /// Drop the meta entry if it carries nothing, keeping `meta.json` minimal.
-fn prune_meta(v: &mut Vault, citekey: &str) {
+pub(crate) fn prune_meta(v: &mut Vault, citekey: &str) {
     if v.meta.get(citekey).is_some_and(|m| m.is_empty()) {
         v.meta.remove(citekey);
     }
 }
 
-fn save_sidecar(v: &Vault) -> Result<(), String> {
+pub(crate) fn save_sidecar(v: &Vault) -> Result<(), String> {
     v.save_sidecar().map_err(|e| format!("update sidecar: {e}"))
 }
 
 /// Take the vault's exclusive lock for a mutating operation; held until the
 /// returned guard drops. Serializes concurrent `niutero` processes so a
 /// read-modify-write race can't lose an update.
-fn lock_vault(v: &Vault) -> Result<niutero_vault::VaultLock, String> {
+pub(crate) fn lock_vault(v: &Vault) -> Result<niutero_vault::VaultLock, String> {
     v.lock().map_err(|e| format!("lock library: {e}"))
 }
 
-fn read_items(v: &Vault) -> Result<Vec<BibItem>, String> {
+pub(crate) fn read_items(v: &Vault) -> Result<Vec<BibItem>, String> {
     v.read_items()
         .map_err(|e| format!("read references.bib: {e}"))
 }
 
-fn write_items(v: &Vault, items: &[BibItem]) -> Result<(), String> {
+pub(crate) fn write_items(v: &Vault, items: &[BibItem]) -> Result<(), String> {
     v.write_items(items)
         .map_err(|e| format!("write references.bib: {e}"))
 }
@@ -1875,7 +1475,7 @@ fn view_of(entry: &BibEntry, v: &Vault) -> EntryView {
 }
 
 /// Build the query facets (tags / status / stars) for an entry from its sidecar.
-fn facets_of<'a>(v: &'a Vault, citekey: &str) -> Facets<'a> {
+pub(crate) fn facets_of<'a>(v: &'a Vault, citekey: &str) -> Facets<'a> {
     let meta = v.meta.get(citekey);
     Facets {
         tags: meta.map(|m| m.tags.as_slice()).unwrap_or(&[]),
@@ -1919,6 +1519,10 @@ fn parse_entries(src: &str) -> Result<Vec<BibEntry>, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::ai::{
+        grounding_context, parse_organize_plan, parse_tag_list, resolve_ai, tag_prompt,
+    };
+    use super::sync_ops::entry_diff;
     use super::*;
     use niutero_vault::View;
 
@@ -1991,6 +1595,299 @@ mod tests {
             assert_eq!(recent_vaults().unwrap().len(), 1);
             assert!(!forget_vault(&va.root).unwrap());
         });
+    }
+
+    #[test]
+    fn ai_config_roundtrips_and_resolve_gates_on_enabled_and_key() {
+        with_registry(|| {
+            // Default: disabled, omitted from disk.
+            assert!(ai_config().unwrap().is_default());
+            // Disabled → resolve errors before any key lookup.
+            assert!(resolve_ai().unwrap_err().contains("off"));
+
+            // Persist a config; it round-trips.
+            set_ai_config(AiConfig {
+                enabled: true,
+                provider: "anthropic".into(),
+                api_key: "sk-test".into(),
+                model: "claude-x".into(),
+                base_url: String::new(),
+            })
+            .unwrap();
+            let cfg = ai_config().unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(cfg.api_key, "sk-test");
+
+            // Enabled + key → resolve returns the configured key and model.
+            let (key, model) = resolve_ai().unwrap();
+            assert_eq!(key, "sk-test");
+            assert_eq!(model, "claude-x");
+        });
+    }
+
+    #[test]
+    fn organize_plan_parses_json_with_or_without_fences() {
+        let json = r#"{"merges":[{"from":"topics:interp","into":"topics:mech-interp","reason":"variant"}],"new_tags":[{"name":"topics:sae"}]}"#;
+        let plan = parse_organize_plan(json).unwrap();
+        assert_eq!(plan.merges.len(), 1);
+        assert_eq!(plan.merges[0].into, "topics:mech-interp");
+        assert_eq!(plan.new_tags[0].name, "topics:sae");
+
+        // Tolerates a ```json fence and surrounding whitespace.
+        let fenced = format!("```json\n{json}\n```");
+        assert_eq!(parse_organize_plan(&fenced).unwrap().merges.len(), 1);
+
+        // Non-JSON is a clean error, not a panic.
+        assert!(parse_organize_plan("sorry, I can't").is_err());
+    }
+
+    #[test]
+    fn default_model_is_a_current_undated_id() {
+        // Dated snapshots (`-20251001`) age out on deprecation; the default
+        // must stay an evergreen id. The GUI seeds from this same constant.
+        assert_eq!(DEFAULT_MODEL, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn resolve_ai_guards_provider_base_url_and_key_fallback() {
+        with_registry(|| {
+            // Scrub any ambient key so the assertions are deterministic
+            // (restored below; we hold the registry env lock throughout).
+            let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+            std::env::remove_var("ANTHROPIC_API_KEY");
+
+            // Enabled but keyless → the actionable no-key error.
+            set_ai_config(AiConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(resolve_ai().unwrap_err().contains("no API key"));
+
+            // Env fallback fills the key; empty model falls to the default.
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-env");
+            let (key, model) = resolve_ai().unwrap();
+            assert_eq!(key, "sk-env");
+            assert_eq!(model, DEFAULT_MODEL);
+
+            // A stored key (even whitespace-padded) wins over env, trimmed.
+            update_ai_config(|c| c.api_key = "  sk-stored  ".into()).unwrap();
+            assert_eq!(resolve_ai().unwrap().0, "sk-stored");
+
+            // An unwired provider hard-errors with the exact fix command —
+            // a request must never silently go to a different service.
+            update_ai_config(|c| c.provider = "OpenAI".into()).unwrap();
+            let err = resolve_ai().unwrap_err();
+            assert!(err.contains("OpenAI") && err.contains("--provider anthropic"));
+            // …and the update preserved the other fields (locked RMW).
+            assert_eq!(ai_config().unwrap().api_key, "  sk-stored  ");
+
+            // "Anthropic" in any case is fine.
+            update_ai_config(|c| c.provider = "Anthropic".into()).unwrap();
+            assert!(resolve_ai().is_ok());
+
+            // A base-URL override is likewise refused until it's honored.
+            update_ai_config(|c| c.base_url = "http://localhost:11434".into()).unwrap();
+            assert!(resolve_ai().unwrap_err().contains("base URL"));
+
+            match saved {
+                Some(k) => std::env::set_var("ANTHROPIC_API_KEY", k),
+                None => std::env::remove_var("ANTHROPIC_API_KEY"),
+            }
+        });
+    }
+
+    #[test]
+    fn ai_config_coexists_with_vault_records_in_the_registry() {
+        with_registry(|| {
+            let (_a, va) = vault();
+            let (_b, vb) = vault();
+            record_open(&va.root);
+            set_ai_config(AiConfig {
+                enabled: true,
+                api_key: "sk-x".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            // The vault record survived the AI write…
+            assert_eq!(recent_vaults().unwrap().len(), 1);
+            // …and a later MRU update preserves the [ai] table (this also pins
+            // that toml serializes a plain table after the [[vault]] array).
+            record_open(&vb.root);
+            let cfg = ai_config().unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(cfg.api_key, "sk-x");
+            assert_eq!(recent_vaults().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn ask_gates_offline_in_order() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            // A blank question errors first, even with assist off — the gate
+            // order is an observable contract.
+            assert_eq!(ask(&v, "   ").unwrap_err(), "ask what?");
+            // A real question with assist off reports the master switch.
+            assert!(ask(&v, "q").unwrap_err().contains("off"));
+        });
+    }
+
+    #[test]
+    fn organize_plan_round_trips_through_json_for_plan_files() {
+        // Pins that `ai organize --json` output is always valid `--plan` input.
+        let plan = OrganizePlan {
+            merges: vec![TagMerge {
+                from: "topics:m-l".into(),
+                into: "topics:ml".into(),
+                reason: "variant".into(),
+            }],
+            new_tags: vec![TagSuggestion {
+                name: "topics:new".into(),
+                reason: String::new(),
+            }],
+        };
+        let json = serde_json::to_string_pretty(&plan).unwrap();
+        let back = parse_organize_plan(&json).unwrap();
+        assert_eq!(back.merges.len(), 1);
+        assert_eq!(back.merges[0].into, "topics:ml");
+        assert_eq!(back.new_tags[0].name, "topics:new");
+        // And through the public Deserialize derive (what `--plan` uses).
+        let direct: OrganizePlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(direct.merges[0].from, "topics:m-l");
+    }
+
+    #[test]
+    fn apply_tag_merges_reports_per_merge_and_never_touches_the_bib() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "a", &["title=A"])).unwrap();
+        add(&v, fields("misc", "b", &["title=B"])).unwrap();
+        set_tags(&mut v, "a", &["topics:ml".into()], &[]).unwrap();
+        set_tags(&mut v, "b", &["topics:m-l".into(), "topics:ml".into()], &[]).unwrap();
+        let bib_before = std::fs::read(v.root.join("references.bib")).unwrap();
+
+        let merges = [
+            tm("topics:m-l", "topics:ml"), // valid merge
+            tm("topics:ml", ""),           // empty target: error, loop continues
+            tm("wf:x", "wf:x"),            // from==to: no-op
+            tm("ghost", "real"),           // nonexistent from: 0 changed, benign
+        ];
+        let res = apply_tag_merges(&mut v, &merges);
+        assert_eq!(res.len(), 4);
+        assert_eq!((res[0].changed, res[0].error.is_none()), (1, true));
+        assert!(res[1].error.is_some());
+        assert_eq!((res[2].changed, res[2].error.is_none()), (0, true));
+        assert_eq!((res[3].changed, res[3].error.is_none()), (0, true));
+        // The merge folded b's variant into the existing tag…
+        assert_eq!(
+            current_tags(&v, "b").unwrap(),
+            vec!["topics:ml".to_string()]
+        );
+        // …and references.bib is byte-identical (invariants 1 + 2).
+        let bib_after = std::fs::read(v.root.join("references.bib")).unwrap();
+        assert_eq!(bib_before, bib_after);
+    }
+
+    fn tm(from: &str, into: &str) -> TagMerge {
+        TagMerge {
+            from: from.into(),
+            into: into.into(),
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn set_tags_bulk_writes_once_and_reports_unknown_keys() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "a", &["title=A"])).unwrap();
+        add(&v, fields("misc", "b", &["title=B"])).unwrap();
+        let adds = vec![
+            ("a".to_string(), vec!["pp:proj".to_string()]),
+            (
+                "b".to_string(),
+                vec!["pp:proj".to_string(), "pp:proj".to_string()],
+            ),
+            ("nope".to_string(), vec!["pp:proj".to_string()]),
+        ];
+        let (changed, unknown) = set_tags_bulk(&mut v, &adds).unwrap();
+        assert_eq!(changed, 2);
+        assert_eq!(unknown, vec!["nope".to_string()]);
+        assert_eq!(current_tags(&v, "a").unwrap(), vec!["pp:proj".to_string()]);
+        // Re-applying the same adds changes nothing (idempotent).
+        let (changed, _) = set_tags_bulk(&mut v, &adds[..2]).unwrap();
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn grounding_context_formats_venues_tags_and_truncates() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            fields(
+                "article",
+                "a1",
+                &["title=T1", "author=Au", "year=2020", "journal=J"],
+            ),
+        )
+        .unwrap();
+        add(
+            &v,
+            fields("inproceedings", "b1", &["title=T2", "booktitle=Conf"]),
+        )
+        .unwrap();
+        set_tags(&mut v, "a1", &["topics:x".into()], &[]).unwrap();
+        let items = read_items(&v).unwrap();
+        let ctx = grounding_context(&v, &items);
+        assert!(
+            ctx.contains("- [a1] T1 | Au | 2020 | J | tags: topics:x\n"),
+            "{ctx}"
+        );
+        // journal→booktitle venue fallback; no tags renders as an em-dash.
+        assert!(ctx.contains("- [b1] T2 |  |  | Conf | tags: —\n"), "{ctx}");
+
+        // One oversized entry must not blow past the budget: the check runs
+        // before the append, so only the omission sentinel is emitted.
+        let (_d2, v2) = vault();
+        let big = "x".repeat(13_000);
+        add(&v2, fields("misc", "big", &[&format!("title={big}")])).unwrap();
+        add(&v2, fields("misc", "small", &["title=ok"])).unwrap();
+        let items2 = read_items(&v2).unwrap();
+        let ctx2 = grounding_context(&v2, &items2);
+        assert!(
+            ctx2.starts_with("…(more entries omitted)"),
+            "{}",
+            &ctx2[..60.min(ctx2.len())]
+        );
+        assert!(!ctx2.contains("xxx"));
+    }
+
+    #[test]
+    fn tag_prompt_truncates_long_abstracts_on_char_boundaries() {
+        let (_d, v) = vault();
+        let long = "é".repeat(700); // multibyte: byte slicing would panic
+        add(
+            &v,
+            fields("misc", "m1", &["title=T", &format!("abstract={long}")]),
+        )
+        .unwrap();
+        let view = show(&v, "m1").unwrap();
+        let (_sys, user) = tag_prompt(&view, &["topics:x".to_string()]);
+        assert!(user.contains(&format!("abstract: {}…", "é".repeat(600))));
+        assert!(!user.contains(&"é".repeat(601)));
+
+        // An exactly-600-char abstract passes through with no ellipsis.
+        let exact = "a".repeat(600);
+        add(
+            &v,
+            fields("misc", "m2", &["title=T", &format!("abstract={exact}")]),
+        )
+        .unwrap();
+        let view = show(&v, "m2").unwrap();
+        let (_sys, user) = tag_prompt(&view, &[]);
+        assert!(user.contains(&format!("abstract: {exact}\n")));
+        assert!(!user.contains('…'));
+        // And the empty vocabulary renders its placeholder.
+        assert!(user.contains("(none yet)"));
     }
 
     #[test]
@@ -2224,6 +2121,80 @@ mod tests {
 
         // Tagging never rewrites the source of truth.
         assert_eq!(std::fs::read_to_string(v.bib_path()).unwrap(), bib_before);
+    }
+
+    #[test]
+    fn list_tags_counts_across_entries() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "a", &[])).unwrap();
+        add(&v, fields("misc", "b", &[])).unwrap();
+        add(&v, fields("misc", "c", &[])).unwrap();
+        set_tags(
+            &mut v,
+            "a",
+            &["topics:sae".into(), "wf:to-cite".into()],
+            &[],
+        )
+        .unwrap();
+        set_tags(&mut v, "b", &["topics:sae".into()], &[]).unwrap();
+        let tags = list_tags(&v);
+        assert_eq!(
+            tags,
+            vec![("topics:sae".to_string(), 2), ("wf:to-cite".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn rename_tag_renames_and_merges_sidecar_only() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "a", &[])).unwrap();
+        add(&v, fields("misc", "b", &[])).unwrap();
+        set_tags(&mut v, "a", &["topics:interp".into()], &[]).unwrap();
+        set_tags(
+            &mut v,
+            "b",
+            &["topics:interp".into(), "topics:mech-interp".into()],
+            &[],
+        )
+        .unwrap();
+        let bib_before = std::fs::read_to_string(v.bib_path()).unwrap();
+
+        // Rename onto an existing tag → both entries end up with the target, and
+        // b's two tags collapse (merge) into one.
+        let changed = rename_tag(&mut v, "topics:interp", "topics:mech-interp").unwrap();
+        assert_eq!(changed, 2);
+        assert_eq!(current_tags(&v, "a").unwrap(), vec!["topics:mech-interp"]);
+        assert_eq!(current_tags(&v, "b").unwrap(), vec!["topics:mech-interp"]);
+
+        // Empty target is rejected; a no-op rename reports zero.
+        assert!(rename_tag(&mut v, "topics:mech-interp", "  ").is_err());
+        assert_eq!(rename_tag(&mut v, "x", "x").unwrap(), 0);
+
+        // Never touches the source of truth.
+        assert_eq!(std::fs::read_to_string(v.bib_path()).unwrap(), bib_before);
+    }
+
+    #[test]
+    fn delete_tag_removes_everywhere_and_prunes() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "a", &[])).unwrap();
+        add(&v, fields("misc", "b", &[])).unwrap();
+        set_tags(
+            &mut v,
+            "a",
+            &["topics:sae".into(), "wf:to-cite".into()],
+            &[],
+        )
+        .unwrap();
+        set_tags(&mut v, "b", &["topics:sae".into()], &[]).unwrap();
+
+        let changed = delete_tag(&mut v, "topics:sae").unwrap();
+        assert_eq!(changed, 2);
+        assert_eq!(current_tags(&v, "a").unwrap(), vec!["wf:to-cite"]);
+        // b had only that tag → its meta is pruned.
+        assert!(!v.meta.contains_key("b"));
+        // Deleting an absent tag is a no-op.
+        assert_eq!(delete_tag(&mut v, "topics:nope").unwrap(), 0);
     }
 
     #[test]

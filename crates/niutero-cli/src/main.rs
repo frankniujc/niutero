@@ -122,6 +122,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the tag vocabulary across the whole library (sidecar only):
+    /// list / rename / merge / delete.
+    Tags {
+        /// Vault folder.
+        vault: PathBuf,
+        #[command(subcommand)]
+        action: TagsAction,
+    },
+    /// LLM assistant: configure, test the connection, ask a question, or
+    /// organize the tag vocabulary.
+    Ai {
+        #[command(subcommand)]
+        action: AiAction,
+    },
     /// Set, clear, or show an entry's note.
     Note {
         /// Vault folder.
@@ -308,12 +322,18 @@ enum Cmd {
         citekey: String,
     },
     /// Run the browser-connector server (loopback) until stopped (Ctrl-C).
+    /// Captures require the printed session token (`Authorization: Bearer …`
+    /// or `X-Niutero-Token: …`), so a random web page can't inject entries.
     Connector {
         /// Vault folder.
         vault: PathBuf,
         /// Loopback port to listen on.
         #[arg(long, default_value_t = 23510)]
         port: u16,
+        /// Session token captures must present (default: generate and print
+        /// a fresh one).
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Manage an entry's attached PDF: show its path, --attach a file, or
     /// --fetch it from the entry's url (online). Binaries live in `pdfs/`
@@ -330,8 +350,9 @@ enum Cmd {
         #[arg(long)]
         fetch: bool,
     },
-    /// Online (LLM): suggest tags for an entry ($ANTHROPIC_API_KEY). Prints
-    /// suggestions to review — apply with `tag --add`.
+    /// Online (LLM): suggest tags for an entry. Needs LLM assist enabled
+    /// (`ai config --enable true`; key from the config or $ANTHROPIC_API_KEY).
+    /// Prints suggestions to review — apply with `tag --add`.
     SuggestTags {
         /// Vault folder.
         vault: PathBuf,
@@ -424,6 +445,112 @@ impl From<StatusArg> for engine::Status {
 }
 
 #[derive(Subcommand)]
+enum AiAction {
+    /// Show the machine-local AI config, or update the given fields.
+    Config {
+        /// Turn LLM assist on/off.
+        #[arg(long)]
+        enable: Option<bool>,
+        /// Provider label (only `anthropic` is wired today).
+        #[arg(long)]
+        provider: Option<String>,
+        /// API key (stored machine-local in vaults.toml). Note: argv is
+        /// visible in the process list and shell history — prefer --key-stdin
+        /// on shared machines.
+        #[arg(long)]
+        key: Option<String>,
+        /// Read the API key from stdin (first line) instead of argv, so it
+        /// never shows in the process list or shell history.
+        #[arg(long, conflicts_with = "key")]
+        key_stdin: bool,
+        /// Model id.
+        #[arg(long)]
+        model: Option<String>,
+        /// API base URL override (not honored yet — calls refuse to run while
+        /// one is set, so requests can't be misrouted).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Test the connection with a tiny request.
+    Test {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a question grounded in a library.
+    Ask {
+        /// Vault folder.
+        vault: PathBuf,
+        /// The question.
+        question: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tidy the tag vocabulary: get a merge plan from the model (or load one
+    /// with --plan, fully offline) and optionally --apply its merges. New-tag
+    /// suggestions are always advisory — a tag exists only on entries.
+    Organize {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Extra steering for the model (e.g. "only merge topics:*").
+        #[arg(long, conflicts_with = "plan")]
+        instructions: Option<String>,
+        /// Apply a saved plan file instead of asking the model. The file is
+        /// the JSON that `--json` emits — this path is fully offline.
+        #[arg(long)]
+        plan: Option<PathBuf>,
+        /// Apply the plan's merges (default: print the plan to review).
+        #[arg(long)]
+        apply: bool,
+        /// Emit JSON instead of text. The output is valid --plan input.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagsAction {
+    /// List every tag with its entry count.
+    List {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a tag everywhere (merges if the target already exists).
+    Rename {
+        /// The existing tag (e.g. `topics:interp`).
+        from: String,
+        /// The new name (e.g. `topics:mech-interp`).
+        to: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Merge one tag into another (alias of `rename`).
+    Merge {
+        /// The tag to fold away.
+        from: String,
+        /// The tag to keep.
+        into: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a tag from every entry that carries it.
+    Delete {
+        /// The tag to remove (e.g. `wf:to-cite`).
+        name: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ViewAction {
     /// List saved views.
     List {
@@ -506,6 +633,15 @@ fn mutated_vault(cmd: &Cmd) -> Option<PathBuf> {
         Cmd::Tag {
             vault, add, remove, ..
         } if !add.is_empty() || !remove.is_empty() => Some(vault.clone()),
+        // Vocabulary-wide tag mutations move the same facets, library-wide.
+        Cmd::Tags { vault, action } if !matches!(action, TagsAction::List { .. }) => {
+            Some(vault.clone())
+        }
+        Cmd::Ai {
+            action: AiAction::Organize {
+                vault, apply: true, ..
+            },
+        } => Some(vault.clone()),
         Cmd::Status {
             vault,
             set: Some(_),
@@ -595,6 +731,8 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             remove,
             json,
         } => cmd_tag(&vault, &citekey, add, remove, json).map(ok),
+        Cmd::Tags { vault, action } => cmd_tags(&vault, action).map(ok),
+        Cmd::Ai { action } => cmd_ai(action).map(ok),
         Cmd::Note {
             vault,
             citekey,
@@ -659,7 +797,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
         Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
         Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
         Cmd::Enrich { vault, citekey } => cmd_enrich(&vault, &citekey).map(ok),
-        Cmd::Connector { vault, port } => cmd_connector(&vault, port).map(ok),
+        Cmd::Connector { vault, port, token } => cmd_connector(&vault, port, token).map(ok),
         Cmd::Pdf {
             vault,
             citekey,
@@ -865,6 +1003,294 @@ fn cmd_tag(
     Ok(())
 }
 
+fn cmd_tags(vault: &Path, action: TagsAction) -> Result<(), String> {
+    match action {
+        TagsAction::List { json } => {
+            let v = open_vault(vault)?;
+            let tags = engine::list_tags(&v);
+            if json {
+                let arr: Vec<_> = tags
+                    .iter()
+                    .map(|(name, count)| serde_json::json!({ "tag": name, "count": count }))
+                    .collect();
+                emit(serde_json::json!({ "tags": arr }))?;
+            } else if tags.is_empty() {
+                println!("(no tags)");
+            } else {
+                for (name, count) in tags {
+                    println!("{count:>4}  {name}");
+                }
+            }
+        }
+        TagsAction::Rename { from, to, json } => {
+            let mut v = open_vault(vault)?;
+            let n = engine::rename_tag(&mut v, &from, &to)?;
+            if json {
+                emit(serde_json::json!({ "from": from, "to": to, "changed": n }))?;
+            } else {
+                println!("Renamed '{from}' → '{to}' on {n} entr{}", plural(n));
+            }
+        }
+        TagsAction::Merge { from, into, json } => {
+            let mut v = open_vault(vault)?;
+            let n = engine::rename_tag(&mut v, &from, &into)?;
+            if json {
+                emit(serde_json::json!({ "from": from, "into": into, "changed": n }))?;
+            } else {
+                println!("Merged '{from}' into '{into}' on {n} entr{}", plural(n));
+            }
+        }
+        TagsAction::Delete { name, json } => {
+            let mut v = open_vault(vault)?;
+            let n = engine::delete_tag(&mut v, &name)?;
+            if json {
+                emit(serde_json::json!({ "tag": name, "changed": n }))?;
+            } else {
+                println!("Deleted '{name}' from {n} entr{}", plural(n));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// "y" / "ies" suffix for an entry count.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        "y"
+    } else {
+        "ies"
+    }
+}
+
+fn cmd_ai(action: AiAction) -> Result<(), String> {
+    match action {
+        AiAction::Config {
+            enable,
+            provider,
+            key,
+            key_stdin,
+            model,
+            base_url,
+            json,
+        } => {
+            let key = if key_stdin {
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|e| format!("read key from stdin: {e}"))?;
+                let k = line.trim().to_string();
+                if k.is_empty() {
+                    return Err("no key arrived on stdin".into());
+                }
+                Some(k)
+            } else {
+                key
+            };
+            let changed = enable.is_some()
+                || provider.is_some()
+                || key.is_some()
+                || model.is_some()
+                || base_url.is_some();
+            // The whole read-modify-write runs inside the registry lock, so a
+            // concurrent updater (GUI save, second CLI) can't be clobbered.
+            let cfg = if changed {
+                engine::update_ai_config(|cfg| {
+                    if let Some(e) = enable {
+                        cfg.enabled = e;
+                    }
+                    if let Some(p) = provider {
+                        cfg.provider = p;
+                    }
+                    if let Some(k) = key {
+                        cfg.api_key = k;
+                    }
+                    if let Some(m) = model {
+                        cfg.model = m;
+                    }
+                    if let Some(b) = base_url {
+                        cfg.base_url = b;
+                    }
+                })?
+            } else {
+                engine::ai_config()?
+            };
+            if json {
+                emit(serde_json::json!({
+                    "enabled": cfg.enabled,
+                    "provider": cfg.provider,
+                    "model": cfg.model,
+                    "base_url": cfg.base_url,
+                    "api_key_set": !cfg.api_key.is_empty(),
+                }))?;
+            } else {
+                println!("enabled:  {}", cfg.enabled);
+                println!(
+                    "provider: {}",
+                    if cfg.provider.is_empty() {
+                        "anthropic (default)"
+                    } else {
+                        &cfg.provider
+                    }
+                );
+                println!(
+                    "model:    {}",
+                    if cfg.model.is_empty() {
+                        "(default)"
+                    } else {
+                        &cfg.model
+                    }
+                );
+                println!(
+                    "api key:  {}",
+                    if cfg.api_key.is_empty() {
+                        "(unset — falls back to $ANTHROPIC_API_KEY)".to_string()
+                    } else {
+                        mask_key(&cfg.api_key)
+                    }
+                );
+                if !cfg.base_url.is_empty() {
+                    println!("base url: {}", cfg.base_url);
+                }
+            }
+        }
+        AiAction::Test { json } => {
+            let msg = engine::ai_test()?;
+            if json {
+                emit(serde_json::json!({ "ok": true, "message": msg }))?;
+            } else {
+                println!("{}", sanitize_terminal(&msg));
+            }
+        }
+        AiAction::Ask {
+            vault,
+            question,
+            json,
+        } => {
+            let v = open_vault(&vault)?;
+            let answer = engine::ask(&v, &question)?;
+            if json {
+                emit(serde_json::json!({ "answer": answer }))?;
+            } else {
+                println!("{}", sanitize_terminal(&answer));
+            }
+        }
+        AiAction::Organize {
+            vault,
+            instructions,
+            plan,
+            apply,
+            json,
+        } => {
+            let mut v = open_vault(&vault)?;
+            let plan_obj: engine::OrganizePlan = match plan {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("read plan {}: {e}", path.display()))?;
+                    serde_json::from_str(&text)
+                        .map_err(|e| format!("parse plan {}: {e}", path.display()))?
+                }
+                None => engine::organize_tags(&v, instructions.as_deref().unwrap_or(""))?,
+            };
+            let applied = if apply {
+                Some(engine::apply_tag_merges(&mut v, &plan_obj.merges))
+            } else {
+                None
+            };
+            if json {
+                // The merges/new_tags keys make this output valid --plan input
+                // (extra keys are ignored on the way back in).
+                let mut out = serde_json::json!({
+                    "merges": plan_obj.merges,
+                    "new_tags": plan_obj.new_tags,
+                });
+                if let Some(results) = &applied {
+                    out["applied"] = serde_json::to_value(results).map_err(|e| e.to_string())?;
+                    out["changed_total"] =
+                        serde_json::json!(results.iter().map(|r| r.changed).sum::<usize>());
+                }
+                emit(out)?;
+            } else {
+                if plan_obj.merges.is_empty() && plan_obj.new_tags.is_empty() {
+                    println!("Nothing to tidy — the plan is empty.");
+                }
+                for m in &plan_obj.merges {
+                    let why = if m.reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", sanitize_terminal(&m.reason))
+                    };
+                    println!("merge '{}' → '{}'{why}", m.from, m.into);
+                }
+                for t in &plan_obj.new_tags {
+                    let why = if t.reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", sanitize_terminal(&t.reason))
+                    };
+                    println!("new tag suggestion: '{}'{why}  — advisory only", t.name);
+                }
+                match &applied {
+                    None => {
+                        if !plan_obj.merges.is_empty() {
+                            println!("(plan only — re-run with --apply to merge)");
+                        }
+                    }
+                    Some(results) => {
+                        let (mut ok_n, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+                        for r in results {
+                            match (&r.error, r.changed) {
+                                (Some(e), _) => {
+                                    failed += 1;
+                                    println!("  ✗ '{}' → '{}': {e}", r.from, r.into);
+                                }
+                                (None, 0) => {
+                                    skipped += 1;
+                                    println!(
+                                        "  – '{}' → '{}': nothing tagged '{}' (skipped)",
+                                        r.from, r.into, r.from
+                                    );
+                                }
+                                (None, n) => {
+                                    ok_n += 1;
+                                    println!(
+                                        "  ✓ '{}' → '{}': {n} entr{}",
+                                        r.from,
+                                        r.into,
+                                        plural(n)
+                                    );
+                                }
+                            }
+                        }
+                        println!(
+                            "Applied {ok_n} of {} merge(s) ({skipped} skipped, {failed} failed).",
+                            results.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Show only a hint of a secret — never the whole thing, even when it's short.
+fn mask_key(k: &str) -> String {
+    let n = k.chars().count();
+    if n < 10 {
+        return format!("(set — {n} chars)");
+    }
+    let head: String = k.chars().take(6).collect();
+    format!("{head}… ({n} chars)")
+}
+
+/// Strip C0/C1 control characters (keeping newline and tab) so model-controlled
+/// text can't smuggle terminal escape sequences into the user's terminal.
+fn sanitize_terminal(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
 fn cmd_note(
     vault: &Path,
     citekey: &str,
@@ -989,10 +1415,15 @@ fn cmd_enrich(vault: &Path, citekey: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_connector(vault: &Path, port: u16) -> Result<(), String> {
+fn cmd_connector(vault: &Path, port: u16, token: Option<String>) -> Result<(), String> {
     let v = open_vault(vault)?;
+    let token = token.unwrap_or_else(engine::connector_token);
     println!("Browser connector listening on http://127.0.0.1:{port}  (POST BibTeX to /capture; Ctrl-C to stop)");
-    engine::serve_connector(&v, port)
+    println!("session token: {token}");
+    println!(
+        "  captures must send it as 'Authorization: Bearer {token}' or 'X-Niutero-Token: {token}'"
+    );
+    engine::serve_connector(&v, port, &token)
 }
 
 fn cmd_pdf(

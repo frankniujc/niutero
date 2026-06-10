@@ -8,22 +8,33 @@ This file is the "where are we right now" layer on top of those.
 
 A ground-up, **CLI-first** rewrite of niutero, a lightweight LaTeX-oriented
 citation manager in Rust. Phase 1 = a complete, tested CLI for all base +
-optional functionality. Phase 2 (a GUI as a thin client over `niutero-engine`)
-is **not being built** — explicitly descoped by the user.
+optional functionality — **done**. Phase 2 (a GUI as a thin client over
+`niutero-engine`) was originally descoped, then un-descoped: **`niutero-gui`
+exists** (egui) and calls the engine directly — it does nothing the CLI cannot.
 
 Hard rule: **written from scratch.** The old project at `../niutero` is a
 *product* reference only (features, data model, invariants) — never an
 implementation source. Exception the user authorized: `../bib_fixer/fix_bib.py`
 is the explicit spec that W2's offline normalizer was ported from.
 
-## Current state (2026-05-29)
+## Current state (2026-06-10)
 
 - **Phase 1 is COMPLETE** — base scope (M1–M5) plus every optional feature, all
   built, tested offline, reviewed, and committed. `niutero-engine` is the
   operations layer; the CLI is a thin shell over it. (External features' live
   network paths are code-complete but unverified in this offline sandbox — see
   "Remaining work".)
-- **Waves**, in order. All committed; all unpushed. Done:
+- **Phase 2 GUI EXISTS** — `niutero-gui` (egui, custom titlebar/theme), a thin
+  client calling `niutero-engine` directly (never shelling out). Tool rail:
+  **Library** (Classic / Reader / Board views, tags sidebar, full detail panel
+  with edit/tags/status/stars/cite/BibTeX/delete), **Tags** tool (vocabulary
+  table, rename/merge/delete with confirm dialogs, Import + Organize + Auto-tag
+  wizards), **Normalize** (offline preview/apply, health report, re-key),
+  **AI** (chat grounded in the library, live when configured), **Settings**
+  (real AI config page; several other pages still visual-only — see the
+  2026-06-10 section). The G1–G5 tab surface landed 2026-05-30; see
+  `gui-button-audit.md` for the real-vs-mock map.
+- **Phase 1 wave history**, in order:
   - **Wave 1** (`8dfd8ee`): small deferred fixes — CRLF/BOM input normalization,
     `open` hardening, entry-type encapsulation, init scaffolding, `cite`.
   - **W2** (`5851e4e`, pushed): **real offline normalization** — full port of
@@ -128,30 +139,130 @@ is the explicit spec that W2's offline normalizer was ported from.
     captures not refreshing mirrors, a tex-scan `--json` stdout leak, and
     non-hermetic `sync_*` tests (isolated via a shared crate-level registry env lock).
 
-- **Git**: `main` is **14 commits ahead of `origin/main`** (W3a · W3b · W-design ·
-  W-norm · W3c · W4a · W4b · W4c · W5a · W5b · W5c · W5d · W6 — all unpushed; the
-  user has not asked to push). Working tree clean.
+- **Git**: don't trust this file for branch/push state — check `git status` and
+  `git log origin/main..main` yourself (this doc has gone stale on commit counts
+  before). The user decides when to push.
   Remote: `git@github.com:frankniujc/niutero_2.git`.
-- **Tests**: full `cargo test --workspace` green at W6 (**269 tests**); fmt +
-  clippy (`-D warnings`) clean. Re-run the full gate before the next commit.
+- **Tests**: full `cargo test --workspace` was green at W6 (**269 tests**) and
+  has grown since; fmt + clippy (`-D warnings`) clean at each landing. Re-run
+  the full gate before the next commit.
   Norm has an optional whole-library idempotence test: run with
   `NIUTERO_BIB_FIXTURE=/path/to/library.bib cargo test -p niutero-norm`.
 
-## Remaining work — Phase 1 is COMPLETE
+## 2026-06-10 landing — AI/tags surface, security hardening, GUI reliability
 
-Every Phase-1 item (base scope + all optional features) is now built, tested
-offline, and committed. Nothing buildable remains for Phase 1. What's left is
-out of Phase-1 scope or unverifiable here:
+One large landing (committed as one release). What changed, by crate:
+
+**niutero-cli** (`crates/niutero-cli/src/main.rs`)
+- New `tags <vault> list|rename|merge|delete [--json]` — whole-library tag
+  vocabulary ops, sidecar-only.
+- New `ai` group: `ai config [--enable] [--provider] [--key|--key-stdin]
+  [--model] [--base-url] [--json]` (`--key-stdin` keeps the key out of argv;
+  short keys never echoed; config RMW now inside the registry lock via
+  `engine::update_ai_config`), `ai test [--json]`, `ai ask <vault> Q [--json]`
+  (terminal output sanitized of control chars), and **`ai organize <vault>
+  [--instructions S | --plan FILE] [--apply] [--json]`** — closes the
+  invariant-3 gap for the GUI's Organize wizard. Plan-only prints the model's
+  merge plan; `--json` output round-trips as `--plan` input (that path is fully
+  OFFLINE); `--apply` runs the merges via `engine::apply_tag_merges` with
+  per-merge results. New-tag suggestions are always advisory.
+- `connector` now prints a per-session token; `POST /capture` requires it
+  (`Authorization: Bearer` or `X-Niutero-Token`); wildcard CORS removed; 512 KB
+  body cap; socket timeouts.
+- `tags rename/merge/delete` and `ai organize --apply` refresh keep-updated
+  export targets (mutated_vault arms). `suggest-tags` help now says it needs
+  LLM assist enabled (`ai config --enable true`), not just `$ANTHROPIC_API_KEY`.
+
+**niutero-engine**
+- `pub DEFAULT_MODEL = "claude-haiku-4-5"` (the old id had an invalid date
+  suffix; the GUI now seeds from the same constant).
+- `resolve_ai` hard-errors on an unwired provider (non-anthropic) or a
+  non-empty `base_url`, so keys/data can't be silently misrouted; stored key
+  trimmed; error messages tool-neutral (mention both the CLI command and
+  Settings).
+- New: `update_ai_config` (locked RMW), `apply_tag_merges` + `MergeApplied`,
+  `set_tags_bulk` (one sidecar write for wizard-scale applies); `OrganizePlan`
+  derives `Deserialize`. `ai_test` max_tokens 16→64 (thinking-model safe);
+  `grounding_context` budget is now a hard pre-append check.
+
+**niutero-online**
+- Fixed the Windows-fatal curl bug: the `-K` config's `data = "@path"` line now
+  uses forward slashes (curl unescapes backslashes in double-quoted config
+  values, e.g. `\T`→TAB — every AI call failed on Windows).
+- The curl config (the only thing holding the API key) now goes to curl via
+  stdin (`-K -`) — the key never touches disk; the request body uses a
+  random-named tempfile (0600 on Unix), auto-deleted.
+- LLM call switched `-fsSL`→`-sSL` + new `extract_text` surfaces the API's own
+  `error.message` and flags token-limit truncation. Keys with
+  quotes/backslashes/control chars are rejected (config-injection guard).
+
+**niutero-vault**
+- `vaults.toml` (can hold the AI key) is written owner-only (0600) on Unix via
+  a private atomic-write variant.
+
+**niutero-gui**
+- Settings → AI: config persists reliably (per-frame dirty flush + flush on
+  tool/library switch and app exit — navigating away used to silently drop a
+  typed key); provider dropdown only allows Anthropic (others visible but
+  disabled "not wired yet"); Base URL field hidden unless a legacy value needs
+  clearing; model field seeded from `engine::DEFAULT_MODEL`; the PDF page's
+  HF-token input disabled ("coming soon" — it stored nothing).
+- Tags tool: Delete and Merge go through a confirm dialog with the affected
+  entry count; detail rename commits only on Enter (Esc/click-away reverts);
+  the Import wizard's project field no longer pre-fills "sae-survey"; color
+  section labeled "(this session only)"; tag-model cache keyed on an explicit
+  library reload generation, not pointer identity.
+- Wizards: Apply paths use one bulk engine call (`set_tags_bulk` /
+  `apply_tag_merges`) instead of per-entry sidecar rewrites on the UI thread;
+  Done steps report REAL applied/skipped/failed counts fed back from the app;
+  done-step copy no longer claims tags were "applied to references.bib" (they
+  live in the `.niutero` sidecar — references.bib untouched).
+- AI jobs: stamped with kind + vault root and a cancel flag; switching
+  libraries cancels jobs, closes wizards, resets the chat (no cross-library
+  result delivery); closing a wizard cancels its in-flight model call; results
+  only land in a matching wizard kind; a dead worker no longer strands the
+  spinner; "New chat" cancels the in-flight ask; the AI popup keeps the typed
+  question if the ask is refused; the AI tab's fake Scope menu is now an honest
+  static label.
+- Library: the active tag filter follows renames/merges and clears on delete
+  (views no longer silently empty); repeated identical toasts re-arm the
+  auto-dismiss timer.
+
+**Refactors landing alongside** (same release, other agents):
+`niutero-engine/src/lib.rs` split into submodules (`ai.rs` extracted; flat API
+preserved via re-exports); `niutero-gui` `tags.rs` split into
+`tags/{mod,wizards}.rs`; the `app.rs` impl split into an `app/` directory;
+duplicated private widgets unified into `widgets.rs`.
+
+### Follow-ups (next work, in rough priority)
+
+- **Live AI smoke** (planned right after this landing) + live verification of
+  the DOI / enrich / connector / PDF network paths — still
+  manually-verified-only.
+- **Normalize ruleset engine API** — the GUI's ruleset toggles are still
+  display-only; the engine has no ruleset read/write.
+- **Vault-config setters** — library name / citekey pattern (Settings fields
+  are visual-only today).
+- **Tag-color persistence** — engine + CLI first (colors are session-local).
+- **Multi-provider AI** (only Anthropic is wired; others refuse to run).
+- **CI / packaging** — no `.github` yet (developed on Windows-on-ARM only).
+
+## Remaining work
+
+Phase 1 is complete; Phase 2's GUI tab surface (G1–G5) is built. What's left:
 
 - **External features are network-UNVERIFIED.** DOI import, enrich, connector,
-  PDF fetch, and LLM tag-suggestions are code-complete with their pure logic
+  PDF fetch, and the LLM features are code-complete with their pure logic
   tested, but no live HTTP/API call could run in this offline sandbox. Before
   trusting them, exercise each against the real services (a real DOI, an entry
-  with a fillable DOI, the loopback `POST /capture`, a PDF url, and a request
-  with `$ANTHROPIC_API_KEY` set) and add the network-path integration coverage.
-- **Phase 2 GUI** — explicitly descoped. It will be a thin client over
-  `niutero-engine` (every capability already has an engine fn + CLI command).
-- **Cross-platform CI matrix** — not set up (developed on Windows-on-ARM only).
+  with a fillable DOI, the loopback `POST /capture` with the session token, a
+  PDF url, and a configured `ai test`/`ai ask`) and add network-path coverage.
+- **GUI polish** — see the follow-ups list above; also still GUI-less engine
+  features: notes, history, dedupe-merge, saved views, export/export-targets,
+  per-entry enrich, attach/fetch PDF. Other known-mock GUI bits: workflow
+  toggles + fonts/density visual-only, keymap/integrations stubs, board
+  drag-and-drop not implemented, `has_pdf` indicator is a url-presence proxy.
+- **Cross-platform CI matrix** — not set up.
 
 ## Known limitations (acceptable, documented)
 
@@ -188,8 +299,10 @@ niutero-bib     tolerant .bib parser + deterministic serializer (the foundation)
 niutero-vault   vault IO: .niutero/ sidecar, atomic writes (temp + fsync + rename)
 niutero-sync    git sync by shelling out to system `git` (no libgit2, no creds)
 niutero-norm    offline, propose-only normalization (W2 port of bib_fixer)
+niutero-online  online helpers (DOI fetch, enrich, LLM via system `curl`)
 niutero-engine  operations layer — EVERY capability is a fn here over an open Vault
 niutero-cli     thin clap arg-parse + output shell (binary: `niutero`)
+niutero-gui     Phase-2 egui thin client — calls niutero-engine directly
 ```
 
 `niutero-engine` is the reusable surface that makes "CLI is the complete
@@ -216,6 +329,12 @@ thin CLI command.
 - **Rust `regex` has no look-ahead/look-behind.** W2 dropped `fix_bib`'s ICCV
   `(?! and)` guard — CVPR is matched *first* in `CONFERENCE_RULES`, so a CVPR
   title never reaches the ICCV rule. Keep rule order load-bearing.
+- **`curl -K` unescapes backslashes in double-quoted config values** — a
+  Windows path in `data = "@C:\Temp\body.json"` turns `\T` into a TAB and the
+  request never leaves the machine (this silently broke every AI call on
+  Windows). Forward-slash any path that goes into a curl config (`curl`
+  accepts `/` on Windows). Discovered fixing the AI calls; the config now goes
+  to curl via stdin (`-K -`) anyway so the key never touches disk.
 - **`niutero_bib::parse()` is infallible** — returns `Vec<BibItem>` directly,
   not a `Result`.
 - **`cargo build --workspace` does NOT compile test code**; a private-field or

@@ -158,6 +158,54 @@ pub enum LibAction {
     NewEntry(Option<Status>),
     /// Open the "add by DOI / import a .bib file" dialog.
     AddByDoi,
+    /// Delete the entry with this cite key (opens a confirm dialog first).
+    Delete(String),
+}
+
+/// The right-click context menu for an entry (shared by Classic rows, Reader
+/// cards, and Board cards). Pushes [`LibAction`]s that the app applies to the
+/// entry; the caller selects the entry on right-click so they target it.
+pub(super) fn entry_context_menu(ui: &mut egui::Ui, e: &EntryView, actions: &mut Vec<LibAction>) {
+    if ui.button("Copy citation").clicked() {
+        actions.push(LibAction::Cite);
+        ui.close();
+    }
+    if ui.button("Copy BibTeX").clicked() {
+        actions.push(LibAction::Bibtex);
+        ui.close();
+    }
+    if ui.button("Copy cite key").clicked() {
+        ui.ctx().copy_text(e.citekey.clone());
+        ui.close();
+    }
+    if let Some(url) = e.fields.get("url").filter(|u| !u.trim().is_empty()) {
+        if ui.button("Open link").clicked() {
+            actions.push(LibAction::OpenUrl(url.clone()));
+            ui.close();
+        }
+    }
+    if has_pdf(e) && ui.button("Open PDF").clicked() {
+        actions.push(LibAction::OpenPdf);
+        ui.close();
+    }
+    ui.separator();
+    ui.menu_button("Set status", |ui| {
+        for (label, status) in [
+            ("Unread", Status::Unread),
+            ("Reading", Status::Reading),
+            ("Read", Status::Done),
+        ] {
+            if ui.button(label).clicked() {
+                actions.push(LibAction::SetStatus(status));
+                ui.close();
+            }
+        }
+    });
+    ui.separator();
+    if ui.button("Delete entry…").clicked() {
+        actions.push(LibAction::Delete(e.citekey.clone()));
+        ui.close();
+    }
 }
 
 /// Render the Classic view. Returns nothing; queued engine actions go into
@@ -244,7 +292,7 @@ fn tags_sidebar(ui: &mut egui::Ui, theme: &Theme, entries: &[EntryView], st: &mu
 
     // TAGS section header with the AI auto-tag (✦) and new-tag (+) buttons.
     // Both open popovers in the design; rendered now, wired in a later wave.
-    tags_header(ui, theme, st);
+    tags_header(ui, theme);
 
     ensure_tag_groups(st, entries);
     let groups = std::mem::take(&mut st.tag_groups_cache);
@@ -339,26 +387,10 @@ fn all_entries_row(ui: &mut egui::Ui, theme: &Theme, on: bool, count: usize) -> 
 }
 
 /// "TAGS" section header with ✦ (AI auto-tag) and + (new tag) buttons.
-fn tags_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState) {
+fn tags_header(ui: &mut egui::Ui, theme: &Theme) {
     ui.horizontal(|ui| {
         ui.add_space(2.0);
         ui.label(RichText::new("TAGS").size(11.0).strong().color(theme.muted));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // "+ New tag" is a shortcut to the detail panel's tag editor: it opens
-            // the inline add-tag input on the selected entry (tags are per-entry —
-            // there's no standalone tag object).
-            if mini_icon_btn(ui, theme, Glyph::Plus)
-                .on_hover_text("Add a tag to the selected entry")
-                .clicked()
-            {
-                st.hide_detail = false;
-                st.locked = false;
-                st.adding_tag = true;
-            }
-            // Auto-tag is LLM-backed (Anthropic API) — deferred with the AI tab.
-            let _ = mini_icon_btn(ui, theme, Glyph::Sparkle)
-                .on_hover_text("Auto-tag with AI (needs a connected model)");
-        });
     });
     ui.add_space(2.0);
 }
@@ -402,17 +434,6 @@ fn group_header(
         theme.muted,
     );
     resp.clicked()
-}
-
-/// A 22×22 transparent icon button (sidebar header controls).
-fn mini_icon_btn(ui: &mut egui::Ui, theme: &Theme, glyph: Glyph) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(6), theme.surface_2);
-    }
-    icons::paint_at(ui, rect.shrink(4.0), glyph, theme.muted);
-    resp
 }
 
 /// One tag in the tree: (full `ns:value`, display value, count, dot color).
@@ -476,7 +497,7 @@ fn ns_label(ns: &str) -> String {
 }
 
 /// A stable per-tag color from the design's semantic palette.
-fn tag_color(name: &str) -> Color32 {
+pub(crate) fn tag_color(name: &str) -> Color32 {
     const PALETTE: [(u8, u8, u8); 6] = [
         (0x1F, 0x8A, 0x5B), // accent green
         (0x2A, 0x6F, 0xDB), // blue
@@ -635,10 +656,13 @@ fn item_list(
                     for i in range {
                         let e = &entries[order[i]];
                         let sel = st.selected.as_deref() == Some(&e.citekey);
-                        if list_row(ui, theme, content_w, e, sel).clicked() {
+                        let resp = list_row(ui, theme, content_w, e, sel);
+                        // Primary or right click selects (so the menu targets it).
+                        if resp.clicked() || resp.secondary_clicked() {
                             st.selected = Some(e.citekey.clone());
                             st.buffers_for = None; // re-load edit buffers for the new pick
                         }
+                        resp.context_menu(|ui| entry_context_menu(ui, e, actions));
                     }
                 });
         });
@@ -934,7 +958,7 @@ fn detail_header(ui: &mut egui::Ui, theme: &Theme, st: &mut LibState, e: &EntryV
             );
         });
     });
-    ui.add_space(6.0);
+    ui.add_space(8.0); // design: header marginBottom 8 (+ title marginTop 4)
 }
 
 pub(super) fn detail_panel(
@@ -966,7 +990,7 @@ pub(super) fn detail_panel(
                     left: 22,
                     right: 22,
                     top: 16,
-                    bottom: 8,
+                    bottom: 20,
                 }),
         )
         .show_inside(ui, |ui| {
@@ -993,9 +1017,9 @@ pub(super) fn detail_fields(
 ) {
     let locked = st.locked;
 
-    // Title (serif 24).
+    // Title (serif 24, design margin 4/0/8).
     edit_text(ui, theme, st, actions, "title", locked, true);
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
     // Authors byline (no label) — compact line locked; editable raw line when
     // unlocked (the Zotero per-author rows are a planned refinement).
@@ -1008,7 +1032,7 @@ pub(super) fn detail_fields(
     } else {
         edit_field_raw(ui, theme, st, actions, "author", false);
     }
-    ui.add_space(14.0);
+    ui.add_space(18.0); // design: authors marginBottom 18
 
     // Divided metadata rows.
     let pub_field = if e.fields.contains_key("journal") {
@@ -1030,17 +1054,17 @@ pub(super) fn detail_fields(
 
     // Reading status + stars (Board drawer only).
     if reading {
-        ui.add_space(14.0);
+        ui.add_space(18.0);
         meta_label(ui, theme, "Reading");
         status_stars(ui, theme, e, actions);
     }
 
-    // Abstract.
-    ui.add_space(14.0);
+    // Abstract (design: sans, 13.5/text-2 — only the Reader pane is serif).
+    ui.add_space(18.0);
     meta_label(ui, theme, "Abstract");
     if locked {
         let abs = e.fields.get("abstract").map(String::as_str).unwrap_or("—");
-        crate::tex::runs_label(ui, abs, theme::serif(13.5), theme.text_2);
+        crate::tex::runs_label(ui, abs, egui::FontId::proportional(13.5), theme.text_2);
     } else {
         let buf = st.buffers.get_mut("abstract").unwrap();
         let r = ui.add(
@@ -1057,7 +1081,7 @@ pub(super) fn detail_fields(
     }
 
     // Tags.
-    ui.add_space(14.0);
+    ui.add_space(18.0);
     meta_label(ui, theme, "Tags");
     tags_editor(ui, theme, e, locked, st, actions);
 }
@@ -1281,7 +1305,7 @@ fn meta_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
             .strong()
             .color(theme.muted),
     );
-    ui.add_space(6.0);
+    ui.add_space(8.0); // design: section label marginBottom 8
 }
 
 /// A divided metadata row (design `metaRow`): a top hairline, then a fixed 92px
@@ -1572,7 +1596,7 @@ fn year_of(e: &EntryView) -> i32 {
         .unwrap_or(0)
 }
 
-fn creator_of(e: &EntryView) -> String {
+pub(crate) fn creator_of(e: &EntryView) -> String {
     let authors = authors_vec(e);
     match authors.len() {
         0 => "—".into(),
@@ -1601,7 +1625,7 @@ fn authors_line(e: &EntryView) -> String {
     if v.is_empty() {
         "—".into()
     } else {
-        v.join("  ·  ")
+        v.join(" · ") // design AuthorsField: authors.join(' · ')
     }
 }
 
@@ -1626,7 +1650,7 @@ fn has_pdf(e: &EntryView) -> bool {
     e.fields.get("url").is_some_and(|u| !u.is_empty())
 }
 
-fn type_label(t: &str) -> &'static str {
+pub(crate) fn type_label(t: &str) -> &'static str {
     match t {
         "inproceedings" | "conference" => "Conference Paper",
         "article" => "Journal Article",
@@ -1645,7 +1669,7 @@ fn type_label(t: &str) -> &'static str {
     }
 }
 
-fn type_glyph(theme: &Theme, t: &str) -> (Glyph, Color32) {
+pub(crate) fn type_glyph(theme: &Theme, t: &str) -> (Glyph, Color32) {
     match t {
         "inproceedings" | "conference" | "proceedings" => (Glyph::Book, theme.accent),
         "article" => (Glyph::Doc, theme.blue),

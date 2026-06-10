@@ -24,11 +24,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// The machine-local registry: a list of known vaults, most-recently-opened
-/// first.
+/// first, plus machine-local LLM settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Registry {
     #[serde(default, rename = "vault")]
     pub vaults: Vec<VaultRecord>,
+    /// Machine-local LLM ("AI assistant") configuration. Stored here — never in
+    /// a synced vault — so an API key can't leak into git.
+    #[serde(default, skip_serializing_if = "AiConfig::is_default")]
+    pub ai: AiConfig,
+}
+
+/// Machine-local LLM settings (Settings → AI assistant). The API key lives here
+/// in `vaults.toml`, never in a library or git.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// Master switch — off by default; the AI features error until it's on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enabled: bool,
+    /// Provider label (only "anthropic" is wired today; stored for the UI).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// API key (falls back to `$ANTHROPIC_API_KEY` when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    /// Model id (falls back to a built-in default when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Optional API base URL override.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+}
+
+impl AiConfig {
+    /// True when all-default, so it's omitted from `vaults.toml`.
+    pub fn is_default(&self) -> bool {
+        *self == AiConfig::default()
+    }
 }
 
 /// One vault's machine-local record, keyed by its canonical path.
@@ -107,7 +139,8 @@ impl Registry {
     }
 
     /// Write the registry to an explicit path, creating the parent dir. The
-    /// write is atomic (temp + rename) via [`crate::write_atomic`].
+    /// write is atomic (temp + rename) and owner-only on Unix — the registry
+    /// can hold the AI API key, so it must not be world-readable at rest.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -116,7 +149,7 @@ impl Registry {
         }
         let body = toml::to_string(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        crate::atomic_write(path, &body)
+        crate::atomic_write_private(path, &body)
     }
 
     /// Load from the machine's default registry path (or `$NIUTERO_REGISTRY`).
@@ -359,6 +392,22 @@ mod tests {
         // And an absent table reads back as the default (pull && push).
         let back = Registry::load_from(&path).unwrap();
         assert!(back.get(&vault).unwrap().sync.is_default());
+    }
+
+    /// Unix-only (the dev machine is Windows; CI's Linux leg runs this): a
+    /// registry that can hold an API key must land owner-only at rest.
+    #[cfg(unix)]
+    #[test]
+    fn registry_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        let path = dir.path().join("vaults.toml");
+        let mut reg = Registry::default();
+        reg.ai.enabled = true;
+        reg.ai.api_key = "sk-secret".into();
+        reg.save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "registry must be owner-only, got {mode:o}");
     }
 
     #[test]

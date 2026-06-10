@@ -13,6 +13,7 @@ niutero-norm = { path = "../niutero-norm" }
 niutero-online = { path = "../niutero-online" }
 indexmap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,5 +1,57 @@
 # GUI Button Audit — what's real, what's a placeholder
 
+> ## Status as of 2026-06-10 — this block supersedes the audit below
+>
+> The audit was taken before two landings: the wiring pass (`6a0b43c`) and the
+> 2026-06-10 AI/tags/security landing. The body below is kept as the historical
+> map (its line numbers are stale); where it disagrees with this block, this
+> block wins.
+>
+> **Now real (was placeholder):**
+> - **Section A is wired, 1–6**: the add-entry dialog (Classic **+**, Board
+>   **Add**, per-column **+**), add-by-DOI / import `.bib` (🔗), Re-key
+>   **Preview all**, rail **Sync**, **Auto-tag** (per-entry
+>   `engine::suggest_tags`, now LLM-backed via the wizard), and a real
+>   online-enrich loop run off-thread (the fake 6s timer is gone). Only A.7
+>   (board drag-between-columns) remains unimplemented.
+> - **Delete entry** exists: detail-panel "Delete entry…" → confirm dialog →
+>   `engine::rm` (was the most conspicuous D-list omission).
+> - **AI tab + floating popup are LIVE** when LLM assist is configured
+>   (Settings → AI or `niutero ai config --enable true`): chat asks ground in
+>   the library; jobs are stamped with kind + vault root, cancellable, and
+>   cancelled on library switch (no cross-library delivery); the popup keeps
+>   the typed question if an ask is refused; the fake Scope menu is an honest
+>   static label now.
+> - **Settings → AI page is real**: persists via `engine::update_ai_config`
+>   (dirty-flush per frame + on tool/library switch/exit); provider locked to
+>   Anthropic (others disabled "not wired yet"); model seeded from
+>   `engine::DEFAULT_MODEL`.
+> - **A Tags tool exists** (rail: Library / Normalize / AI / Tags / Settings —
+>   not in this audit at all): vocabulary table; rename commits on Enter
+>   (Esc/click-away reverts); Merge/Delete behind confirm dialogs showing the
+>   affected entry count; Import / Organize / Auto-tag wizards whose Apply
+>   paths use one bulk engine call (`set_tags_bulk` / `apply_tag_merges`) and
+>   whose Done steps show real applied/skipped/failed counts. The Organize
+>   wizard's capability is CLI-covered by `niutero ai organize` (invariant 3
+>   holds again).
+>
+> **Still mock / unchanged:**
+> - **B.1 Normalize ruleset toggles** — still display-only; engine still has no
+>   ruleset read/write.
+> - Settings: library name / citekey-pattern fields, workflow toggles,
+>   fonts/density — visual-only; keymap / integrations pages — stubs; the PDF
+>   page's HF-token input is disabled ("coming soon").
+> - Board drag-and-drop not implemented; the `has_pdf` indicator is still a
+>   url-presence proxy; tag colors are session-local (labeled as such).
+> - Live network paths (AI, DOI, enrich, connector, PDF fetch) remain
+>   manually-verified-only — a live AI smoke is planned next.
+>
+> **Engine features still with no GUI surface** (updated D list): notes,
+> history, dedupe-merge, saved views, export / export-targets, per-entry
+> enrich, attach/fetch PDF.
+
+---
+
 Audited the full interactive surface of `niutero-gui` (every button, clickable
 icon, toggle, menu, clickable row) and cross-referenced each placeholder against
 the `niutero-engine` public API to see whether the backing capability already

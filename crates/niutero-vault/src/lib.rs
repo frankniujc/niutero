@@ -29,7 +29,7 @@ use niutero_bib::{parse, to_bibtex, BibItem};
 use serde::{Deserialize, Serialize};
 
 pub mod registry;
-pub use registry::{ExportTarget, Registry, SyncPrefs, VaultRecord};
+pub use registry::{AiConfig, ExportTarget, Registry, SyncPrefs, VaultRecord};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -301,6 +301,19 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Windows), so a crash leaves either the old file or the new one intact —
 /// never a truncated `references.bib`.
 fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
+    atomic_write_impl(path, contents, false)
+}
+
+/// Like [`atomic_write`], but the file ends up owner-only (0600) on Unix —
+/// for machine-local files that can hold secrets, like the registry once an
+/// AI key is stored in it. (`rename` keeps the temp file's mode, so the
+/// restriction survives the swap.) On Windows the per-user `%APPDATA%`
+/// default ACL already scopes the file to the user.
+pub(crate) fn atomic_write_private(path: &Path, contents: &str) -> io::Result<()> {
+    atomic_write_impl(path, contents, true)
+}
+
+fn atomic_write_impl(path: &Path, contents: &str, private: bool) -> io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -311,6 +324,13 @@ fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
 
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        let _ = private;
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
         fs::rename(&tmp, path)

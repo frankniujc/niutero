@@ -1698,6 +1698,7 @@ dependencies = [
  "niutero-sync",
  "niutero-vault",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1729,6 +1730,7 @@ name = "niutero-online"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

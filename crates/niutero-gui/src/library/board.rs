@@ -8,12 +8,13 @@
 //! drawer — the board reflows on the next reload. (The design's drag-between-
 //! columns is not part of its control inventory.)
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use niutero_engine::{EntryView, Status};
 
 use super::{LibAction, LibState};
 use crate::icons::{self, Glyph};
 use crate::theme::{self, Theme};
+use crate::widgets;
 
 /// The three board columns: (status key, label, dot color selector).
 const COLUMNS: [(&str, &str); 3] = [
@@ -136,7 +137,7 @@ fn header_bar(
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Add (primary) → the shared new-entry dialog.
-                    if pri_btn(ui, theme, Glyph::Plus, "Add")
+                    if widgets::pri_btn(ui, theme, Glyph::Plus, "Add")
                         .on_hover_text("New entry")
                         .clicked()
                     {
@@ -264,11 +265,13 @@ fn column(
                         .max_rect(card_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
-                if card(&mut card_ui, theme, e, sel) {
+                let resp = card(&mut card_ui, theme, e, sel);
+                if resp.clicked() || resp.secondary_clicked() {
                     st.selected = Some(e.citekey.clone());
                     st.drawer_open = true;
                     st.buffers_for = None;
                 }
+                resp.context_menu(|ui| super::entry_context_menu(ui, e, actions));
             }
         });
 }
@@ -295,7 +298,7 @@ fn list_view(
                 return;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if pri_btn(ui, theme, Glyph::Plus, "Add")
+                if widgets::pri_btn(ui, theme, Glyph::Plus, "Add")
                     .on_hover_text("New entry")
                     .clicked()
                 {
@@ -322,18 +325,20 @@ fn list_view(
                                 .max_rect(card_rect)
                                 .layout(egui::Layout::top_down(egui::Align::Min)),
                         );
-                        if card(&mut card_ui, theme, e, sel) {
+                        let resp = card(&mut card_ui, theme, e, sel);
+                        if resp.clicked() || resp.secondary_clicked() {
                             st.selected = Some(e.citekey.clone());
                             st.drawer_open = true;
                             st.buffers_for = None;
                         }
+                        resp.context_menu(|ui| super::entry_context_menu(ui, e, actions));
                     }
                 });
         });
 }
 
-/// One board card. Returns whether it was clicked.
-fn card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> bool {
+/// One board card. Returns its click `Response` (for selection + context menu).
+fn card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> egui::Response {
     let inner = egui::Frame::default()
         .fill(theme.surface)
         .stroke(egui::Stroke::new(
@@ -426,12 +431,11 @@ fn card(ui: &mut egui::Ui, theme: &Theme, e: &EntryView, selected: bool) -> bool
             });
         });
 
-    let r = ui.interact(
+    ui.interact(
         inner.response.rect,
         ui.id().with(("board-card", &e.citekey)),
         egui::Sense::click(),
-    );
-    r.clicked()
+    )
 }
 
 /// The dashed "+ Add paper" affordance, painted into the top of `row_rect`.
@@ -561,27 +565,6 @@ fn tag_chip(ui: &mut egui::Ui, theme: &Theme, tag: &str) {
                 ui.label(RichText::new(value).size(11.0).color(theme.text_2));
             });
         });
-}
-
-/// A primary pill button (icon + label).
-fn pri_btn(ui: &mut egui::Ui, theme: &Theme, icon: Glyph, label: &str) -> egui::Response {
-    egui::Frame::default()
-        .fill(theme.accent)
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(12, 7))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                icons::show(ui, icon, 16.0, Color32::WHITE);
-                ui.label(
-                    RichText::new(label)
-                        .size(13.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-            });
-        })
-        .response
-        .interact(egui::Sense::click())
 }
 
 /// A 30×28 segmented icon cell (grid/rows layout toggle).

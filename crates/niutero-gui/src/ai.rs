@@ -1,12 +1,13 @@
-//! AI Assistant — the full chat tab (design spec §7).
+//! AI Assistant — the chat tab (design spec §7), wired to the real model.
 //!
-//! There is no LLM wired in Phase 1 (the engine exposes no model op, and the CLI
-//! is the complete interface), so this is an honest *preview*: the thread is a
-//! demo conversation grounded in the **real** library — citation chips jump to
-//! the actual entries, and "Copy citations" really copies `engine::cite` output.
-//! Composing a message appends it with a clearly-labelled placeholder reply.
+//! Composing a question sends it to `engine::ask` off-thread (grounded in the
+//! library); the answer streams back into the thread. The model is told to cite
+//! cite keys in `[brackets]`, so we surface those as clickable chips that jump
+//! to the real entries, plus a "Copy citations" action. Requires LLM assist to
+//! be enabled (Settings → AI assistant) with a key.
 //!
-//! Engine-touching requests come back as [`AiAction`]s the app applies.
+//! Engine-touching requests come back as [`AiAction`]s the app applies; the
+//! actual model call runs on the app's off-thread AI worker.
 
 use eframe::egui::{self, Color32, RichText};
 use niutero_engine::EntryView;
@@ -15,12 +16,14 @@ use crate::icons::{self, Glyph};
 use crate::theme::Theme;
 use crate::widgets;
 
-/// View-local chat state (just the composer text + any messages the user sent
-/// this session — the leading demo turn is rendered from the library).
+/// View-local chat state: the composer text, the conversation turns, and whether
+/// an answer is currently in flight.
 #[derive(Default)]
 pub struct AiState {
     pub input: String,
     pub turns: Vec<Turn>,
+    /// True while a question is awaiting the model's answer.
+    pub pending: bool,
 }
 
 pub struct Turn {
@@ -30,21 +33,24 @@ pub struct Turn {
 
 /// An engine-touching request from the AI tab/popup.
 pub enum AiAction {
+    /// Ask the model a question (grounded in the library), off-thread.
+    Ask(String),
     /// Jump to the entry in the Library (Classic).
     OpenEntry(String),
     /// Copy formatted citations for these cite keys.
     CopyCitations(Vec<String>),
-    /// A preview-only notice (actions with no real backend yet).
-    Toast(String),
+    /// The thread was cleared — drop any in-flight ask so its stale answer
+    /// can't land in the fresh chat.
+    NewChat,
 }
 
 const SUGGEST: [&str; 3] = [
-    "Find gaps in my SAE coverage",
-    "Draft a related-work paragraph on unlearning",
     "Which papers should I read next?",
+    "Summarize what my library says about evaluation",
+    "What topics am I missing?",
 ];
 
-/// Render the AI Assistant tab. `entries` grounds the demo answer + citations.
+/// Render the AI Assistant tab. `entries` grounds the answers + citation chips.
 pub fn ai_tab(
     ctx: &egui::Context,
     theme: &Theme,
@@ -71,18 +77,21 @@ pub fn ai_tab(
                     if widgets::button(ui, theme, Some(Glyph::Plus), "New chat", false, 30.0)
                         .clicked()
                     {
+                        // A fresh thread: also drop the spinner and tell the
+                        // app to invalidate any in-flight ask, or its stale
+                        // answer would land as an orphan turn in the new chat.
                         st.turns.clear();
+                        st.pending = false;
+                        actions.push(AiAction::NewChat);
                     }
-                    ui.menu_button(
-                        RichText::new("Scope: My Library  ▾")
+                    // Scope is always the whole library today — shown as a
+                    // plain fact, not a menu of options that do nothing.
+                    ui.label(
+                        RichText::new("Scope: My Library")
                             .size(13.0)
-                            .color(theme.text),
-                        |ui| {
-                            let _ = ui.button("My Library");
-                            let _ = ui.button("Current view");
-                            let _ = ui.button("Selected entries");
-                        },
-                    );
+                            .color(theme.muted),
+                    )
+                    .on_hover_text("Narrower scopes (current view, selection) are coming later.");
                 });
             });
         });
@@ -100,7 +109,9 @@ pub fn ai_tab(
                 }),
         )
         .show(ctx, |ui| {
-            widgets::centered_column(ui, 760.0, |ui| composer(ui, theme, entries.len(), st));
+            widgets::centered_column(ui, 760.0, |ui| {
+                composer(ui, theme, entries.len(), st, actions)
+            });
         });
 
     // Thread (fills the rest).
@@ -132,107 +143,90 @@ fn thread(
     st: &mut AiState,
     actions: &mut Vec<AiAction>,
 ) {
-    let cited = grounding_entries(entries);
-
-    // Demo turn — a question grounded in the real library.
-    user_bubble(
-        ui,
-        theme,
-        "Which papers in my library use sparse autoencoders for unlearning, and do they agree on \
-         whether it works?",
-    );
-    ui.add_space(20.0);
-    assistant_row(ui, theme, |ui| {
-        if cited.is_empty() {
+    if st.turns.is_empty() && !st.pending {
+        assistant_row(ui, theme, |ui| {
             ui.label(
-                RichText::new("Your library is empty — add some entries and ask again.")
-                    .size(14.5)
-                    .color(theme.text),
+                RichText::new(format!(
+                    "Ask anything about your {} entries — I answer from your library and cite the \
+                     papers I draw on.",
+                    entries.len()
+                ))
+                .size(14.5)
+                .color(theme.text),
             );
-            return;
-        }
-        ui.label(
-            RichText::new(format!(
-                "{} entr{} in your library touch SAE-based unlearning:",
-                cited.len(),
-                if cited.len() == 1 { "y" } else { "ies" }
-            ))
-            .size(14.5)
-            .color(theme.text),
-        );
-        ui.add_space(8.0);
-        for e in &cited {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("•").color(theme.muted));
-                if cite_chip(ui, theme, &cite_label(e)).clicked() {
-                    actions.push(AiAction::OpenEntry(e.citekey.clone()));
-                }
-                let title =
-                    crate::tex::display(e.fields.get("title").map(String::as_str).unwrap_or(""));
-                ui.label(
-                    RichText::new(crate::library::ellipsize(&title, 52))
-                        .size(13.5)
-                        .color(theme.text_2),
-                );
-            });
-            ui.add_space(4.0);
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
-                "They diverge on efficacy — some report clean forgetting, others collateral \
-                 damage to retained capabilities.  (Preview: not a real model answer.)",
-            )
-            .size(14.5)
-            .color(theme.text),
-        );
-        ui.add_space(11.0);
-        // answer actions
-        ui.horizontal_wrapped(|ui| {
-            if widgets::button(
-                ui,
-                theme,
-                Some(Glyph::Quote),
-                "Draft related-work ¶",
-                false,
-                30.0,
-            )
-            .clicked()
-            {
-                actions.push(AiAction::Toast(
-                    "Drafting needs a connected model (preview)".into(),
-                ));
-            }
-            let tag_lbl = format!("Tag these {} “unlearning”", cited.len());
-            if widgets::button(ui, theme, Some(Glyph::Tag), &tag_lbl, false, 30.0).clicked() {
-                actions.push(AiAction::Toast(
-                    "Bulk-tag needs a connected model (preview)".into(),
-                ));
-            }
-            if widgets::button(ui, theme, Some(Glyph::Copy), "Copy citations", false, 30.0)
-                .clicked()
-            {
-                actions.push(AiAction::CopyCitations(
-                    cited.iter().map(|e| e.citekey.clone()).collect(),
-                ));
-            }
         });
-    });
+        return;
+    }
 
-    // Any messages the user composed this session.
     for t in &st.turns {
-        ui.add_space(20.0);
         if t.user {
             user_bubble(ui, theme, &t.text);
         } else {
             assistant_row(ui, theme, |ui| {
                 ui.label(RichText::new(&t.text).size(14.5).color(theme.text));
+                // Surface the cite keys the model referenced as jump chips.
+                let cited = cited_in(&t.text, entries);
+                if !cited.is_empty() {
+                    ui.add_space(9.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for e in &cited {
+                            if cite_chip(ui, theme, &cite_label(e)).clicked() {
+                                actions.push(AiAction::OpenEntry(e.citekey.clone()));
+                            }
+                        }
+                        if widgets::button(
+                            ui,
+                            theme,
+                            Some(Glyph::Copy),
+                            "Copy citations",
+                            false,
+                            28.0,
+                        )
+                        .clicked()
+                        {
+                            actions.push(AiAction::CopyCitations(
+                                cited.iter().map(|e| e.citekey.clone()).collect(),
+                            ));
+                        }
+                    });
+                }
             });
         }
+        ui.add_space(20.0);
+    }
+
+    if st.pending {
+        assistant_row(ui, theme, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(16.0).color(theme.accent));
+                ui.label(RichText::new("Thinking…").size(14.0).color(theme.muted));
+            });
+        });
     }
 }
 
-fn composer(ui: &mut egui::Ui, theme: &Theme, count: usize, st: &mut AiState) {
+/// The entries the model cited, by scanning the answer for `[citekey]` markers
+/// that match real entries (de-duplicated, in order of appearance). Shared with
+/// the popup chat (`overlays`).
+pub(crate) fn cited_in<'a>(answer: &str, entries: &'a [EntryView]) -> Vec<&'a EntryView> {
+    let mut out: Vec<&EntryView> = Vec::new();
+    for e in entries {
+        if answer.contains(&format!("[{}]", e.citekey))
+            && !out.iter().any(|x| x.citekey == e.citekey)
+        {
+            out.push(e);
+        }
+    }
+    out
+}
+
+fn composer(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    count: usize,
+    st: &mut AiState,
+    actions: &mut Vec<AiAction>,
+) {
     // Suggestion chips.
     ui.horizontal_wrapped(|ui| {
         for s in SUGGEST {
@@ -277,7 +271,11 @@ fn composer(ui: &mut egui::Ui, theme: &Theme, count: usize, st: &mut AiState) {
             });
         });
     if send {
-        send_message(st, count);
+        let q = st.input.trim().to_string();
+        if !q.is_empty() && !st.pending {
+            // The app records the turn, clears the input, and runs the model.
+            actions.push(AiAction::Ask(q));
+        }
     }
     ui.add_space(9.0);
     ui.vertical_centered(|ui| {
@@ -290,22 +288,6 @@ fn composer(ui: &mut egui::Ui, theme: &Theme, count: usize, st: &mut AiState) {
             .color(theme.faint),
         );
     });
-}
-
-fn send_message(st: &mut AiState, count: usize) {
-    let text = st.input.trim().to_string();
-    if text.is_empty() {
-        return;
-    }
-    st.turns.push(Turn { user: true, text });
-    st.turns.push(Turn {
-        user: false,
-        text: format!(
-            "No model is connected yet — this is a preview. With one wired I'd search your \
-             {count} entries and answer with citations.",
-        ),
-    });
-    st.input.clear();
 }
 
 // ----------------------------------------------------------- shared chat bits
@@ -375,20 +357,6 @@ fn pill_chip(ui: &mut egui::Ui, theme: &Theme, label: &str) -> bool {
 }
 
 // ------------------------------------------------------------------ grounding
-
-/// Entries the demo answer cites: those tagged for unlearning, else the first
-/// few — so the citation chips always point at real entries.
-pub(crate) fn grounding_entries(entries: &[EntryView]) -> Vec<&EntryView> {
-    let mut v: Vec<&EntryView> = entries
-        .iter()
-        .filter(|e| e.tags.iter().any(|t| t.contains("unlearn")))
-        .collect();
-    if v.is_empty() {
-        v = entries.iter().take(3).collect();
-    }
-    v.truncate(3);
-    v
-}
 
 /// "Lastname et al. YEAR" (or "Lastname YEAR" for a single author).
 pub(crate) fn cite_label(e: &EntryView) -> String {

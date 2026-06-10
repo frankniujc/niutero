@@ -80,6 +80,58 @@ niutero import <vault> <file.bib> [--on-dup skip|overwrite|rename]
 niutero export <vault> --out FILE [--query Q | --view NAME]
 ```
 
+### Post-M5 surface (implemented)
+
+The base list above is the historical M1–M4 plan, kept as written. The shipped
+CLI grew well past it (the authoritative list is the `Cmd` enum in
+`crates/niutero-cli/src/main.rs`). The additions, as of 2026-06-10:
+
+**Tag vocabulary** — whole-library tag ops, sidecar-only (`references.bib`
+untouched):
+
+```
+niutero tags <vault> list                  [--json]
+niutero tags <vault> rename <from> <to>    [--json]   # merges if <to> exists
+niutero tags <vault> merge  <from> <into>  [--json]   # alias of rename
+niutero tags <vault> delete <name>         [--json]
+```
+
+**LLM assist** — machine-local config in the registry (`vaults.toml`), never in
+the vault:
+
+```
+niutero ai config [--enable BOOL] [--provider S] [--key S | --key-stdin]
+                  [--model S] [--base-url S] [--json]
+niutero ai test [--json]
+niutero ai ask <vault> QUESTION [--json]
+niutero ai organize <vault> [--instructions S | --plan FILE] [--apply] [--json]
+```
+
+- `ai config`: `--key-stdin` reads the key from stdin so it never appears in
+  argv/shell history; keys are never echoed back; updates are a read-modify-write
+  under the registry lock. Only `anthropic` is wired — any other provider, or a
+  non-empty `--base-url`, makes calls refuse to run (no silent misrouting).
+- `ai organize` contract: by default it prints the model's tag-merge **plan**
+  for review; `--json` output is valid `--plan` input, and the `--plan` path is
+  fully **offline** (review a plan, save it, apply it later without a network
+  call); `--apply` runs the merges with per-merge results. New-tag suggestions
+  are always advisory — a tag exists only on entries. Exit codes: `0` ok /
+  `1` error.
+
+**Connector hardening** — `niutero connector` prints a per-session token;
+`POST /capture` requires it (`Authorization: Bearer <t>` or `X-Niutero-Token`),
+wildcard CORS is gone, bodies are capped at 512 KB, sockets have timeouts.
+
+**Everything else** that shipped beyond this plan, one line each (all take
+`<vault>` first and support `--json` where output exists): `history` (per-entry
+git log), `rekey` (key-pattern preview/`--write`), `status` / `stars` (reading
+state), `analyze` (offline health report), `dedupe [--merge]`,
+`normalize --profile`, `export-target add/rm/list` (keep-updated mirrors),
+`sync-config` (machine-local pull/push toggles), `recent` / `forget` (registry),
+`suggest-tags` (LLM, needs `ai config --enable true`), `enrich` (DOI fill),
+`import --doi`, `pdf [--attach|--fetch]`, `cite`, `connect`. Browser capture is
+the connector's `POST /capture` endpoint, not a subcommand.
+
 ## Testing (this is the point of Phase 1)
 
 - **Big-bib fixture.** Drop a large real library at

@@ -98,6 +98,190 @@ fn tag_missing_entry_errors() {
         .stderr(predicate::str::contains("no entry with cite key 'ghost'"));
 }
 
+// ----------------------------------------------------- tag vocabulary (tags)
+
+#[test]
+fn tags_vocab_list_rename_merge_delete_bib_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    niutero().arg("init").arg(d.path()).assert().success();
+    fs::write(
+        d.path().join("references.bib"),
+        "@misc{a,\n  title = {A}\n}\n@misc{b,\n  title = {B}\n}\n",
+    )
+    .unwrap();
+    let before = bib(&d);
+
+    niutero()
+        .arg("tag")
+        .arg(d.path())
+        .arg("a")
+        .args(["--add", "topics:interp", "--add", "wf:to-cite"])
+        .assert()
+        .success();
+    niutero()
+        .arg("tag")
+        .arg(d.path())
+        .arg("b")
+        .args(["--add", "topics:interp"])
+        .assert()
+        .success();
+
+    // list (JSON) shows both tags with counts.
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .arg("list")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"tag\": \"topics:interp\"")
+                .and(predicate::str::contains("\"count\": 2"))
+                .and(predicate::str::contains("\"tag\": \"wf:to-cite\"")),
+        );
+
+    // rename touches both entries.
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["rename", "topics:interp", "topics:mech-interp"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 entries"));
+    niutero()
+        .arg("show")
+        .arg(d.path())
+        .arg("a")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("topics:mech-interp"));
+
+    // merge folds wf:to-cite into the renamed tag (only entry a has it).
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["merge", "wf:to-cite", "topics:mech-interp"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 entry"));
+
+    // delete removes it from both, leaving no tags.
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["delete", "topics:mech-interp"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 entries"));
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no tags)"));
+
+    // The vocabulary lives only in the sidecar — references.bib is untouched.
+    assert_eq!(bib(&d), before);
+}
+
+#[test]
+fn tags_rename_and_delete_json_shapes() {
+    // Pins the documented JSON contracts for script/GUI consumers.
+    let d = vault_with_entry();
+    niutero()
+        .arg("tag")
+        .arg(d.path())
+        .arg("k")
+        .args(["--add", "x"])
+        .assert()
+        .success();
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["rename", "x", "y", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"from\": \"x\"")
+                .and(predicate::str::contains("\"to\": \"y\""))
+                .and(predicate::str::contains("\"changed\": 1")),
+        );
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["merge", "y", "z", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"into\": \"z\"")
+                .and(predicate::str::contains("\"changed\": 1")),
+        );
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["delete", "z", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"tag\": \"z\"")
+                .and(predicate::str::contains("\"changed\": 1")),
+        );
+}
+
+#[test]
+fn tags_rename_refreshes_keep_updated_exports() {
+    // A `tag:`-filtered keep-updated target must re-export after a vocabulary
+    // mutation (`tags rename`), exactly like per-entry `tag --add` does.
+    let d = vault_with_entry();
+    niutero()
+        .arg("tag")
+        .arg(d.path())
+        .arg("k")
+        .args(["--add", "thesis"])
+        .assert()
+        .success();
+    let mirror = d.path().join("mirror.bib");
+    niutero()
+        .arg("export-target")
+        .arg(d.path())
+        .arg("add")
+        .arg(&mirror)
+        .args(["--query", "tag:thesis"])
+        .assert()
+        .success();
+    assert!(fs::read_to_string(&mirror).unwrap().contains("@misc{k"));
+
+    // After the rename nothing carries `thesis`, so the mirror empties.
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["rename", "thesis", "topics:thesis"])
+        .assert()
+        .success();
+    assert!(!fs::read_to_string(&mirror).unwrap().contains("@misc{k"));
+}
+
+#[test]
+fn tags_rename_empty_target_errors() {
+    let d = vault_with_entry();
+    niutero()
+        .arg("tag")
+        .arg(d.path())
+        .arg("k")
+        .args(["--add", "topics:x"])
+        .assert()
+        .success();
+    niutero()
+        .arg("tags")
+        .arg(d.path())
+        .args(["rename", "topics:x", "   "])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("must not be empty"));
+}
+
 // -------------------------------------------------------------------- note
 
 #[test]

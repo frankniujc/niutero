@@ -45,52 +45,105 @@ pub fn fetch_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
 pub fn anthropic_text(model: &str, system: &str, user: &str) -> Result<String, String> {
     let key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "set ANTHROPIC_API_KEY to use the AI features".to_string())?;
+    anthropic_text_with(&key, model, 512, system, user)
+}
+
+/// Like [`anthropic_text`] but with an explicit key and `max_tokens` — so the
+/// engine can drive it from the user's stored AI config. The key goes to curl
+/// as a `-K -` config on **stdin** (never argv, never on disk); only the
+/// request body touches disk, as a random-named 0600 temp file.
+pub fn anthropic_text_with(
+    key: &str,
+    model: &str,
+    max_tokens: u32,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("no API key configured".into());
+    }
+    if key.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
+        // Quotes/backslashes/control chars would corrupt the quoted curl config
+        // line (or inject directives); no real API key contains them.
+        return Err("the API key contains characters that aren't allowed in a key".into());
+    }
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 512,
+        "max_tokens": max_tokens,
         "system": system,
         "messages": [{ "role": "user", "content": user }],
     })
     .to_string();
 
-    // Pass secrets/body via a temp -K config so nothing lands in argv.
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let body_path = dir.join(format!("niutero-llm-{pid}.json"));
-    let cfg_path = dir.join(format!("niutero-llm-{pid}.cfg"));
-    std::fs::write(&body_path, &body).map_err(|e| format!("write request body: {e}"))?;
-    let cfg = format!(
+    // The body goes via a random-named temp file (0600 on Unix, auto-deleted on
+    // drop even if the call errors); the config — the only part holding the
+    // key — is fed to `-K -` on stdin so the secret never lands on disk.
+    let mut body_file = tempfile::Builder::new()
+        .prefix("niutero-llm-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|e| format!("create request temp file: {e}"))?;
+    std::io::Write::write_all(&mut body_file, body.as_bytes())
+        .map_err(|e| format!("write request body: {e}"))?;
+    let cfg = curl_llm_cfg(key, body_file.path());
+
+    // No `-f`: on an HTTP error we want the API's JSON error body so
+    // `extract_text` can surface its message instead of an opaque curl exit.
+    let raw = ok_with_stdin(&["-sSL", "--max-time", "60", "-K", "-"], &cfg)?;
+    drop(body_file); // deletes the temp file
+    extract_text(&raw)
+}
+
+/// Build the `-K` curl config for an LLM call. Pure.
+///
+/// Inside curl's double-quoted config values backslash sequences are
+/// *unescaped* (`\t` → TAB, a lone `\x` drops the backslash), which mangles
+/// Windows paths — so the body path is emitted with forward slashes, which
+/// curl accepts on every platform and which are inert inside the quotes.
+fn curl_llm_cfg(key: &str, body_path: &std::path::Path) -> String {
+    let path = body_path.display().to_string().replace('\\', "/");
+    format!(
         "url = \"https://api.anthropic.com/v1/messages\"\n\
          header = \"content-type: application/json\"\n\
          header = \"anthropic-version: 2023-06-01\"\n\
          header = \"x-api-key: {key}\"\n\
-         data = \"@{}\"\n",
-        body_path.display()
-    );
-    std::fs::write(&cfg_path, cfg).map_err(|e| format!("write curl config: {e}"))?;
+         data = \"@{path}\"\n"
+    )
+}
 
-    let result = ok(&[
-        "-fsSL",
-        "--max-time",
-        "60",
-        "-K",
-        cfg_path.to_str().unwrap_or_default(),
-    ]);
-    let _ = std::fs::remove_file(&cfg_path);
-    let _ = std::fs::remove_file(&body_path);
-
-    let raw = result?;
+/// Pull the answer text out of a Messages API response. Pure.
+///
+/// Surfaces the API's own `error.message` for error bodies (reachable now that
+/// the call drops `-f`), and flags responses truncated at the token limit.
+fn extract_text(raw: &str) -> Result<String, String> {
     let value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse API response: {e}"))?;
-    value["content"]
-        .as_array()
-        .and_then(|blocks| {
-            blocks
-                .iter()
-                .find_map(|b| (b["type"] == "text").then(|| b["text"].as_str()).flatten())
-        })
-        .map(str::to_string)
-        .ok_or_else(|| "no text in the API response".to_string())
+        serde_json::from_str(raw).map_err(|e| format!("parse API response: {e}"))?;
+    if value["type"] == "error" {
+        let kind = value["error"]["type"].as_str().unwrap_or("error");
+        let msg = value["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown API error");
+        return Err(format!("API error ({kind}): {msg}"));
+    }
+    let stop_reason = value["stop_reason"].as_str().unwrap_or("");
+    let text = value["content"].as_array().and_then(|blocks| {
+        blocks
+            .iter()
+            .find_map(|b| (b["type"] == "text").then(|| b["text"].as_str()).flatten())
+    });
+    match text {
+        Some(t) if stop_reason == "max_tokens" => {
+            Ok(format!("{t}\n[answer truncated at the token limit]"))
+        }
+        Some(t) => Ok(t.to_string()),
+        None if stop_reason == "max_tokens" => Err(
+            "the response hit the token limit before any text was produced (raise max_tokens \
+             or pick a non-thinking model)"
+                .into(),
+        ),
+        None => Err("no text in the API response".into()),
+    }
 }
 
 /// Normalize a DOI — a bare DOI, a `doi:`-prefixed one, or a doi.org URL — to a
@@ -138,6 +191,43 @@ fn ok(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Run curl with `input` piped to stdin (for `-K -` configs that must never
+/// touch disk or argv). The input is tiny, so no pipe-deadlock risk.
+fn ok_with_stdin(args: &[&str], input: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("curl")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                "curl not found on PATH (install curl to use online features)".to_string()
+            }
+            _ => format!("failed to run curl: {e}"),
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .map_err(|e| format!("write curl config: {e}"))?; // drop closes the pipe
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!(
+            "curl failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +247,62 @@ mod tests {
             doi_url("https://aclanthology.org/N19-1423.bib"),
             "https://aclanthology.org/N19-1423.bib"
         );
+    }
+
+    #[test]
+    fn curl_llm_cfg_forward_slashes_windows_paths() {
+        // The worst case: `\T` would become a TAB and `\n` a newline inside
+        // curl's double-quoted config value. Spaces must survive as-is.
+        let p = std::path::Path::new(r"C:\Users\frank y\AppData\Local\Temp\niutero-llm-1.json");
+        let cfg = curl_llm_cfg("sk-ant-test123", p);
+        let data_line = cfg.lines().find(|l| l.starts_with("data")).unwrap();
+        assert_eq!(
+            data_line,
+            "data = \"@C:/Users/frank y/AppData/Local/Temp/niutero-llm-1.json\""
+        );
+        assert!(!data_line.contains('\\'));
+        assert!(cfg.contains("header = \"x-api-key: sk-ant-test123\""));
+        // A Unix path passes through unchanged.
+        let cfg = curl_llm_cfg("k", std::path::Path::new("/tmp/niutero-llm-1.json"));
+        assert!(cfg.contains("data = \"@/tmp/niutero-llm-1.json\""));
+    }
+
+    #[test]
+    fn anthropic_text_with_rejects_bad_keys_before_any_io() {
+        // Empty / whitespace-only.
+        assert!(anthropic_text_with("  ", "m", 16, "s", "u").is_err());
+        // Quote, backslash, or control chars would corrupt the curl config.
+        for bad in ["sk\"x", "sk\\x", "sk\nx"] {
+            let err = anthropic_text_with(bad, "m", 16, "s", "u").unwrap_err();
+            assert!(err.contains("aren't allowed"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn extract_text_finds_the_first_text_block() {
+        let raw = r#"{"content":[{"type":"thinking","thinking":"…"},{"type":"text","text":"hello"}],"stop_reason":"end_turn"}"#;
+        assert_eq!(extract_text(raw).unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_text_surfaces_api_error_bodies() {
+        let raw = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let err = extract_text(raw).unwrap_err();
+        assert!(err.contains("authentication_error"));
+        assert!(err.contains("invalid x-api-key"));
+    }
+
+    #[test]
+    fn extract_text_handles_truncation_and_empty_content() {
+        // Truncated but with text: keep the text, flag the truncation.
+        let raw = r#"{"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}"#;
+        let out = extract_text(raw).unwrap();
+        assert!(out.starts_with("partial"));
+        assert!(out.contains("truncated"));
+        // Token budget eaten before any text (e.g. a thinking-only response).
+        let raw = r#"{"content":[{"type":"thinking","thinking":"…"}],"stop_reason":"max_tokens"}"#;
+        assert!(extract_text(raw).unwrap_err().contains("token limit"));
+        // No content at all: clean error, no panic.
+        assert!(extract_text(r#"{"content":[]}"#).is_err());
     }
 }
