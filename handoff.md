@@ -144,7 +144,8 @@ is the explicit spec that W2's offline normalizer was ported from.
 - **Git**: don't trust this file for branch/push state — check `git status` and
   `git log origin/main..main` yourself (this doc has gone stale on commit counts
   before). The user decides when to push.
-  Remote: `git@github.com:frankniujc/niutero_2.git`.
+  Remote: `git@github.com:frankniujc/niutero.git` (repo renamed from
+  `niutero_2` on 2026-06-10; the local folder is still `niutero_2/`).
 - **Tests**: full `cargo test --workspace` was green at W6 (**269 tests**) and
   has grown since; fmt + clippy (`-D warnings`) clean at each landing. Re-run
   the full gate before the next commit.
