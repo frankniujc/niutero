@@ -1,4 +1,4 @@
-//! Library — the three layouts of the Library tool (design spec §4): Classic
+﻿//! Library — the three layouts of the Library tool (design spec §4): Classic
 //! (this file, §4·A), Reader ([`reader`], §4·B), and Board ([`board`], §4·C).
 //! All three share the tag-first sidebar and the lock-guarded editable detail;
 //! Classic owns the shared helpers (entry formatting, the detail panel, the
@@ -92,9 +92,16 @@ pub struct LibState {
     tag_groups_sig: Option<u64>,
     /// Classic: tag-tree namespace groups the user has collapsed.
     collapsed_ns: HashSet<String>,
+    /// Display authors as `First Last` (set by the app from the machine
+    /// appearance pref each frame; display-only).
+    pub author_first_last: bool,
     /// Edit buffers for the selected entry's text fields, valid while unlocked.
     buffers: BTreeMap<String, String>,
     buffers_for: Option<String>,
+    /// Per-author edit rows for the unlocked detail (the `author` field split
+    /// on " and "), rebuilt when the entry changes.
+    author_rows: Vec<String>,
+    author_rows_for: Option<String>,
     /// Inline "add tag" input state.
     adding_tag: bool,
     new_tag: String,
@@ -105,6 +112,7 @@ impl LibState {
     /// just-edited) entry on the next frame.
     pub fn refresh(&mut self) {
         self.buffers_for = None;
+        self.author_rows_for = None;
     }
 }
 
@@ -127,8 +135,11 @@ impl Default for LibState {
             tag_groups_cache: Vec::new(),
             tag_groups_sig: None,
             collapsed_ns: HashSet::new(),
+            author_first_last: false,
             buffers: BTreeMap::new(),
             buffers_for: None,
+            author_rows: Vec::new(),
+            author_rows_for: None,
             adding_tag: false,
             new_tag: String::new(),
         }
@@ -1034,6 +1045,91 @@ pub(super) fn detail_panel(
         });
 }
 
+/// One editable row per author (the raw `author` field split on " and "),
+/// with per-row remove and an add button. Rows hold the RAW BibTeX form
+/// (`Last, First` — the hint says so); the joined field is committed when a
+/// row loses focus or on add/remove, and only when it actually changed.
+pub(super) fn edit_authors(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    e: &EntryView,
+    st: &mut LibState,
+    actions: &mut Vec<LibAction>,
+) {
+    if st.author_rows_for.as_deref() != Some(e.citekey.as_str()) {
+        st.author_rows = e
+            .fields
+            .get("author")
+            .map(|a| {
+                a.split(" and ")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if st.author_rows.is_empty() {
+            st.author_rows.push(String::new());
+        }
+        st.author_rows_for = Some(e.citekey.clone());
+    }
+
+    let mut commit = false;
+    let mut remove: Option<usize> = None;
+    for i in 0..st.author_rows.len() {
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut st.author_rows[i])
+                    .hint_text("Last, First")
+                    .desired_width(220.0),
+            );
+            if r.lost_focus() {
+                commit = true;
+            }
+            let x = ui
+                .add(
+                    egui::Button::new(RichText::new("✕").size(12.0).color(theme.muted))
+                        .frame(false),
+                )
+                .on_hover_text("Remove this author");
+            if x.clicked() {
+                remove = Some(i);
+            }
+        });
+        ui.add_space(4.0);
+    }
+    if let Some(i) = remove {
+        st.author_rows.remove(i);
+        if st.author_rows.is_empty() {
+            st.author_rows.push(String::new());
+        }
+        commit = true;
+    }
+    if ui
+        .add(
+            egui::Button::new(RichText::new("+ Add author").size(12.5).color(theme.accent))
+                .frame(false),
+        )
+        .clicked()
+    {
+        // No commit yet — an empty row writes nothing until typed into.
+        st.author_rows.push(String::new());
+    }
+
+    if commit {
+        let joined = st
+            .author_rows
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let current = e.fields.get("author").map(String::as_str).unwrap_or("");
+        if joined != current {
+            actions.push(LibAction::Edit("author".into(), joined));
+        }
+    }
+}
+
 /// The scrollable detail content (title … tags), shared by the Classic detail
 /// panel and the Board drawer. The header and footer are rendered by the caller
 /// (pinned). `reading` adds the Reading status+stars row (Board only).
@@ -1051,16 +1147,17 @@ pub(super) fn detail_fields(
     edit_text(ui, theme, st, actions, "title", locked, true);
     ui.add_space(8.0);
 
-    // Authors byline (no label) — compact line locked; editable raw line when
-    // unlocked (the Zotero per-author rows are a planned refinement).
+    // Authors byline (no label) — compact line locked; one editable row per
+    // author when unlocked (Zotero-style), committed back as the BibTeX
+    // `A and B and C` field.
     if locked {
         ui.label(
-            RichText::new(authors_line(e))
+            RichText::new(authors_line(e, st.author_first_last))
                 .size(14.0)
                 .color(theme.text_2),
         );
     } else {
-        edit_field_raw(ui, theme, st, actions, "author", false);
+        edit_authors(ui, theme, e, st, actions);
     }
     ui.add_space(18.0); // design: authors marginBottom 18
 
@@ -1650,12 +1747,36 @@ fn authors_vec(e: &EntryView) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn authors_line(e: &EntryView) -> String {
+fn authors_line(e: &EntryView, first_last: bool) -> String {
     let v = authors_vec(e);
     if v.is_empty() {
         "—".into()
     } else {
-        v.join(" · ") // design AuthorsField: authors.join(' · ')
+        v.iter()
+            .map(|n| display_author(n, first_last))
+            .collect::<Vec<_>>()
+            .join(" · ") // design AuthorsField: authors.join(' · ')
+    }
+}
+
+/// One author for display, per the appearance pref. BibTeX stores
+/// `Last, First` (or already `First Last`); `first_last` flips the comma form
+/// to `First Last`. Display-only — the stored field is never rewritten.
+pub(crate) fn display_author(name: &str, first_last: bool) -> String {
+    let n = name.trim();
+    if !first_last {
+        return n.to_string();
+    }
+    match n.split_once(',') {
+        Some((last, first)) => {
+            let (last, first) = (last.trim(), first.trim());
+            if first.is_empty() {
+                last.to_string()
+            } else {
+                format!("{first} {last}")
+            }
+        }
+        None => n.to_string(), // already First Last (or a corporate name)
     }
 }
 

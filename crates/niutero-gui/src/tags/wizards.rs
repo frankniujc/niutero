@@ -261,7 +261,7 @@ fn wizard_inner(
         ),
         WizardKind::Import => (
             Glyph::Doc,
-            "Import paper project",
+            "Tag from a LaTeX project",
             "Tag every entry cited by a LaTeX manuscript.",
             ["Source", "Citations", "Done"],
         ),
@@ -1377,7 +1377,7 @@ fn import_body(ui: &mut egui::Ui, theme: &Theme, wiz: &mut Wizard) -> Footer {
             wz_done(
                 ui,
                 theme,
-                "Project imported",
+                "Project tagged",
                 "Created the project tag and applied it across the cited entries (tags live \
                  in the .niutero sidecar).",
                 &recap,

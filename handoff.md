@@ -307,6 +307,18 @@ User decisions: appearance → machine-local; workflow → the vault's own confi
   remote_url, CLI `config` black-box (incl. config.toml contents, on-dup
   honored by import, auto-commit end-to-end, remote display).
 
+## 2026-06-10 (fourth, small) — author UX + a rename
+
+- Tags toolbar "Import project" → **"Tag from LaTeX"** (it never imported
+  anything; it tags what a manuscript cites). Wizard title/done copy updated.
+- Unlocked detail (Classic + Reader): the author field edits as **one row per
+  author** (hint `Last, First`, per-row ✕, "+ Add author"), committed back as
+  the BibTeX `A and B and C` field only when it actually changed.
+- New Appearance pref **Author names**: `Lastname, First` (as stored — the
+  default) or `First Lastname` (flips the comma form, display-only; corporate
+  / comma-less names pass through). Lives in the registry `[ui]` as
+  `author_first_last`; `set_ui_prefs` now takes the whole `UiPrefs`.
+
 ### Follow-ups (next work, in rough priority)
 
 - **Live AI smoke** (planned right after this landing) + live verification of

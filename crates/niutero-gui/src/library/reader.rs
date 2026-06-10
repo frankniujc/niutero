@@ -600,15 +600,15 @@ fn reading_column(
     }
     ui.add_space(8.0);
 
-    // ---- authors (compact line; raw edit when unlocked)
+    // ---- authors (compact line; per-author rows when unlocked)
     if locked {
         ui.label(
-            RichText::new(super::authors_line(e))
+            RichText::new(super::authors_line(e, st.author_first_last))
                 .size(15.0)
                 .color(theme.text_2),
         );
     } else {
-        super::edit_field_raw(ui, theme, st, actions, "author", false);
+        super::edit_authors(ui, theme, e, st, actions);
     }
     ui.add_space(4.0);
 

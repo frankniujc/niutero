@@ -126,8 +126,17 @@ impl NiuteroApp {
         self.ensure_settings_seed();
         let dark = self.dark;
         let accent = self.accent_idx;
+        let first_last = self.author_first_last;
         let mut actions = Vec::new();
-        settings::settings(ctx, theme, &mut self.settings, dark, accent, &mut actions);
+        settings::settings(
+            ctx,
+            theme,
+            &mut self.settings,
+            dark,
+            accent,
+            first_last,
+            &mut actions,
+        );
         for a in actions {
             self.apply_settings_action(a, ctx);
         }
@@ -188,6 +197,10 @@ impl NiuteroApp {
             }
             SettingsAction::SetAccent(i) => {
                 self.accent_idx = i;
+                self.persist_ui_prefs();
+            }
+            SettingsAction::SetAuthorStyle(first_last) => {
+                self.author_first_last = first_last;
                 self.persist_ui_prefs();
             }
             SettingsAction::SetGitRemote(url) => {

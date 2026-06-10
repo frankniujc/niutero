@@ -287,7 +287,9 @@ fn toolbar(ui: &mut egui::Ui, theme: &Theme, st: &mut TagsState, actions: &mut V
                         actions.push(TagAction::Wizard(WizardKind::Organize));
                     }
                     divider(ui, theme);
-                    if wz_btn(ui, theme, Glyph::Download, "Import project", false).clicked() {
+                    // "Tag from LaTeX", not "Import project": nothing is
+                    // imported — the wizard tags entries a manuscript cites.
+                    if wz_btn(ui, theme, Glyph::Download, "Tag from LaTeX", false).clicked() {
                         actions.push(TagAction::Wizard(WizardKind::Import));
                     }
                     if wz_btn(ui, theme, Glyph::Ai, "Auto-tag", true).clicked() {

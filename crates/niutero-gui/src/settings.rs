@@ -10,6 +10,7 @@
 //!   applied again at next launch.
 //! - **Sync → Git remote** is read back from the repo itself (`origin`) and
 //!   set via `engine::connect`.
+//!
 //! Text edits flush on focus-loss AND on navigate-away (`take_*_dirty` from
 //! `settings()`'s end-of-frame pass), so a typed value is never silently lost.
 //! Still visual-only: font pickers, density, the settings search box, Keymap /
@@ -151,6 +152,8 @@ impl Default for SettingsState {
 pub enum SettingsAction {
     SetTheme(bool),
     SetAccent(usize),
+    /// Display authors as `First Last` (true) or `Lastname, First` (false).
+    SetAuthorStyle(bool),
     SetGitRemote(String),
     /// Persist the AI assistant config (machine-local registry).
     SetAi(AiConfig),
@@ -270,6 +273,7 @@ pub fn settings(
     st: &mut SettingsState,
     dark: bool,
     accent_idx: usize,
+    author_first_last: bool,
     actions: &mut Vec<SettingsAction>,
 ) {
     egui::SidePanel::left("niu-settings-nav")
@@ -334,9 +338,15 @@ pub fn settings(
                                 SettingsView::Workflow => workflow_view(ui, theme, st, actions),
                                 SettingsView::Ai => ai_view(ui, theme, st, actions),
                                 SettingsView::Pdf => pdf_view(ui, theme, st, actions),
-                                SettingsView::Appearance => {
-                                    appearance_view(ui, theme, st, dark, accent_idx, actions)
-                                }
+                                SettingsView::Appearance => appearance_view(
+                                    ui,
+                                    theme,
+                                    st,
+                                    dark,
+                                    accent_idx,
+                                    author_first_last,
+                                    actions,
+                                ),
                                 SettingsView::Sync => sync_view(ui, theme, st, actions),
                                 SettingsView::Keymap => {
                                     stub(ui, theme, "Keymap", "Keyboard shortcuts — coming soon.")
@@ -567,9 +577,30 @@ fn appearance_view(
     st: &mut SettingsState,
     dark: bool,
     accent_idx: usize,
+    author_first_last: bool,
     actions: &mut Vec<SettingsAction>,
 ) {
     section_title(ui, theme, "Appearance");
+    row(
+        ui,
+        theme,
+        "Author names",
+        "How authors display everywhere (lists, detail, Reader). BibTeX stores \
+         names as Lastname, First — this only changes the display, never the file.",
+        false,
+        |ui| {
+            let sel = usize::from(author_first_last);
+            if let Some(i) = widgets::segmented(
+                ui,
+                theme,
+                &[("Lastname, First", None), ("First Lastname", None)],
+                sel,
+                false,
+            ) {
+                actions.push(SettingsAction::SetAuthorStyle(i == 1));
+            }
+        },
+    );
     row(
         ui,
         theme,

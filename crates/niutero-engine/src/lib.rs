@@ -960,8 +960,8 @@ pub fn ui_prefs() -> Result<UiPrefs, String> {
 
 /// Persist the appearance prefs under the registry lock, so the app reopens
 /// looking the way it was left.
-pub fn set_ui_prefs(dark: bool, accent: usize) -> Result<(), String> {
-    niutero_vault::registry::with_registry_mut(|reg| reg.ui = UiPrefs { dark, accent })
+pub fn set_ui_prefs(prefs: UiPrefs) -> Result<(), String> {
+    niutero_vault::registry::with_registry_mut(|reg| reg.ui = prefs)
         .map_err(|e| format!("save UI prefs: {e}"))
 }
 
@@ -3392,10 +3392,15 @@ mod tests {
     fn ui_prefs_roundtrip_in_the_registry() {
         with_registry(|| {
             let p = ui_prefs().unwrap();
-            assert!(!p.dark && p.accent == 0);
-            set_ui_prefs(true, 3).unwrap();
+            assert!(!p.dark && p.accent == 0 && !p.author_first_last);
+            set_ui_prefs(UiPrefs {
+                dark: true,
+                accent: 3,
+                author_first_last: true,
+            })
+            .unwrap();
             let p = ui_prefs().unwrap();
-            assert!(p.dark);
+            assert!(p.dark && p.author_first_last);
             assert_eq!(p.accent, 3);
         });
     }

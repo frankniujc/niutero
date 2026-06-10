@@ -93,6 +93,9 @@ impl Library {
 
 pub struct NiuteroApp {
     dark: bool,
+    /// Display authors as `First Last` (default: as stored, `Last, First`).
+    /// Machine-local appearance pref, like the theme.
+    author_first_last: bool,
     tool: Tool,
     lib_view: LibView,
     library: Option<Library>,
@@ -233,6 +236,7 @@ impl NiuteroApp {
         let ui = engine::ui_prefs().unwrap_or_default();
         NiuteroApp {
             dark: ui.dark,
+            author_first_last: ui.author_first_last,
             tool,
             lib_view,
             library,
@@ -271,9 +275,15 @@ impl NiuteroApp {
         self.toast_gen += 1;
     }
 
-    /// Persist the appearance (theme + accent) so the app reopens as left.
+    /// Persist the appearance (theme + accent + author-name style) so the app
+    /// reopens as left.
     pub(super) fn persist_ui_prefs(&mut self) {
-        if let Err(e) = engine::set_ui_prefs(self.dark, self.accent_idx) {
+        let prefs = engine::UiPrefs {
+            dark: self.dark,
+            accent: self.accent_idx,
+            author_first_last: self.author_first_last,
+        };
+        if let Err(e) = engine::set_ui_prefs(prefs) {
             self.set_toast(format!("Couldn't save appearance: {e}"));
         }
     }

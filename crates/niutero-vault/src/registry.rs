@@ -53,6 +53,10 @@ pub struct UiPrefs {
     /// Accent swatch index (0 = the theme's own default green).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub accent: usize,
+    /// Display author names as `First Last` instead of the BibTeX-conventional
+    /// `Last, First` (display-only — the stored field is never rewritten).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub author_first_last: bool,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -477,6 +481,7 @@ mod tests {
         reg.ui = UiPrefs {
             dark: true,
             accent: 2,
+            ..Default::default()
         };
         reg.save_to(&path).unwrap();
         let back = Registry::load_from(&path).unwrap();

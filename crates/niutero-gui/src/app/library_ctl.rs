@@ -28,6 +28,8 @@ impl NiuteroApp {
             return;
         }
         let mut actions = Vec::new();
+        // Mirror the appearance pref into the view state (display-only).
+        self.lib.author_first_last = self.author_first_last;
         let entries = &self.library.as_ref().unwrap().entries;
         match self.lib_view {
             LibView::Classic => library::classic(ctx, theme, entries, &mut self.lib, &mut actions),
