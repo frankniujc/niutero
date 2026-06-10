@@ -218,7 +218,8 @@ enum Cmd {
     Sync {
         /// Vault folder.
         vault: PathBuf,
-        /// Commit message (default: "niutero: sync").
+        /// Commit message (default: an auto-generated entry-level summary,
+        /// e.g. "niutero: 2 added, 1 changed").
         #[arg(long)]
         message: Option<String>,
     },
@@ -321,6 +322,9 @@ enum Cmd {
         vault: PathBuf,
         /// Cite key to enrich.
         citekey: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Run the browser-connector server (loopback) until stopped (Ctrl-C).
     /// Captures require the printed session token (`Authorization: Bearer …`
@@ -357,10 +361,14 @@ enum Cmd {
         /// Online (HF): download the PDF from the dataset repo.
         #[arg(long)]
         pull: bool,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
-    /// Show or set this machine's PDF-attachment config for a vault: the HF
-    /// dataset repo its PDFs push/pull to, auto-fetch-on-import, and the HF
-    /// account token (all machine-local in vaults.toml — never synced).
+    /// Show or set the vault's PDF-attachment config. The HF dataset repo and
+    /// auto-fetch-on-import are LIBRARY properties (saved in the vault's
+    /// synced .niutero/config.toml — collaborators share them); only the HF
+    /// account token is machine-local (vaults.toml, never synced).
     PdfConfig {
         /// Vault folder.
         vault: PathBuf,
@@ -393,6 +401,9 @@ enum Cmd {
         vault: PathBuf,
         /// Cite key.
         citekey: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// List the vaults this machine has opened, most-recent first (machine-local
     /// registry — never synced with any vault).
@@ -638,6 +649,21 @@ enum ViewAction {
 }
 
 fn main() -> ExitCode {
+    // clap's derived `Command` tree for this many subcommands is built as one
+    // giant stack expression, which overflows Windows' default 1 MiB main
+    // stack in unoptimized builds — run the real main on a roomier thread.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("spawn main thread")
+        .join()
+        .expect("main thread panicked")
+}
+
+fn real_main() -> ExitCode {
+    // Route the `log` facade (engine/online/sync log through it too) to
+    // stderr; silent unless RUST_LOG is set (e.g. RUST_LOG=niutero=debug).
+    env_logger::init();
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(e) => {
@@ -792,6 +818,11 @@ fn mutated_vault(cmd: &Cmd) -> Option<PathBuf> {
 /// an error (it must not change the command's exit code). All notes go to
 /// **stderr** so they never corrupt a command's `--json` stdout for a machine
 /// consumer.
+///
+/// NOTE: these `eprintln!`s (and the auto-commit / auto-fetch / auto-enrich
+/// notes) are deliberate USER-FACING product output, not logging — tests
+/// assert their exact text, and they must show without RUST_LOG. Don't
+/// migrate them to the `log` facade.
 fn refresh_keep_updated(vault: &Path) {
     let Ok(v) = engine::open(vault) else { return };
     match engine::refresh_exports(&v) {
@@ -854,7 +885,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             json,
         } => cmd_tag(&vault, &citekey, add, remove, json).map(ok),
         Cmd::Tags { vault, action } => cmd_tags(&vault, action).map(ok),
-        Cmd::Ai { action } => cmd_ai(action).map(ok),
+        Cmd::Ai { action } => cmd_ai(action),
         Cmd::Note {
             vault,
             citekey,
@@ -918,7 +949,11 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
         } => cmd_stars(&vault, &citekey, set, json).map(ok),
         Cmd::Analyze { vault, json } => cmd_analyze(&vault, json).map(ok),
         Cmd::Dedupe { vault, merge, json } => cmd_dedupe(&vault, merge, json).map(ok),
-        Cmd::Enrich { vault, citekey } => cmd_enrich(&vault, &citekey).map(ok),
+        Cmd::Enrich {
+            vault,
+            citekey,
+            json,
+        } => cmd_enrich(&vault, &citekey, json).map(ok),
         Cmd::Connector { vault, port, token } => cmd_connector(&vault, port, token).map(ok),
         Cmd::Pdf {
             vault,
@@ -927,7 +962,8 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             fetch,
             push,
             pull,
-        } => cmd_pdf(&vault, &citekey, attach, fetch, push, pull).map(ok),
+            json,
+        } => cmd_pdf(&vault, &citekey, attach, fetch, push, pull, json).map(ok),
         Cmd::PdfConfig {
             vault,
             repo,
@@ -946,7 +982,11 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             json,
         )
         .map(ok),
-        Cmd::SuggestTags { vault, citekey } => cmd_suggest_tags(&vault, &citekey).map(ok),
+        Cmd::SuggestTags {
+            vault,
+            citekey,
+            json,
+        } => cmd_suggest_tags(&vault, &citekey, json).map(ok),
         Cmd::Recent { json } => cmd_recent(json).map(ok),
         Cmd::Forget { vault } => cmd_forget(&vault).map(ok),
         Cmd::ExportTarget { vault, action } => cmd_export_target(&vault, action).map(ok),
@@ -1279,7 +1319,10 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-fn cmd_ai(action: AiAction) -> Result<(), String> {
+fn cmd_ai(action: AiAction) -> Result<ExitCode, String> {
+    // Stays 0 unless an arm reports a partial failure (organize --apply with
+    // failed merges) — the 0-ok / 1-error contract scripts rely on.
+    let mut exit = ExitCode::SUCCESS;
     match action {
         AiAction::Config {
             enable,
@@ -1485,9 +1528,17 @@ fn cmd_ai(action: AiAction) -> Result<(), String> {
                     }
                 }
             }
+            // A merge that errored means the plan wasn't fully applied — a
+            // script must see that without parsing stdout.
+            if applied
+                .as_ref()
+                .is_some_and(|rs| rs.iter().any(|r| r.error.is_some()))
+            {
+                exit = ExitCode::from(1);
+            }
         }
     }
-    Ok(())
+    Ok(exit)
 }
 
 /// Show only a hint of a secret — never the whole thing, even when it's short.
@@ -1640,10 +1691,12 @@ fn cmd_import(
     Ok(())
 }
 
-fn cmd_enrich(vault: &Path, citekey: &str) -> Result<(), String> {
+fn cmd_enrich(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
     let v = open_vault(vault)?;
     let filled = engine::enrich(&v, citekey)?;
-    if filled.is_empty() {
+    if json {
+        emit(serde_json::json!({ "citekey": citekey, "filled": filled }))?;
+    } else if filled.is_empty() {
         println!("{citekey}: already complete (nothing to fill).");
     } else {
         println!("{citekey}: filled {}", filled.join(", "));
@@ -1662,6 +1715,7 @@ fn cmd_connector(vault: &Path, port: u16, token: Option<String>) -> Result<(), S
     engine::serve_connector(&v, port, &token)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_pdf(
     vault: &Path,
     citekey: &str,
@@ -1669,6 +1723,7 @@ fn cmd_pdf(
     fetch: bool,
     push: bool,
     pull: bool,
+    json: bool,
 ) -> Result<(), String> {
     let picked = [attach.is_some(), fetch, push, pull]
         .iter()
@@ -1678,29 +1733,51 @@ fn cmd_pdf(
         return Err("use only one of --attach / --fetch / --push / --pull".into());
     }
     let v = open_vault(vault)?;
-    if let Some(src) = attach {
+    // (action label, local path) — one JSON shape for every mode.
+    let (action, path) = if let Some(src) = attach {
         let dest = engine::attach_pdf(&v, citekey, &src)?;
-        println!("Attached {} -> {}", src.display(), dest.display());
+        if !json {
+            println!("Attached {} -> {}", src.display(), dest.display());
+        }
+        ("attached", dest)
     } else if fetch {
         let dest = engine::fetch_pdf(&v, citekey)?;
-        println!("Downloaded PDF -> {}", dest.display());
+        if !json {
+            println!("Downloaded PDF -> {}", dest.display());
+        }
+        ("fetched", dest)
     } else if push {
         let remote = engine::pdf_push(&v, citekey)?;
-        println!(
-            "Pushed {} -> {remote}",
-            engine::pdf_path(&v, citekey).display()
-        );
+        let local = engine::pdf_path(&v, citekey);
+        if !json {
+            println!("Pushed {} -> {remote}", local.display());
+        }
+        ("pushed", local)
     } else if pull {
         let dest = engine::pdf_pull(&v, citekey)?;
-        println!("Pulled PDF -> {}", dest.display());
+        if !json {
+            println!("Pulled PDF -> {}", dest.display());
+        }
+        ("pulled", dest)
     } else {
         let path = engine::pdf_path(&v, citekey);
-        let status = if path.exists() {
-            "present"
-        } else {
-            "not attached"
-        };
-        println!("{} ({status})", path.display());
+        if !json {
+            let status = if path.exists() {
+                "present"
+            } else {
+                "not attached"
+            };
+            println!("{} ({status})", path.display());
+        }
+        ("status", path)
+    };
+    if json {
+        emit(serde_json::json!({
+            "citekey": citekey,
+            "action": action,
+            "path": path,
+            "present": path.exists(),
+        }))?;
     }
     Ok(())
 }
@@ -1777,17 +1854,19 @@ fn cmd_pdf_config(
     Ok(())
 }
 
-fn cmd_suggest_tags(vault: &Path, citekey: &str) -> Result<(), String> {
+fn cmd_suggest_tags(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
     let v = open_vault(vault)?;
     let tags = engine::suggest_tags(&v, citekey)?;
-    if tags.is_empty() {
+    if json {
+        emit(serde_json::json!({ "citekey": citekey, "tags": tags }))?;
+    } else if tags.is_empty() {
         println!("(no suggestions)");
     } else {
         println!("Suggested tags for {citekey}:");
         for t in &tags {
             println!("  {t}");
         }
-        println!("Apply with: niutero-cli tag {citekey} --add <tag>");
+        println!("Apply with: niutero-cli tag <vault> {citekey} --add <tag>");
     }
     Ok(())
 }

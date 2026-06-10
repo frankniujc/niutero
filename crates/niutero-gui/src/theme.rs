@@ -21,9 +21,9 @@ fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color32 {
 }
 
 /// The resolved palette for one theme. Field names mirror the CSS custom
-/// properties on `.niu` so the mapping stays auditable. The full token set is
-/// defined now (it's the design's source of truth); some tokens aren't consumed
-/// until the later view waves (G2–G5), hence the allow.
+/// properties on `.niu` 1:1 so the mapping stays auditable against the design
+/// — which is why two tokens nothing consumes yet (`raise`, `accent_tint_2`)
+/// are kept rather than dropped; the allow covers exactly those.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct Theme {

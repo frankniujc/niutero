@@ -1,5 +1,6 @@
-﻿//! Library — the three layouts of the Library tool (design spec §4): Classic
-//! (this file, §4·A), Reader ([`reader`], §4·B), and Board ([`board`], §4·C).
+//! Library — the three layouts of the Library tool (design spec §4): Classic
+//! (this file, §4·A) and Reader ([`reader`], §4·B). The Board (§4·C kanban) is
+//! temporarily removed — see the note above `mod reader`.
 //! All three share the tag-first sidebar and the lock-guarded editable detail;
 //! Classic owns the shared helpers (entry formatting, the detail panel, the
 //! small widgets), and the two sibling submodules reuse them via `super::`.
@@ -80,7 +81,7 @@ pub struct LibState {
     /// tag, sort, or a library reload), never on a plain scroll frame.
     shown_cache: Vec<usize>,
     shown_sig: Option<u64>,
-    /// Reader/Board: indices matching the search box, cached so the
+    /// Reader: indices matching the search box, cached so the
     /// O(entries×fields) field scan runs once per (search, library) change rather
     /// than every frame. The cheap tag/status post-filters run live on top.
     search_cache: Vec<usize>,
@@ -102,6 +103,10 @@ pub struct LibState {
     /// on " and "), rebuilt when the entry changes.
     author_rows: Vec<String>,
     author_rows_for: Option<String>,
+    /// "+ Add author" was clicked in the same frame a pending edit committed:
+    /// the commit triggers a reload + row rebuild that would silently discard
+    /// the fresh blank row, so re-append it after the rebuild.
+    author_add_pending: bool,
     /// Inline "add tag" input state.
     adding_tag: bool,
     new_tag: String,
@@ -140,6 +145,7 @@ impl Default for LibState {
             buffers_for: None,
             author_rows: Vec::new(),
             author_rows_for: None,
+            author_add_pending: false,
             adding_tag: false,
             new_tag: String::new(),
         }
@@ -148,8 +154,16 @@ impl Default for LibState {
 
 /// An engine-touching action the view requests; the app applies it post-render.
 pub enum LibAction {
-    /// `engine::edit` the selected entry: set `field` to `value` (empty unsets).
-    Edit(String, String),
+    /// `engine::edit` entry `key`: set `field` to `value` (empty unsets).
+    /// Carries its own citekey because the commit fires on focus-loss — which
+    /// can land in the SAME frame as a click that moves the selection (the
+    /// detail panel renders before the list), so resolving against the
+    /// selection at apply time wrote entry A's buffer into entry B.
+    Edit {
+        key: String,
+        field: String,
+        value: String,
+    },
     SetStatus(Status),
     SetStars(Option<u8>),
     AddTag(String),
@@ -166,8 +180,9 @@ pub enum LibAction {
     PullPdf,
     Cite,
     Bibtex,
-    /// Open the "new entry" dialog; `Some(status)` pre-files it into a Board
-    /// column's reading status.
+    /// Open the "new entry" dialog; `Some(status)` pre-sets the created entry's
+    /// reading status (no live producer since the Board's removal — every
+    /// current caller passes None; kept for the Board's return).
     NewEntry(Option<Status>),
     /// Open the "add by DOI / import a .bib file" dialog.
     AddByDoi,
@@ -176,7 +191,7 @@ pub enum LibAction {
 }
 
 /// The right-click context menu for an entry (shared by Classic rows, Reader
-/// cards, and Board cards). Pushes [`LibAction`]s that the app applies to the
+/// cards). Pushes [`LibAction`]s that the app applies to the
 /// entry; the caller selects the entry on right-click so they target it.
 pub(super) fn entry_context_menu(ui: &mut egui::Ui, e: &EntryView, actions: &mut Vec<LibAction>) {
     if ui.button("Copy citation").clicked() {
@@ -928,7 +943,7 @@ fn list_row(
 
 /// (Re)load the edit buffers for `e`'s text fields when the selection changed,
 /// so the unlocked `EditField`s start from the entry's current values. Shared by
-/// the Classic detail panel, the Reader pane, and the Board drawer.
+/// the Classic detail panel and the Reader pane.
 pub(super) fn ensure_buffers(st: &mut LibState, e: &EntryView) {
     if st.buffers_for.as_deref() == Some(e.citekey.as_str()) {
         return;
@@ -950,7 +965,7 @@ pub(super) fn ensure_buffers(st: &mut LibState, e: &EntryView) {
 }
 
 /// The accent-tint type pill (icon + uppercase label) used in the Reader pane
-/// header and the Board drawer header.
+/// header.
 pub(super) fn type_badge(ui: &mut egui::Ui, theme: &Theme, e: &EntryView) {
     let (g, _) = type_glyph(theme, &e.entry_type);
     egui::Frame::default()
@@ -1039,7 +1054,8 @@ pub(super) fn detail_panel(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     detail_header(ui, theme, st, e);
-                    // Classic detail omits the reading row (it's in the Board).
+                    // Classic detail omits the reading row (status/stars are set via the
+                    // context menu and Reader's star toggle until the Board returns).
                     detail_fields(ui, theme, e, st, actions, false);
                 });
         });
@@ -1068,6 +1084,12 @@ pub(super) fn edit_authors(
             })
             .unwrap_or_default();
         if st.author_rows.is_empty() {
+            st.author_rows.push(String::new());
+        }
+        // A "+ Add author" click that coincided with a commit (focus-loss in
+        // the same frame) triggered this rebuild — restore the blank row the
+        // click added, or the click appears to do nothing.
+        if std::mem::take(&mut st.author_add_pending) {
             st.author_rows.push(String::new());
         }
         st.author_rows_for = Some(e.citekey.clone());
@@ -1111,8 +1133,13 @@ pub(super) fn edit_authors(
         )
         .clicked()
     {
-        // No commit yet — an empty row writes nothing until typed into.
+        // No commit yet — an empty row writes nothing until typed into. But
+        // the same click may have blurred an edited row (commit below →
+        // reload → rebuild), so flag the blank row for re-append.
         st.author_rows.push(String::new());
+        if commit {
+            st.author_add_pending = true;
+        }
     }
 
     if commit {
@@ -1125,14 +1152,20 @@ pub(super) fn edit_authors(
             .join(" and ");
         let current = e.fields.get("author").map(String::as_str).unwrap_or("");
         if joined != current {
-            actions.push(LibAction::Edit("author".into(), joined));
+            actions.push(LibAction::Edit {
+                key: e.citekey.clone(),
+                field: "author".into(),
+                value: joined,
+            });
         }
     }
 }
 
 /// The scrollable detail content (title … tags), shared by the Classic detail
-/// panel and the Board drawer. The header and footer are rendered by the caller
-/// (pinned). `reading` adds the Reading status+stars row (Board only).
+/// panel (and formerly the Board drawer). The header and footer are rendered
+/// by the caller (pinned). `reading` adds the Reading status+stars row —
+/// currently always false; the row and `status_stars` are parked for the
+/// Board's return.
 pub(super) fn detail_fields(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1144,7 +1177,7 @@ pub(super) fn detail_fields(
     let locked = st.locked;
 
     // Title (serif 24, design margin 4/0/8).
-    edit_text(ui, theme, st, actions, "title", locked, true);
+    edit_text(ui, theme, e, st, actions, "title", locked, true);
     ui.add_space(8.0);
 
     // Authors byline (no label) — compact line locked; one editable row per
@@ -1167,9 +1200,9 @@ pub(super) fn detail_fields(
     } else {
         "booktitle"
     };
-    meta_row(ui, theme, st, actions, "Publication", pub_field, locked);
-    meta_row(ui, theme, st, actions, "Year", "year", locked);
-    meta_row(ui, theme, st, actions, "DOI", "doi", locked);
+    meta_row(ui, theme, e, st, actions, "Publication", pub_field, locked);
+    meta_row(ui, theme, e, st, actions, "Year", "year", locked);
+    meta_row(ui, theme, e, st, actions, "DOI", "doi", locked);
     // Citation key (read-only — re-keying is a Normalize action).
     divided_meta(ui, theme, "Citation Key", |ui| {
         ui.label(
@@ -1179,7 +1212,8 @@ pub(super) fn detail_fields(
         );
     });
 
-    // Reading status + stars (Board drawer only).
+    // Reading status + stars (parked — was the Board drawer's; no caller
+    // passes reading=true while the Board is removed).
     if reading {
         ui.add_space(18.0);
         meta_label(ui, theme, "Reading");
@@ -1199,11 +1233,14 @@ pub(super) fn detail_fields(
                 .desired_width(f32::INFINITY)
                 .desired_rows(5),
         );
-        if r.lost_focus() {
-            actions.push(LibAction::Edit(
-                "abstract".into(),
-                st.buffers["abstract"].clone(),
-            ));
+        if r.lost_focus()
+            && st.buffers["abstract"] != *e.fields.get("abstract").unwrap_or(&String::new())
+        {
+            actions.push(LibAction::Edit {
+                key: e.citekey.clone(),
+                field: "abstract".into(),
+                value: st.buffers["abstract"].clone(),
+            });
         }
     }
 
@@ -1462,9 +1499,11 @@ fn divided_meta(ui: &mut egui::Ui, theme: &Theme, label: &str, value: impl FnOnc
 
 /// A labelled meta field (Publication/Year/DOI) as a divided row, editable when
 /// unlocked. The DOI is mono + accent (an identifier, no LaTeX).
+#[allow(clippy::too_many_arguments)]
 fn meta_row(
     ui: &mut egui::Ui,
     theme: &Theme,
+    e: &EntryView,
     st: &mut LibState,
     actions: &mut Vec<LibAction>,
     label: &str,
@@ -1489,15 +1528,17 @@ fn meta_row(
             let col = if is_doi { theme.accent } else { theme.text };
             ui.label(RichText::new(shown).font(font).color(col));
         } else {
-            edit_field_raw(ui, theme, st, actions, field, is_doi);
+            edit_field_raw(ui, theme, e, st, actions, field, is_doi);
         }
     });
 }
 
 /// The title field: serif, large; editable when unlocked.
+#[allow(clippy::too_many_arguments)]
 fn edit_text(
     ui: &mut egui::Ui,
     theme: &Theme,
+    e: &EntryView,
     st: &mut LibState,
     actions: &mut Vec<LibAction>,
     field: &str,
@@ -1508,14 +1549,18 @@ fn edit_text(
         let v = st.buffers.get(field).cloned().unwrap_or_default();
         crate::tex::runs_label(ui, &v, theme::serif(24.0), theme.text);
     } else {
-        edit_field_raw(ui, theme, st, actions, field, false);
+        edit_field_raw(ui, theme, e, st, actions, field, false);
     }
 }
 
-/// A single-line editable buffer that emits an `Edit` action on commit.
+/// A single-line editable buffer that emits an `Edit` action on commit. The
+/// action carries `e`'s citekey, and an UNCHANGED buffer commits nothing — a
+/// plain focus-loss must never rewrite the .bib.
+#[allow(clippy::too_many_arguments)]
 fn edit_field_raw(
     ui: &mut egui::Ui,
     theme: &Theme,
+    e: &EntryView,
     st: &mut LibState,
     actions: &mut Vec<LibAction>,
     field: &str,
@@ -1527,11 +1572,12 @@ fn edit_field_raw(
         te = te.font(theme::mono(12.5));
     }
     let r = ui.add(te);
-    if r.lost_focus() {
-        actions.push(LibAction::Edit(
-            field.to_string(),
-            st.buffers[field].clone(),
-        ));
+    if r.lost_focus() && st.buffers[field] != *e.fields.get(field).unwrap_or(&String::new()) {
+        actions.push(LibAction::Edit {
+            key: e.citekey.clone(),
+            field: field.to_string(),
+            value: st.buffers[field].clone(),
+        });
     }
     let _ = theme;
 }
@@ -1672,7 +1718,7 @@ fn compute_order(
 /// (Re)compute `st.search_cache` — the indices matching the search box — only
 /// when the search text or the library changed. The de-TeX-free but still
 /// O(entries×fields) lowercasing scan in [`matches_search`] would otherwise run
-/// on every Reader/Board frame; callers then apply cheap tag/status post-filters
+/// on every Reader frame; callers then apply cheap tag/status post-filters
 /// on top of the cached set. Mirrors Classic's [`compute_order`] cache.
 pub(super) fn ensure_search_cache(st: &mut LibState, entries: &[EntryView]) {
     use std::hash::{Hash, Hasher};

@@ -6,8 +6,9 @@ a hidden `.niutero/` sidecar for private data (tags, notes, reading status,
 saved views, config). Hand the `.bib` to any tool — a collaborator who doesn't
 use niutero still gets a clean, tool-agnostic bibliography.
 
-> Status: **Phase 1** — a complete, tested CLI. (Phase 2, a GUI as a thin client
-> over the same engine, is not built yet.) See `plan.md` / `handoff.md`.
+> Status: Phase 1 (the CLI) is **complete**. Phase 2, `niutero-gui` (egui), is
+> **built and evolving** — a thin client over the same engine. See `plan.md` /
+> `handoff.md`.
 
 ## What it does
 
@@ -44,9 +45,10 @@ cargo run -p niutero-cli -- sync mylib
 ```
 
 Every subcommand takes the vault folder as its first argument and supports
-`--json`. Exit codes: `0` ok · `1` error · `2` actionable (a CI gate — e.g.
-`tex-scan` undefined refs, `normalize --check`, an unresolvable `sync` conflict).
-The installed binary is named `niutero`.
+`--json` (exceptions: `connector`, `cite`, `init`, `connect`, `forget`, `sync`).
+Exit codes: `0` ok · `1` error · `2` actionable (a CI gate — e.g. `tex-scan`
+undefined refs, `normalize --check`, an unresolvable `sync` conflict).
+The CLI binary is named `niutero-cli`; the GUI binary is `niutero`.
 
 ## Vault layout
 
@@ -73,7 +75,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 A Cargo workspace that keeps domain logic out of any UI; every capability is an
 `niutero-engine` function over an open vault, and the CLI is a thin shell over it
-(so a future GUI drives the exact same code).
+(the GUI drives the exact same code).
 
 ```text
 niutero-core    domain model: BibEntry + validate(), filter, citekey, merge, dedup, texscan — no IO
@@ -81,8 +83,10 @@ niutero-bib     tolerant .bib parser + deterministic serializer (the foundation)
 niutero-vault   vault IO: .niutero/ sidecar, atomic writes, exclusive lock
 niutero-sync    git sync by shelling out to system git (no libgit2, no credentials)
 niutero-norm    offline, propose-only normalization
+niutero-online  online helpers via system curl: DOI import/enrich, Anthropic LLM, HuggingFace PDFs
 niutero-engine  operations layer — every capability lives here
-niutero-cli     thin clap arg-parse + output shell (binary: niutero)
+niutero-cli     thin clap arg-parse + output shell (binary: niutero-cli)
+niutero-gui     egui thin client over niutero-engine (binary: niutero)
 ```
 
 See `CLAUDE.md` for the durable rules and `plan.md` for the full spec.

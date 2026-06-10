@@ -2,7 +2,7 @@
 //!
 //! Unlike the `.niutero/` sidecar — which travels *with* the library and is
 //! shared with collaborators — the registry is **per-machine** and never
-//! committed/synced. It records the vaults this machine has opened (so a future
+//! committed/synced. It records the vaults this machine has opened (so a
 //! GUI / shell can offer "recent libraries") plus the strictly machine-local
 //! preferences that must NOT leak into the synced vault:
 //!
@@ -14,6 +14,8 @@
 //! tests so they never touch the real machine file). The on-disk API is
 //! *path-explicit* ([`Registry::load_from`] / [`Registry::save_to`]) so unit
 //! tests run race-free without mutating any global env var.
+
+// NEVER log Registry contents — it holds the AI key and the HF token.
 
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -113,16 +115,20 @@ pub struct VaultRecord {
     /// This machine's sync strategy for the vault (#48).
     #[serde(default, skip_serializing_if = "SyncPrefs::is_default")]
     pub sync: SyncPrefs,
-    /// This machine's PDF-attachment prefs for the vault (HF repo + auto-fetch).
+    /// **Legacy** copy of the vault's PDF prefs (the HF repo / auto-fetch now
+    /// live in the vault's synced `config.toml`). Read-only migration fallback,
+    /// cleared by the engine on set — do not write new prefs here.
     #[serde(default, skip_serializing_if = "PdfPrefs::is_default")]
     pub pdf: PdfPrefs,
 }
 
-/// Machine-local PDF prefs for one vault: the HuggingFace **dataset** repo its
-/// `pdfs/` binaries push/pull to, and whether imports auto-fetch a likely PDF.
-/// Per-vault (different libraries use different repos); the account token is
-/// [`Registry::hf_token`]. `auto_fetch` defaults **off** — optional features
-/// must not put network calls on the base import path uninvited.
+/// **Legacy** copy of one vault's PDF prefs: the HuggingFace **dataset** repo
+/// and the auto-fetch toggle briefly lived here before moving into the vault's
+/// own synced `config.toml`. Kept only as a read-only migration fallback — the
+/// engine clears it whenever the value is set anew; do not write new prefs
+/// here. The account token is [`Registry::hf_token`]. `auto_fetch` defaults
+/// **off** — optional features must not put network calls on the base import
+/// path uninvited.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PdfPrefs {
     /// HF dataset repo as `user/repo`; empty = HF sync not configured.
@@ -275,7 +281,10 @@ impl Registry {
 /// dependency — resolved from the standard env vars directly.
 pub fn registry_path() -> io::Result<PathBuf> {
     if let Some(p) = std::env::var_os("NIUTERO_REGISTRY") {
-        return Ok(PathBuf::from(p));
+        // A leaked test env var is maddening to spot otherwise.
+        let p = PathBuf::from(p);
+        log::debug!("registry: using $NIUTERO_REGISTRY override {}", p.display());
+        return Ok(p);
     }
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
@@ -284,13 +293,17 @@ pub fn registry_path() -> io::Result<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     };
-    base.map(|b| b.join("niutero").join("vaults.toml"))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "could not determine a config directory for the niutero registry",
-            )
-        })
+    base.map(|b| {
+        let p = b.join("niutero").join("vaults.toml");
+        log::debug!("registry: using platform path {}", p.display());
+        p
+    })
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not determine a config directory for the niutero registry",
+        )
+    })
 }
 
 /// Load the default registry, run `f` against it, and save — all while holding

@@ -92,15 +92,22 @@ impl NiuteroApp {
         // Deferred past the `lib` borrow: starting the HF pull needs &mut self.
         let mut pull_pdf = false;
         match action {
-            LibAction::Edit(field, value) => {
+            // Edit carries its OWN citekey (the commit can land in the same
+            // frame as a selection change — `key` may already point at the
+            // newly clicked entry, not the one whose buffer was edited).
+            LibAction::Edit {
+                key: edit_key,
+                field,
+                value,
+            } => {
                 let (set, unset): (Vec<String>, Vec<String>) = if value.trim().is_empty() {
                     (vec![], vec![field.clone()])
                 } else {
                     (vec![format!("{field}={value}")], vec![])
                 };
-                match engine::edit(&lib.vault, &key, &set, &unset, None) {
+                match engine::edit(&lib.vault, &edit_key, &set, &unset, None) {
                     Ok(()) => {
-                        info!("edit {key}.{field}");
+                        info!("edit {edit_key}.{field}");
                         lib.reload();
                         self.lib.refresh();
                         dirtied = true;

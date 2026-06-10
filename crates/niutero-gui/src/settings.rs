@@ -155,8 +155,14 @@ pub enum SettingsAction {
     /// Display authors as `First Last` (true) or `Lastname, First` (false).
     SetAuthorStyle(bool),
     SetGitRemote(String),
-    /// Persist the AI assistant config (machine-local registry).
-    SetAi(AiConfig),
+    /// Persist the AI assistant config (machine-local registry). Carries
+    /// `(previously_saved, current)` so the applier writes only the changed
+    /// fields under the registry lock — a concurrent CLI edit to another
+    /// field must survive a GUI save.
+    SetAi {
+        prev: AiConfig,
+        cur: AiConfig,
+    },
     /// Run a live connection test against the configured provider.
     TestAi,
     /// Persist the open vault's PDF prefs (HF repo + auto-fetch).
@@ -204,17 +210,19 @@ fn current_ai(st: &SettingsState) -> AiConfig {
     }
 }
 
-/// The unsaved AI config, if the state has drifted from what was last
-/// persisted — and mark it saved (callers must actually persist the returned
-/// config). `None` while unseeded or clean.
-pub fn take_ai_dirty(st: &mut SettingsState) -> Option<AiConfig> {
+/// The unsaved AI config as `(previously_saved, current)`, if the state has
+/// drifted — and mark it saved (callers must actually persist it). Returning
+/// the pair lets the applier write only the CHANGED fields through the locked
+/// `update_ai_config`, so a concurrent CLI edit to another field survives.
+/// `None` while unseeded or clean.
+pub fn take_ai_dirty(st: &mut SettingsState) -> Option<(AiConfig, AiConfig)> {
     if !st.ai_seeded {
         return None;
     }
     let cur = current_ai(st);
     if cur != st.ai_saved {
-        st.ai_saved = cur.clone();
-        Some(cur)
+        let prev = std::mem::replace(&mut st.ai_saved, cur.clone());
+        Some((prev, cur))
     } else {
         None
     }
@@ -365,8 +373,8 @@ pub fn settings(
         st.ai_field_focused = false;
     }
     if !st.ai_field_focused {
-        if let Some(cfg) = take_ai_dirty(st) {
-            actions.push(SettingsAction::SetAi(cfg));
+        if let Some((prev, cur)) = take_ai_dirty(st) {
+            actions.push(SettingsAction::SetAi { prev, cur });
         }
     }
     // Same discipline for the PDF page: repo/auto-fetch drift flushes once no
@@ -382,7 +390,8 @@ pub fn settings(
         let tok = st.pdf_token_buf.trim().to_string();
         if !tok.is_empty() {
             st.pdf_token_buf.clear();
-            st.pdf_token_set = true;
+            // pdf_token_set is updated by the applier on the engine's actual
+            // Ok/Err — claiming "set" before the save can fail would lie.
             actions.push(SettingsAction::SetHfToken(tok));
         }
     }
@@ -859,8 +868,8 @@ fn ai_view(
     st.ai_field_focused = focused;
     // Save first, then test against the just-saved config.
     if changed {
-        if let Some(cfg) = take_ai_dirty(st) {
-            actions.push(SettingsAction::SetAi(cfg));
+        if let Some((prev, cur)) = take_ai_dirty(st) {
+            actions.push(SettingsAction::SetAi { prev, cur });
         }
     }
     if test {

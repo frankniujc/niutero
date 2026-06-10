@@ -65,6 +65,10 @@ enum BgMsg {
 pub(super) struct BgHandle {
     rx: mpsc::Receiver<BgMsg>,
     pub(super) cancel: Arc<AtomicBool>,
+    /// Whether this job mutates the LIBRARY on success (entries / sidecar) —
+    /// gates the post-completion auto-commit. PDF binary fetches and HF
+    /// pushes don't (pdfs/ is git-ignored).
+    mutates: bool,
 }
 
 impl NiuteroApp {
@@ -161,7 +165,11 @@ impl NiuteroApp {
             "Enrich finished",
             total,
         ));
-        self.bg = Some(BgHandle { rx, cancel });
+        self.bg = Some(BgHandle {
+            rx,
+            cancel,
+            mutates: true,
+        });
     }
 
     /// Start a Sync (commit & push, pulling/merging first) on a worker thread.
@@ -199,6 +207,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: true,
         });
     }
 
@@ -251,6 +260,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: true,
         });
         true
     }
@@ -301,6 +311,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: true,
         });
     }
 
@@ -350,6 +361,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: false,
         });
     }
 
@@ -377,6 +389,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: false,
         });
     }
 
@@ -403,6 +416,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: false,
         });
     }
 
@@ -434,6 +448,7 @@ impl NiuteroApp {
         self.bg = Some(BgHandle {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            mutates: false,
         });
     }
 
@@ -448,8 +463,11 @@ impl NiuteroApp {
         if msgs.is_empty() {
             return;
         }
+        // Read before the terminal arms drop `bg`.
+        let mutates = self.bg.as_ref().is_some_and(|b| b.mutates);
         let mut reload = false;
         let mut terminal = false;
+        let mut succeeded = false;
         for m in msgs {
             match m {
                 BgMsg::Progress(n) => {
@@ -466,6 +484,7 @@ impl NiuteroApp {
                     self.bg = None;
                     reload = true;
                     terminal = true;
+                    succeeded = true;
                 }
                 BgMsg::Failed(e) => {
                     self.toast = Some(e);
@@ -483,11 +502,17 @@ impl NiuteroApp {
             self.lib.refresh();
             self.norm_cache = None;
         }
-        // Refresh git on ANY completion — a Sync that committed locally but failed
-        // to push (Err) still dirtied/advanced the work tree, so the status bar
-        // must not keep showing the pre-sync state.
         if terminal {
-            self.after_mutation();
+            // Auto-commit only when a LIBRARY-MUTATING job actually succeeded
+            // — a failed DOI fetch or a non-mutating HF push must never sweep
+            // a user's unrelated pending edits into a commit. The git-status
+            // refresh runs on every completion regardless (a Sync that failed
+            // its push still advanced the work tree).
+            if succeeded && mutates {
+                self.after_mutation();
+            } else {
+                self.refresh_git();
+            }
         }
     }
 

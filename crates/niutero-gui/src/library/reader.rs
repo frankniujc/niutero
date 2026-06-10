@@ -594,8 +594,13 @@ fn reading_column(
                 .desired_width(f32::INFINITY)
                 .desired_rows(2),
         );
-        if r.lost_focus() {
-            actions.push(LibAction::Edit("title".into(), st.buffers["title"].clone()));
+        if r.lost_focus() && st.buffers["title"] != *e.fields.get("title").unwrap_or(&String::new())
+        {
+            actions.push(LibAction::Edit {
+                key: e.citekey.clone(),
+                field: "title".into(),
+                value: st.buffers["title"].clone(),
+            });
         }
     }
     ui.add_space(8.0);
@@ -670,11 +675,14 @@ fn reading_column(
                         .desired_width(f32::INFINITY)
                         .desired_rows(6),
                 );
-                if r.lost_focus() {
-                    actions.push(LibAction::Edit(
-                        "abstract".into(),
-                        st.buffers["abstract"].clone(),
-                    ));
+                if r.lost_focus()
+                    && st.buffers["abstract"] != *e.fields.get("abstract").unwrap_or(&String::new())
+                {
+                    actions.push(LibAction::Edit {
+                        key: e.citekey.clone(),
+                        field: "abstract".into(),
+                        value: st.buffers["abstract"].clone(),
+                    });
                 }
             }
         });

@@ -25,12 +25,14 @@ mod wizards;
 
 pub use wizards::{wizard_ui, ApplySummary, Wizard, WizardOutcome};
 
-/// Which wizard the toolbar launched.
+/// Which wizard the toolbar launched. `TexTag` is the "Tag from LaTeX" flow
+/// (formerly named Import — nothing is imported; it tags what a manuscript
+/// cites, and the name collided with the real `.bib` import surface).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WizardKind {
     Organize,
     Autotag,
-    Import,
+    TexTag,
 }
 
 /// Tag-table sort column.
@@ -290,7 +292,7 @@ fn toolbar(ui: &mut egui::Ui, theme: &Theme, st: &mut TagsState, actions: &mut V
                     // "Tag from LaTeX", not "Import project": nothing is
                     // imported — the wizard tags entries a manuscript cites.
                     if wz_btn(ui, theme, Glyph::Download, "Tag from LaTeX", false).clicked() {
-                        actions.push(TagAction::Wizard(WizardKind::Import));
+                        actions.push(TagAction::Wizard(WizardKind::TexTag));
                     }
                     if wz_btn(ui, theme, Glyph::Ai, "Auto-tag", true).clicked() {
                         actions.push(TagAction::Wizard(WizardKind::Autotag));

@@ -224,11 +224,12 @@ impl NiuteroApp {
             )),
             _ => None,
         };
-        // Dev/QA: open a tag wizard on boot (NIU_WIZARD=organize|autotag|import).
+        // Dev/QA: open a tag wizard on boot (NIU_WIZARD=organize|autotag|textag;
+        // "import" stays as an alias for the TexTag wizard's old name).
         let tag_wizard = match std::env::var("NIU_WIZARD").as_deref() {
             Ok("organize") => Some(tags::Wizard::new(tags::WizardKind::Organize)),
             Ok("autotag") => Some(tags::Wizard::new(tags::WizardKind::Autotag)),
-            Ok("import") => Some(tags::Wizard::new(tags::WizardKind::Import)),
+            Ok("textag") | Ok("import") => Some(tags::Wizard::new(tags::WizardKind::TexTag)),
             _ => None,
         };
         // Appearance is a machine-local pref: the app reopens looking the way
@@ -336,7 +337,7 @@ impl NiuteroApp {
         self.cancel_ai_job();
         self.tag_wizard = None;
         // Persist an unsaved AI-settings edit before the state is reset.
-        self.flush_ai_settings();
+        self.flush_settings();
         self.task = None;
         match Library::load(&path) {
             Ok(lib) => {
@@ -611,7 +612,7 @@ impl eframe::App for NiuteroApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Last chance to persist an AI-settings edit typed just before close.
-        self.flush_ai_settings();
+        self.flush_settings();
     }
 }
 
@@ -833,7 +834,7 @@ impl NiuteroApp {
                     // unsaved AI edit (a key still in a focused field when the
                     // rail was clicked) must be persisted now.
                     if self.tool == Tool::Settings && tool != Tool::Settings {
-                        self.flush_ai_settings();
+                        self.flush_settings();
                     }
                     self.tool = tool;
                 }

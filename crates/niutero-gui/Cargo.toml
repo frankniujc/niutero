@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The desktop GUI (Phase 2): a pure-Rust egui/eframe app with the wgpu (GPU)
+# The desktop GUI (Phase 2): a pure-Rust egui/eframe app with the glow (OpenGL)
 # backend, calling niutero-engine directly — no IPC, no shelling out. The binary
 # is `niutero` (the CLI binary is `niutero-cli`). Cross-platform: nothing here is
 # OS-specific; the Windows-on-ARM linker workaround lives in the gitignored
@@ -24,9 +24,9 @@ eframe = { version = "0.33.3", default-features = false, features = ["glow", "de
 niutero-engine = { path = "../niutero-engine" }
 # Logging: the `log` facade (eframe/egui/winit/glow log through it too) routed to
 # stderr by env_logger. Tune via RUST_LOG, e.g. `RUST_LOG=niutero=debug`.
-log = "0.4"
-env_logger = "0.11"
+log = { workspace = true }
+env_logger = { workspace = true }
 egui_extras = { version = "0.33.3", features = ["svg"] }
 rfd = "0.17.2"
 # eframe pinned via `cargo add` to the latest release compatible with the 1.89
-# toolchain; wgpu backend for GPU rendering.
+# toolchain; glow backend (see the renderer note above).

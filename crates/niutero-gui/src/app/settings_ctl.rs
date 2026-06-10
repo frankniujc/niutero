@@ -16,42 +16,129 @@ use super::jobs::AiJobKind;
 use super::{LibView, NiuteroApp, Tool};
 
 impl NiuteroApp {
-    /// Persist any unsaved Settings edit (AI config, PDF prefs, a typed HF
-    /// token) — the typed-then-navigate-away case. Called when leaving the
-    /// Settings tool, switching libraries (BEFORE the old library is dropped,
-    /// since PDF prefs are per-vault), and on app exit. No-op when clean.
-    pub(super) fn flush_ai_settings(&mut self) {
-        if let Some(cfg) = settings::take_ai_dirty(&mut self.settings) {
-            if let Err(e) = engine::set_ai_config(cfg) {
-                self.set_toast(format!("Couldn't save AI settings: {e}"));
-            }
+    /// Persist every unsaved Settings edit (AI config, PDF prefs, a typed HF
+    /// token, the library name/pattern) — the typed-then-navigate-away case.
+    /// Called when leaving the Settings tool, switching libraries (BEFORE the
+    /// old library is dropped, since the vault-config groups are per-vault),
+    /// and on app exit. No-op when clean. The same `persist_*` helpers back
+    /// the SettingsAction appliers, so each persistence chain exists once.
+    pub(super) fn flush_settings(&mut self) {
+        if let Some((prev, cur)) = settings::take_ai_dirty(&mut self.settings) {
+            self.persist_ai(prev, cur);
         }
         if let Some((repo, auto_fetch)) = settings::take_pdf_dirty(&mut self.settings) {
-            if let Some(lib) = self.library.as_mut() {
-                if let Err(e) = engine::set_pdf_repo(&mut lib.vault, &repo) {
-                    self.set_toast(format!("Couldn't save the PDF repo: {e}"));
-                } else if let Err(e) =
-                    engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch))
-                {
-                    self.set_toast(format!("Couldn't save PDF settings: {e}"));
-                }
-            }
+            self.persist_pdf(repo, auto_fetch);
         }
         let tok = self.settings.pdf_token_buf.trim().to_string();
         if !tok.is_empty() {
             self.settings.pdf_token_buf.clear();
-            self.settings.pdf_token_set = true;
-            if let Err(e) = engine::set_hf_token(&tok) {
-                self.set_toast(format!("Couldn't save the HF token: {e}"));
-            }
+            self.persist_token(tok, true);
         }
         if let Some((name, pattern)) = settings::take_lib_dirty(&mut self.settings) {
-            if let Some(lib) = self.library.as_mut() {
-                if let Err(e) =
-                    engine::set_library_meta(&mut lib.vault, Some(&name), Some(&pattern))
-                {
-                    self.set_toast(format!("Couldn't save library settings: {e}"));
+            self.persist_lib(name, pattern);
+        }
+    }
+
+    /// Write only the CHANGED AI fields under the registry lock, so a
+    /// concurrent `niutero-cli ai config` edit to another field survives a
+    /// GUI save. On failure: toast + reseed the page from the engine, so the
+    /// UI shows what is actually stored rather than pretending the rejected
+    /// value was saved.
+    fn persist_ai(&mut self, prev: engine::AiConfig, cur: engine::AiConfig) {
+        let r = engine::update_ai_config(|c| {
+            if cur.enabled != prev.enabled {
+                c.enabled = cur.enabled;
+            }
+            if cur.provider != prev.provider {
+                c.provider = cur.provider.clone();
+            }
+            if cur.api_key != prev.api_key {
+                c.api_key = cur.api_key.clone();
+            }
+            if cur.model != prev.model {
+                c.model = cur.model.clone();
+            }
+            if cur.base_url != prev.base_url {
+                c.base_url = cur.base_url.clone();
+            }
+        });
+        if let Err(e) = r {
+            self.set_toast(format!("Couldn't save AI settings: {e}"));
+            self.settings.ai_seeded = false; // reseed from the engine's truth
+        }
+    }
+
+    /// Persist the vault's PDF repo + auto-fetch (synced config). A config
+    /// write dirties the repo, so the auto-commit hook runs like the CLI's.
+    fn persist_pdf(&mut self, repo: String, auto_fetch: bool) {
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        let r = engine::set_pdf_repo(&mut lib.vault, &repo).and_then(|()| {
+            engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch)).map(|_| ())
+        });
+        match r {
+            Ok(()) => self.after_mutation(),
+            Err(e) => {
+                self.set_toast(format!("Couldn't save PDF settings: {e}"));
+                self.settings.seeded = false; // reseed the vault-bound groups
+            }
+        }
+    }
+
+    /// Persist the library name + citekey pattern (synced config).
+    fn persist_lib(&mut self, name: String, pattern: String) {
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        match engine::set_library_meta(&mut lib.vault, Some(&name), Some(&pattern)) {
+            Ok(()) => self.after_mutation(),
+            Err(e) => {
+                self.set_toast(format!("Couldn't save library settings: {e}"));
+                self.settings.seeded = false;
+            }
+        }
+    }
+
+    /// Persist the library's workflow toggles (synced config).
+    fn persist_workflow(&mut self, enrich: bool, commit: bool, on_dup: String) {
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        match engine::set_workflow(
+            &mut lib.vault,
+            Some(enrich),
+            Some(commit),
+            Some(&on_dup),
+            None,
+        ) {
+            Ok(_) => self.after_mutation(),
+            Err(e) => {
+                self.set_toast(format!("Couldn't save workflow settings: {e}"));
+                self.settings.seeded = false;
+            }
+        }
+    }
+
+    /// Store/clear the machine HF token; `pdf_token_set` reflects the actual
+    /// engine outcome, never an optimistic guess. `quiet` skips the success
+    /// toast (the navigate-away flush shouldn't pop one).
+    fn persist_token(&mut self, tok: String, quiet: bool) {
+        let clearing = tok.trim().is_empty();
+        match engine::set_hf_token(&tok) {
+            Ok(()) => {
+                self.settings.pdf_token_set = !clearing;
+                if !quiet {
+                    self.set_toast(if clearing {
+                        "HF token cleared"
+                    } else {
+                        "HF token saved (machine-local)"
+                    });
                 }
+            }
+            Err(e) => {
+                self.settings.pdf_token_set = engine::hf_token_set().unwrap_or(false);
+                self.set_toast(format!("Couldn't save the HF token: {e}"));
             }
         }
     }
@@ -217,64 +304,16 @@ impl NiuteroApp {
                     None => {}
                 }
             }
-            SettingsAction::SetAi(cfg) => {
-                if let Err(e) = engine::set_ai_config(cfg) {
-                    self.toast = Some(format!("Couldn't save AI settings: {e}"));
-                }
-            }
+            SettingsAction::SetAi { prev, cur } => self.persist_ai(prev, cur),
             SettingsAction::TestAi => self.start_ai_test(ctx),
-            SettingsAction::SetPdfPrefs { repo, auto_fetch } => {
-                if let Some(lib) = self.library.as_mut() {
-                    // Repo + auto-fetch are library properties now (synced
-                    // config.toml), not machine prefs.
-                    if let Err(e) = engine::set_pdf_repo(&mut lib.vault, &repo) {
-                        self.toast = Some(format!("Couldn't save the PDF repo: {e}"));
-                    } else if let Err(e) =
-                        engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch))
-                    {
-                        self.toast = Some(format!("Couldn't save PDF settings: {e}"));
-                    }
-                }
-            }
-            SettingsAction::SetLibraryMeta { name, pattern } => {
-                if let Some(lib) = self.library.as_mut() {
-                    match engine::set_library_meta(&mut lib.vault, Some(&name), Some(&pattern)) {
-                        // The titlebar shows vault.config.name — updated in place.
-                        Ok(()) => {}
-                        Err(e) => self.toast = Some(format!("Couldn't save library settings: {e}")),
-                    }
-                }
-            }
+            SettingsAction::SetPdfPrefs { repo, auto_fetch } => self.persist_pdf(repo, auto_fetch),
+            SettingsAction::SetLibraryMeta { name, pattern } => self.persist_lib(name, pattern),
             SettingsAction::SetWorkflow {
                 enrich_on_import,
                 auto_commit,
                 on_dup,
-            } => {
-                if let Some(lib) = self.library.as_mut() {
-                    if let Err(e) = engine::set_workflow(
-                        &mut lib.vault,
-                        Some(enrich_on_import),
-                        Some(auto_commit),
-                        Some(&on_dup),
-                        None,
-                    ) {
-                        self.toast = Some(format!("Couldn't save workflow settings: {e}"));
-                    }
-                }
-            }
-            SettingsAction::SetHfToken(tok) => {
-                let clearing = tok.trim().is_empty();
-                match engine::set_hf_token(&tok) {
-                    Ok(()) => {
-                        self.set_toast(if clearing {
-                            "HF token cleared"
-                        } else {
-                            "HF token saved (machine-local)"
-                        });
-                    }
-                    Err(e) => self.set_toast(format!("Couldn't save the HF token: {e}")),
-                }
-            }
+            } => self.persist_workflow(enrich_on_import, auto_commit, on_dup),
+            SettingsAction::SetHfToken(tok) => self.persist_token(tok, false),
             SettingsAction::CreatePdfRepo => self.start_create_pdf_repo(ctx),
             SettingsAction::Toast(m) => self.toast = Some(m),
         }

@@ -1,10 +1,10 @@
 //! niutero-engine — the operations layer.
 //!
 //! Every niutero capability is a function here, expressed over an open
-//! [`Vault`], so the CLI and a future GUI drive the *same* code. Front-ends
-//! only parse input into the request types below and format the results;
-//! nothing operational lives in a binary. This is what makes "the GUI is a
-//! thin client over the CLI's interface" real rather than aspirational.
+//! [`Vault`], so the CLI and the GUI (`niutero-gui`) drive the *same* code.
+//! Front-ends only parse input into the request types below and format the
+//! results; nothing operational lives in a binary. This is what makes "the GUI
+//! is a thin client over the CLI's interface" real.
 
 use std::path::{Path, PathBuf};
 
@@ -217,6 +217,8 @@ pub fn edit(
     if let BibItem::Entry(e) = &items[idx] {
         e.validate()?;
     }
+    // debug, not info: the GUI already info-logs edits at its own layer.
+    log::debug!("edit {citekey}");
     write_items(v, &items)
 }
 
@@ -232,6 +234,7 @@ pub fn rm(v: &mut Vault, citekey: &str) -> Result<(), String> {
         v.save_sidecar()
             .map_err(|e| format!("update sidecar: {e}"))?;
     }
+    log::debug!("rm {citekey}");
     Ok(())
 }
 
@@ -369,6 +372,14 @@ fn merge_incoming(
     }
 
     write_items(v, &items)?;
+    log::info!(
+        "import into {}: {} added, {} overwritten, {} renamed, {} skipped",
+        v.root.display(),
+        report.added,
+        report.overwritten,
+        report.renamed.len(),
+        report.skipped
+    );
     Ok(report)
 }
 
@@ -403,6 +414,8 @@ pub fn enrich(v: &Vault, citekey: &str) -> Result<Vec<String>, String> {
             e.validate()?;
         }
         write_items(v, &items)?;
+        // Field NAMES only — never the fetched values.
+        log::info!("enrich {citekey}: filled {}", filled.join(", "));
     }
     Ok(filled)
 }
@@ -646,13 +659,15 @@ pub fn git_status(root: &Path) -> Option<GitStatus> {
 /// Record that a vault was just opened. **Best-effort**: a machine with no
 /// resolvable config dir, or an unwritable registry, must never make `open`
 /// fail — recency tracking is a convenience, not part of the data path. The CLI
-/// (and a future GUI) call this right after a successful [`open`].
+/// and the GUI call this right after a successful [`open`].
 pub fn record_open(root: &Path) {
     // Locked read-modify-save so a concurrent process can't clobber it; failures
-    // are swallowed because recency tracking must never break an open.
-    let _ = niutero_vault::registry::with_registry_mut(|reg| {
+    // never break an open (recency tracking is a convenience) but are logged.
+    if let Err(e) = niutero_vault::registry::with_registry_mut(|reg| {
         reg.record_open(root, niutero_vault::registry::now_epoch());
-    });
+    }) {
+        log::warn!("could not record vault open in the registry: {e}");
+    }
 }
 
 /// Forget a vault from the recent list. Returns whether one was present.
@@ -906,10 +921,20 @@ pub fn set_workflow(
             }
         };
     }
+    let clear_legacy_auto_fetch = auto_fetch_pdf.is_some();
     if let Some(b) = auto_fetch_pdf {
         v.config.workflow.auto_fetch_pdf = b;
     }
     v.save_sidecar().map_err(|e| format!("save config: {e}"))?;
+    // The vault config is the single source for auto-fetch now; clear the
+    // legacy machine-registry toggle whenever it's explicitly set, or a
+    // pre-migration `true` there would OR back in and make "off" impossible
+    // (mirrors what set_pdf_repo does for the repo).
+    if clear_legacy_auto_fetch {
+        if let Err(e) = pdf_ops::update_pdf_prefs(v, |p| p.auto_fetch = false) {
+            log::warn!("could not clear the legacy auto-fetch registry toggle: {e}");
+        }
+    }
     Ok(v.config.workflow.clone())
 }
 
@@ -925,7 +950,8 @@ pub fn default_dup_policy(v: &Vault, fallback: DupPolicy) -> DupPolicy {
     }
 }
 
-/// Post-import hook: enrich `keys` from their DOIs when the library opted in
+/// **Online (when enabled).** Post-import hook: enrich `keys` from their DOIs
+/// when the library opted in
 /// (`config --enrich-on-import true`). Best-effort per entry — an entry
 /// without a DOI is skipped silently; a failed fetch counts as attempted.
 /// Returns `(filled, attempted)`; `(0, 0)` with zero network calls when the
@@ -1029,9 +1055,15 @@ pub fn rekey_apply(v: &mut Vault, pattern: Option<&str>) -> Result<Vec<Rekey>, S
     }
     v.meta = migrated;
     if let Err(e) = save_sidecar(v) {
-        let _ = write_items(v, &original);
+        if let Err(rb) = write_items(v, &original) {
+            log::warn!("rekey: rollback of references.bib also failed — .bib and sidecar may disagree on cite keys: {rb}");
+            return Err(format!(
+                "{e} (and rolling back references.bib failed: {rb})"
+            ));
+        }
         return Err(e);
     }
+    log::info!("rekey: renamed {} cite key(s)", changes.len());
     Ok(changes)
 }
 
@@ -1267,6 +1299,7 @@ pub fn dedupe_merge(v: &mut Vault) -> Result<Vec<DupMerge>, String> {
     items.retain(|it| !matches!(it, BibItem::Entry(e) if to_remove.contains(&e.citekey)));
     write_items(v, &items)?;
     save_sidecar(v)?;
+    log::info!("dedupe: merged {} duplicate group(s)", merges.len());
     Ok(merges)
 }
 
@@ -1427,6 +1460,7 @@ pub fn normalize_apply(v: &Vault, profile: Option<&str>) -> Result<Vec<NormChang
     let (normalized, changes) = norm_changes(&items, &cfg);
     if !changes.is_empty() {
         write_items(v, &normalized)?;
+        log::info!("normalize: changed {} entr(ies)", changes.len());
     }
     Ok(changes)
 }
@@ -3525,6 +3559,21 @@ mod tests {
         ] {
             assert_eq!(fetchable_pdf_url(no), None, "{no}");
         }
+    }
+
+    #[test]
+    fn disabling_auto_fetch_also_clears_the_legacy_registry_toggle() {
+        with_registry(|| {
+            let (_d, mut v) = vault();
+            // A machine that enabled auto-fetch on the registry-pref build…
+            update_pdf_prefs(&v, |p| p.auto_fetch = true).unwrap();
+            assert!(pdf_auto_fetch_enabled(&v));
+            // …must be able to turn it OFF: the explicit set clears the
+            // legacy copy, or the OR-fallback would re-enable it forever.
+            set_workflow(&mut v, None, None, None, Some(false)).unwrap();
+            assert!(!pdf_auto_fetch_enabled(&v));
+            assert!(!pdf_prefs(&v).unwrap().auto_fetch);
+        });
     }
 
     #[test]

@@ -1,4 +1,4 @@
-﻿//! Tags tool body and appliers: tag rename/merge/delete (with confirmation),
+//! Tags tool body and appliers: tag rename/merge/delete (with confirmation),
 //! the tag-wizard modal step loop, and the wizard apply paths (organize /
 //! auto-tag / import).
 
@@ -169,7 +169,7 @@ impl NiuteroApp {
                 // otherwise the result lands in whatever wizard opens next.
                 self.cancel_wizard_ai_job();
             }
-            tags::WizardOutcome::ScanImport { files } => {
+            tags::WizardOutcome::ScanTex { files } => {
                 // Run the LaTeX cite-scan (we hold the vault), feed the result
                 // back into the wizard, and keep it open at the review step.
                 match self
@@ -195,8 +195,8 @@ impl NiuteroApp {
                 }
                 self.tag_wizard = Some(wiz);
             }
-            tags::WizardOutcome::ApplyImport { tag, keys } => {
-                let summary = self.apply_import(tag, keys);
+            tags::WizardOutcome::ApplyTexTag { tag, keys } => {
+                let summary = self.apply_textag(tag, keys);
                 wiz.set_applied(summary); // the Done step reports real counts
                 self.tag_wizard = Some(wiz);
             }
@@ -347,7 +347,7 @@ impl NiuteroApp {
 
     /// Tag every cited+matched entry from the Import wizard with `tag`
     /// (sidecar), in one bulk write. Returns the real outcome.
-    fn apply_import(&mut self, tag: String, keys: Vec<String>) -> tags::ApplySummary {
+    fn apply_textag(&mut self, tag: String, keys: Vec<String>) -> tags::ApplySummary {
         let Some(lib) = self.library.as_mut() else {
             return tags::ApplySummary::default();
         };

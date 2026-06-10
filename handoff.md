@@ -26,13 +26,15 @@ is the explicit spec that W2's offline normalizer was ported from.
   "Remaining work".)
 - **Phase 2 GUI EXISTS** — `niutero-gui` (egui, custom titlebar/theme), a thin
   client calling `niutero-engine` directly (never shelling out). Tool rail:
-  **Library** (Classic / Reader / Board views, tags sidebar, full detail panel
+  **Library** (Classic / Reader views — Board temporarily removed, see the
+  2026-06-10 (later) section; tags sidebar, full detail panel
   with edit/tags/status/stars/cite/BibTeX/delete), **Tags** tool (vocabulary
   table, rename/merge/delete with confirm dialogs, Import + Organize + Auto-tag
   wizards), **Normalize** (offline preview/apply, health report, re-key),
   **AI** (chat grounded in the library, live when configured), **Settings**
-  (real AI config page; several other pages still visual-only — see the
-  2026-06-10 section). The G1–G5 tab surface landed 2026-05-30; see
+  (every page persists to its proper home — vault config vs machine registry;
+  still visual-only: font pickers, density, the search box, Keymap/Integrations
+  stubs). The G1–G5 tab surface landed 2026-05-30; see
   `gui-button-audit.md` for the real-vs-mock map.
 - **Phase 1 wave history**, in order:
   - **Wave 1** (`8dfd8ee`): small deferred fixes — CRLF/BOM input normalization,
@@ -318,6 +320,32 @@ User decisions: appearance → machine-local; workflow → the vault's own confi
   default) or `First Lastname` (flips the comma form, display-only; corporate
   / comma-less names pass through). Lives in the registry `[ui]` as
   `author_first_last`; `set_ui_prefs` now takes the whole `UiPrefs`.
+
+## 2026-06-10 (fifth) — pre-push sweep: hardening, logging, cleanup
+
+A full pre-push review found **8 confirmed correctness issues — all fixed**
+before pushing:
+
+- **HIGH GUI bug**: a focus-loss edit could write entry A's field into entry B
+  when the click that blurred the field also moved the selection.
+  `LibAction::Edit` now carries its citekey, and unchanged buffers no longer
+  commit.
+- Disabling PDF auto-fetch now also clears the legacy registry toggle — it
+  previously could never be turned off on a machine that still had the
+  registry-era pref set.
+- Connector captures run the same post-import hooks as every other import
+  (PDF auto-fetch, enrich-on-import, auto-commit).
+- GUI background jobs only auto-commit when a library-mutating job actually
+  succeeded.
+- GUI settings writes go through shared persist helpers: config-page saves now
+  auto-commit like the CLI's, failed saves reseed the page instead of pretending
+  success, and the AI config saves only changed fields under the registry lock
+  (a concurrent CLI edit survives).
+- `ai organize --apply` exits 1 when any merge failed; `enrich` / `pdf` /
+  `suggest-tags` gained `--json`.
+- Logging landed across engine/online/vault behind `RUST_LOG` (the CLI now
+  initializes `env_logger`; secrets are never logged), plus assorted
+  stale-doc / dead-code cleanup.
 
 ### Follow-ups (next work, in rough priority)
 

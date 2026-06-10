@@ -9,15 +9,11 @@
 
 use std::process::Command;
 
-/// Is a usable `curl` on PATH?
-pub fn curl_available() -> bool {
-    run(&["--version"]).is_ok_and(|o| o.status.success())
-}
-
 /// Fetch an entry's canonical BibTeX from its DOI via doi.org content
 /// negotiation (`Accept: application/x-bibtex`). Needs network access.
 pub fn fetch_doi_bibtex(doi: &str) -> Result<String, String> {
     let url = doi_url(doi);
+    log::debug!("doi fetch: {url}");
     let body = ok(&[
         "-fsSL",
         "--max-time",
@@ -34,24 +30,16 @@ pub fn fetch_doi_bibtex(doi: &str) -> Result<String, String> {
 
 /// Download `url` to `dest` (following redirects). Needs network access.
 pub fn fetch_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    log::debug!("download {url} -> {}", dest.display());
     let dest = dest.to_str().ok_or("destination path is not valid UTF-8")?;
     ok(&["-fsSL", "--max-time", "120", "-o", dest, url]).map(|_| ())
 }
 
 /// Ask Claude (Anthropic Messages API) for a completion; returns the text.
-/// Reads the API key from `$ANTHROPIC_API_KEY`. The key and request body are
-/// passed via a temp `curl` config file (`-K`), never on the command line, so
-/// the key isn't exposed in the process list. Needs network access.
-pub fn anthropic_text(model: &str, system: &str, user: &str) -> Result<String, String> {
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "set ANTHROPIC_API_KEY to use the AI features".to_string())?;
-    anthropic_text_with(&key, model, 512, system, user)
-}
-
-/// Like [`anthropic_text`] but with an explicit key and `max_tokens` — so the
-/// engine can drive it from the user's stored AI config. The key goes to curl
-/// as a `-K -` config on **stdin** (never argv, never on disk); only the
+/// The engine drives this from the user's stored AI config. The key goes to
+/// curl as a `-K -` config on **stdin** (never argv, never on disk); only the
 /// request body touches disk, as a random-named 0600 temp file.
+/// Needs network access.
 pub fn anthropic_text_with(
     key: &str,
     model: &str,
@@ -88,10 +76,16 @@ pub fn anthropic_text_with(
         .map_err(|e| format!("write request body: {e}"))?;
     let cfg = curl_llm_cfg(key, body_file.path());
 
+    // never log cfg/input/body — they carry the API key / user content
+    log::debug!(
+        "anthropic request: model={model} max_tokens={max_tokens} body={}B",
+        body.len()
+    );
     // No `-f`: on an HTTP error we want the API's JSON error body so
     // `extract_text` can surface its message instead of an opaque curl exit.
     let raw = ok_with_stdin(&["-sSL", "--max-time", "60", "-K", "-"], &cfg)?;
     drop(body_file); // deletes the temp file
+    log::debug!("anthropic response: {}B", raw.len());
     extract_text(&raw)
 }
 
@@ -205,6 +199,8 @@ pub fn hf_create_dataset(token: &str, repo: &str) -> Result<String, String> {
          data = \"@{}\"\n",
         fwd_slashes(body_file.path())
     );
+    // never log cfg — it embeds the Bearer token
+    log::debug!("hf create dataset: {repo}");
     let raw = ok_with_stdin(&["-sSL", "--max-time", "60", "-K", "-"], &cfg)?;
     drop(body_file);
     let value: serde_json::Value =
@@ -250,6 +246,8 @@ pub fn hf_upload(
          data = \"@{}\"\n",
         fwd_slashes(body_file.path())
     );
+    // never log cfg — it embeds the Bearer token
+    log::debug!("hf upload: {repo}/{remote_path} ({}B)", bytes.len());
     let raw = ok_with_stdin(&["-sSL", "--max-time", "300", "-K", "-"], &cfg)?;
     drop(body_file);
     let value: serde_json::Value =
@@ -283,6 +281,8 @@ pub fn hf_download(
          output = \"{}\"\n",
         fwd_slashes(dest)
     );
+    // never log cfg — it embeds the Bearer token
+    log::debug!("hf download: {repo}/{remote_path} -> {}", dest.display());
     ok_with_stdin(&["-sS", "--max-time", "300", "-K", "-"], &cfg)
         .map(|_| ())
         .map_err(|e| format!("HF download failed ({e}) — check the repo, path, and token"))

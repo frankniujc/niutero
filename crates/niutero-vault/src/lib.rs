@@ -239,7 +239,13 @@ impl Vault {
         // a corrupt sidecar and then overwrite it with empty defaults.
         let config = match fs::read_to_string(root.join(".niutero").join("config.toml")) {
             Ok(s) => toml::from_str(&s).map_err(invalid_data)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Config::named(folder_name(&root)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                log::debug!(
+                    "{}: no .niutero sidecar, opening with in-memory defaults",
+                    root.display()
+                );
+                Config::named(folder_name(&root))
+            }
             Err(e) => return Err(e),
         };
         let meta = match fs::read_to_string(root.join(".niutero").join("meta.json")) {
@@ -377,7 +383,14 @@ fn atomic_write_impl(path: &Path, contents: &str, private: bool) -> io::Result<(
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp); // best-effort cleanup
+        // Best-effort cleanup; a stranded .tmp beside references.bib confuses
+        // users and git, so a failure to remove it is worth a warning. (A
+        // NotFound just means the temp file was never created.)
+        if let Err(e) = fs::remove_file(&tmp) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::warn!("could not remove temp file {}: {e}", tmp.display());
+            }
+        }
     }
     result
 }

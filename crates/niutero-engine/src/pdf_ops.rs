@@ -1,10 +1,12 @@
 //! PDF sync + auto-fetch — the operations behind Settings → PDF attachments.
 //!
 //! Local attach/fetch/open live in `lib.rs` (`attach_pdf` / `fetch_pdf` /
-//! `pdf_path`); this module adds the machine-local prefs (HF dataset repo,
-//! auto-fetch toggle, account token) and the HuggingFace push/pull/create
-//! operations over `niutero-online`. Everything network-touching stays off the
-//! base path: with no prefs configured, nothing here makes a call.
+//! `pdf_path`); this module adds the prefs and the HuggingFace push/pull/create
+//! operations over `niutero-online`. The HF dataset repo and the auto-fetch
+//! toggle live in the vault's own synced `config.toml` (with a legacy machine-
+//! registry read fallback); only the account token stays machine-local.
+//! Everything network-touching stays off the base path: with no prefs
+//! configured, nothing here makes a call.
 //!
 //! Binaries never enter the `.bib` or git (`pdfs/` is git-ignored); the HF
 //! token is machine-local registry state, like the AI key.
@@ -54,6 +56,9 @@ pub fn pdf_repo(v: &Vault) -> Result<Option<String>, String> {
         return Ok(Some(r.to_string()));
     }
     let legacy = pdf_prefs(v)?.repo.trim().to_string();
+    if !legacy.is_empty() {
+        log::debug!("pdf repo: using legacy registry value (config.toml unset)");
+    }
     Ok((!legacy.is_empty()).then_some(legacy))
 }
 
@@ -72,15 +77,25 @@ pub fn set_pdf_repo(v: &mut Vault, repo: &str) -> Result<(), String> {
         v.config.pdf_repo = (!repo.is_empty()).then(|| repo.to_string());
         v.save_sidecar().map_err(|e| format!("save config: {e}"))?;
     }
-    // Best-effort legacy cleanup — the vault config is the single source now.
-    let _ = update_pdf_prefs(v, |p| p.repo = String::new());
+    // Best-effort legacy cleanup — the vault config is the single source now;
+    // a stale registry copy would silently resurrect a cleared repo.
+    if let Err(e) = update_pdf_prefs(v, |p| p.repo = String::new()) {
+        log::warn!("could not clear the legacy PDF-repo registry copy: {e}");
+    }
     Ok(())
 }
 
 /// Whether post-import PDF auto-fetch is on for this library: the synced
 /// `workflow.auto_fetch_pdf`, or the legacy machine-registry toggle.
 pub fn pdf_auto_fetch_enabled(v: &Vault) -> bool {
-    v.config.workflow.auto_fetch_pdf || pdf_prefs(v).map(|p| p.auto_fetch).unwrap_or(false)
+    if v.config.workflow.auto_fetch_pdf {
+        return true;
+    }
+    let legacy = pdf_prefs(v).map(|p| p.auto_fetch).unwrap_or(false);
+    if legacy {
+        log::debug!("pdf auto-fetch: using legacy registry value (config.toml unset)");
+    }
+    legacy
 }
 
 /// Whether a HuggingFace token is configured (the token itself is never
@@ -107,14 +122,14 @@ fn resolve_hf(v: &Vault) -> Result<(String, String), String> {
     let token = reg.hf_token.trim().to_string();
     if token.is_empty() {
         return Err(
-            "no HuggingFace token — run `niutero pdf-config <vault> --token-stdin` \
+            "no HuggingFace token — run `niutero-cli pdf-config <vault> --token-stdin` \
                     or add one in Settings → PDF attachments"
                 .into(),
         );
     }
     let Some(repo) = pdf_repo(v)? else {
         return Err("no HF dataset repo configured for this library — run \
-                    `niutero pdf-config <vault> --repo user/repo` or set it in \
+                    `niutero-cli pdf-config <vault> --repo user/repo` or set it in \
                     Settings → PDF attachments"
             .into());
     };
@@ -188,7 +203,8 @@ pub fn fetchable_pdf_url(url: &str) -> Option<String> {
     None
 }
 
-/// Post-import hook: fetch likely PDFs for `keys` when this vault opted in
+/// **Online (when enabled).** Post-import hook: fetch likely PDFs for `keys`
+/// when this vault opted in
 /// (`pdf-config --auto-fetch true`). Best-effort per entry — a failed fetch
 /// is skipped, never fatal, and leaves no partial file. Returns
 /// `(fetched, attempted)`; `(0, 0)` without a single network call when the
@@ -213,8 +229,18 @@ pub fn auto_fetch_pdfs(v: &Vault, keys: &[String]) -> Result<(usize, usize), Str
         let dest = crate::prepare_pdf_dir(v, k)?;
         match niutero_online::fetch_to_file(&url, &dest) {
             Ok(()) => fetched += 1,
-            Err(_) => {
-                let _ = std::fs::remove_file(&dest);
+            Err(e) => {
+                // The url is the entry's own public url field — fine to log.
+                log::warn!("auto-fetch: could not fetch a PDF for '{k}' from {url}: {e}");
+                if let Err(rm) = std::fs::remove_file(&dest) {
+                    if rm.kind() != std::io::ErrorKind::NotFound {
+                        // A torn dest blocks future fetches via the exists() check.
+                        log::debug!(
+                            "auto-fetch: could not remove partial {}: {rm}",
+                            dest.display()
+                        );
+                    }
+                }
             }
         }
     }

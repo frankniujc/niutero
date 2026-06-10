@@ -10,5 +10,6 @@ license.workspace = true
 # offline base path.
 
 [dependencies]
+log = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

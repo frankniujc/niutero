@@ -1,10 +1,11 @@
 //! Wizards — three multi-step flows launched from the Tags toolbar. All real:
-//!   Organize  : `engine::organize_tags` proposes merges + new tags; the app
-//!               applies the accepted merges via `rename_tag`.
-//!   Auto-tag  : `engine::suggest_tags` per untagged entry; the app applies the
-//!               accepted assignments via `set_tags`.
-//!   Import    : `tex_scan` resolves `\cite{}` keys, then tags the matched
-//!               entries `pp:<project>`.
+//!   Organize     : `engine::organize_tags` proposes merges + new tags; the app
+//!                  applies the accepted merges via `rename_tag`.
+//!   Auto-tag     : `engine::suggest_tags` per untagged entry; the app applies
+//!                  the accepted assignments via `set_tags`.
+//!   Tag-from-LaTeX (TexTag): `tex_scan` resolves `\cite{}` keys, then tags the
+//!                  matched entries `pp:<project>`. (The `imp_*` fields keep
+//!                  their historical prefix.)
 //!
 //! The model runs off-thread (see `app::start_organize` / `start_auto_tag`); the
 //! wizard shows a spinner (`busy`) until the app feeds results back via
@@ -30,9 +31,9 @@ pub enum WizardOutcome {
     Close,
     /// Run a LaTeX cite-scan over these files (the app has the vault; it fills
     /// the wizard's matched/unmatched lists and advances to the review step).
-    ScanImport { files: Vec<std::path::PathBuf> },
+    ScanTex { files: Vec<std::path::PathBuf> },
     /// Tag these matched cite keys with `tag` (`pp:<project>`).
-    ApplyImport { tag: String, keys: Vec<String> },
+    ApplyTexTag { tag: String, keys: Vec<String> },
     /// Ask the model to tidy the vocabulary (off-thread); results come back via
     /// [`Wizard::set_organize`].
     RunOrganize { instructions: String },
@@ -61,8 +62,8 @@ enum Nav {
     ApplyOrganize,
     RunAutotag,
     ApplyAutotag,
-    ScanImport,
-    ApplyImport,
+    ScanTex,
+    ApplyTexTag,
 }
 
 /// The pinned footer the current step wants: a left (Back/Cancel) button and a
@@ -148,7 +149,7 @@ impl Wizard {
         }
     }
 
-    /// Called by the app after a `ScanImport`: record the tex-scan result and
+    /// Called by the app after a `ScanTex`: record the tex-scan result and
     /// advance to the review step.
     pub fn set_scan(&mut self, matched: Vec<String>, missing: Vec<String>) {
         self.imp_matched = matched.into_iter().map(|k| (k, true)).collect();
@@ -259,7 +260,7 @@ fn wizard_inner(
             "Apply your existing tags across the whole library.",
             ["Setup", "Review", "Done"],
         ),
-        WizardKind::Import => (
+        WizardKind::TexTag => (
             Glyph::Doc,
             "Tag from a LaTeX project",
             "Tag every entry cited by a LaTeX manuscript.",
@@ -353,7 +354,7 @@ fn wizard_inner(
                         footer = match wiz.kind {
                             WizardKind::Organize => organize_body(ui, theme, wiz),
                             WizardKind::Autotag => autotag_body(ui, theme, wiz, entries),
-                            WizardKind::Import => import_body(ui, theme, wiz),
+                            WizardKind::TexTag => textag_body(ui, theme, wiz),
                         };
                     }
                 });
@@ -408,10 +409,10 @@ fn wizard_inner(
             wiz.step = 2;
             WizardOutcome::ApplyAutotag { assignments }
         }
-        Some(Nav::ScanImport) => WizardOutcome::ScanImport {
+        Some(Nav::ScanTex) => WizardOutcome::ScanTex {
             files: wiz.imp_files.clone(),
         },
-        Some(Nav::ApplyImport) => {
+        Some(Nav::ApplyTexTag) => {
             let keys: Vec<String> = wiz
                 .imp_matched
                 .iter()
@@ -420,7 +421,7 @@ fn wizard_inner(
                 .collect();
             let tag = wiz.proj_tag();
             wiz.step = 2;
-            WizardOutcome::ApplyImport { tag, keys }
+            WizardOutcome::ApplyTexTag { tag, keys }
         }
     }
 }
@@ -485,7 +486,7 @@ fn wz_scan(ui: &mut egui::Ui, theme: &Theme, kind: WizardKind) {
         let label = match kind {
             WizardKind::Organize => "Analyzing your tag vocabulary…",
             WizardKind::Autotag => "Reading papers…",
-            WizardKind::Import => "Reading the LaTeX project…",
+            WizardKind::TexTag => "Reading the LaTeX project…",
         };
         ui.label(RichText::new(label).size(15.0).strong().color(theme.text));
         ui.add_space(4.0);
@@ -1121,7 +1122,7 @@ fn autotag_body(
 
 // -------------------------------------------------------------- import (real)
 
-fn import_body(ui: &mut egui::Ui, theme: &Theme, wiz: &mut Wizard) -> Footer {
+fn textag_body(ui: &mut egui::Ui, theme: &Theme, wiz: &mut Wizard) -> Footer {
     let proj_ok = !wiz.imp_proj.trim().is_empty();
     let tag = wiz.proj_tag();
     match wiz.step {
@@ -1256,7 +1257,7 @@ fn import_body(ui: &mut egui::Ui, theme: &Theme, wiz: &mut Wizard) -> Footer {
                 primary: "Scan citations".into(),
                 enabled: picked && proj_ok,
                 on_back: Nav::Close,
-                on_primary: Nav::ScanImport,
+                on_primary: Nav::ScanTex,
             }
         }
         1 => {
@@ -1355,7 +1356,7 @@ fn import_body(ui: &mut egui::Ui, theme: &Theme, wiz: &mut Wizard) -> Footer {
                 primary: format!("Tag {keep} entries"),
                 enabled: keep > 0,
                 on_back: Nav::Step(0),
-                on_primary: Nav::ApplyImport,
+                on_primary: Nav::ApplyTexTag,
             }
         }
         _ => {

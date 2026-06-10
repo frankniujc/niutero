@@ -43,6 +43,7 @@ pub fn set_tags(
         .unwrap_or_default();
     prune_meta(v, citekey);
     save_sidecar(v)?;
+    log::debug!("set tags on {citekey}");
     Ok(result)
 }
 
@@ -80,6 +81,10 @@ pub fn set_tags_bulk(
     }
     if changed > 0 {
         save_sidecar(v)?;
+        log::info!(
+            "bulk tag: {changed} entr(ies) changed, {} unknown key(s)",
+            unknown.len()
+        );
     }
     Ok((changed, unknown))
 }
@@ -126,6 +131,7 @@ pub fn rename_tag(v: &mut Vault, from: &str, to: &str) -> Result<usize, String> 
         }
     }
     save_sidecar(v)?;
+    log::info!("renamed tag '{from}' -> '{to}' on {} entr(ies)", keys.len());
     Ok(keys.len())
 }
 
@@ -146,6 +152,7 @@ pub fn delete_tag(v: &mut Vault, name: &str) -> Result<usize, String> {
         prune_meta(v, k);
     }
     save_sidecar(v)?;
+    log::info!("deleted tag '{name}' from {} entr(ies)", keys.len());
     Ok(keys.len())
 }
 
@@ -164,6 +171,8 @@ pub fn set_note(v: &mut Vault, citekey: &str, note: Option<String>) -> Result<()
     entry_exists(v, citekey)?;
     v.meta.entry(citekey.to_string()).or_default().note = note.unwrap_or_default();
     prune_meta(v, citekey);
+    // Citekey only — NEVER the note text.
+    log::debug!("set note on {citekey}");
     save_sidecar(v)
 }
 
@@ -175,6 +184,7 @@ pub fn set_status(v: &mut Vault, citekey: &str, status: Status) -> Result<(), St
     let stored = (status != Status::Unread).then_some(status);
     v.meta.entry(citekey.to_string()).or_default().status = stored;
     prune_meta(v, citekey);
+    log::debug!("set status on {citekey}");
     save_sidecar(v)
 }
 
@@ -190,5 +200,6 @@ pub fn set_stars(v: &mut Vault, citekey: &str, stars: Option<u8>) -> Result<(), 
     };
     v.meta.entry(citekey.to_string()).or_default().stars = stored;
     prune_meta(v, citekey);
+    log::debug!("set stars on {citekey}");
     save_sidecar(v)
 }

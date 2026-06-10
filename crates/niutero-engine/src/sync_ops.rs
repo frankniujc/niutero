@@ -44,7 +44,12 @@ fn ensure_repo_hygiene(v: &Vault) -> Result<(), String> {
     }
     // gitattributes is the real guarantee; autocrlf is belt-and-suspenders, so
     // don't fail the whole operation if this one config write hiccups.
-    let _ = git::set_config(&v.root, "core.autocrlf", "false");
+    if let Err(e) = git::set_config(&v.root, "core.autocrlf", "false") {
+        log::warn!(
+            "could not set core.autocrlf=false ({e}) — autocrlf left on can churn \
+             references.bib line endings on Windows (the byte-stability invariant)"
+        );
+    }
     Ok(())
 }
 
@@ -52,7 +57,8 @@ fn ensure_repo_hygiene(v: &Vault) -> Result<(), String> {
 /// platform, so the source of truth never churns on a Windows checkout.
 const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
 
-/// Commit local changes, pull, then push. Requires a git repo with an `origin`
+/// **Online (git).** Commit local changes, pull, then push. Requires a git repo
+/// with an `origin`
 /// remote (set up via [`connect`]). On a pull conflict it attempts a structured
 /// entry-level 3-way merge of `references.bib`; if that resolves cleanly the
 /// merge is committed and the sync proceeds, otherwise the merge is aborted and
@@ -60,34 +66,49 @@ const GITATTRIBUTES: &str = "* text=auto eol=lf\n";
 pub fn sync(v: &Vault, message: Option<String>) -> Result<SyncStatus, String> {
     let _lock = lock_vault(v)?;
     if !git::is_repo(&v.root) {
-        return Err("not a git repository — run `niutero-cli connect <url>` first".into());
+        return Err("not a git repository — run `niutero-cli connect <vault> <url>` first".into());
     }
     if git::remote_url(&v.root, "origin").is_none() {
-        return Err("no 'origin' remote — run `niutero-cli connect <url>` first".into());
+        return Err("no 'origin' remote — run `niutero-cli connect <vault> <url>` first".into());
     }
     ensure_repo_hygiene(v)?;
     // Machine-local sync strategy (#48): pull/push are per-machine toggles.
     let prefs = sync_prefs(v)?;
     let message = message.unwrap_or_else(|| auto_commit_message(v));
     let committed = git::commit_all(&v.root, &message)?;
+    if committed {
+        // The message is our own generated text — fine to log.
+        log::info!("sync: committed local changes — {message}");
+    }
     let mut merged = false;
     if prefs.pull && git::has_upstream(&v.root) && git::pull(&v.root)? == git::PullOutcome::Conflict
     {
         // A merge is now in progress; resolve it or leave a clean tree.
         match try_resolve_merge(v) {
-            Ok(true) => merged = true,
+            Ok(true) => {
+                merged = true;
+                log::info!("sync: auto-resolved a pull conflict in references.bib");
+            }
             Ok(false) => {
                 git::abort_merge(&v.root)?;
                 return Ok(SyncStatus::Conflict);
             }
             Err(e) => {
-                let _ = git::abort_merge(&v.root); // best effort; surface the real error
+                // best effort; surface the real error
+                if let Err(abort) = git::abort_merge(&v.root) {
+                    log::warn!(
+                        "could not abort the in-progress merge ({abort}) — the repo may \
+                         need a manual `git merge --abort`"
+                    );
+                }
                 return Err(e);
             }
         }
     }
     if prefs.push {
         git::push(&v.root)?;
+        // Remote NAME only — the URL can embed credentials.
+        log::info!("sync: pushed to origin");
     }
     Ok(SyncStatus::Synced { committed, merged })
 }
@@ -184,6 +205,7 @@ pub fn auto_commit_if_enabled(v: &Vault) -> Result<Option<String>, String> {
     ensure_repo_hygiene(v)?;
     let msg = auto_commit_message(v);
     if git::commit_all(&v.root, &msg)? {
+        log::info!("auto-commit: {msg}");
         Ok(Some(msg))
     } else {
         Ok(None)
@@ -265,10 +287,11 @@ pub struct HistoryCommit {
 /// isn't in HEAD (added-but-not-synced vs. no such entry at all).
 pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
     if !git::is_repo(&v.root) {
-        return Err("not a git repository — run `niutero-cli connect <url>` first".into());
+        return Err("not a git repository — run `niutero-cli connect <vault> <url>` first".into());
     }
     let head = git::file_at_head(&v.root, "references.bib").ok_or_else(|| {
-        "references.bib has no committed history yet — run `niutero-cli sync` first".to_string()
+        "references.bib has no committed history yet — run `niutero-cli sync <vault>` first"
+            .to_string()
     })?;
     let (start, end) = match entry_line_span(&head, citekey) {
         Some(span) => span,
@@ -277,7 +300,7 @@ pub fn history(v: &Vault, citekey: &str) -> Result<Vec<HistoryCommit>, String> {
         None => {
             let exists = entries(&read_items(v)?).any(|e| e.citekey == citekey);
             return Err(if exists {
-                format!("'{citekey}' isn't in the last commit yet — run `niutero-cli sync` first")
+                format!("'{citekey}' isn't in the last commit yet — run `niutero-cli sync <vault>` first")
             } else {
                 format!("no entry with cite key '{citekey}'")
             });

@@ -17,9 +17,9 @@ durable rules and architecture; `plan.md` carries the milestone detail.
    source. This is an explicit user instruction; honor it strictly.
 2. **The CLI is the complete interface.** Every capability is a `niutero-cli`
    subcommand, with `--json` output and tests, *before* anything else consumes it.
-   There is no GUI yet — it is Phase 2 and will be a thin client over this same
-   surface, able to do nothing the CLI cannot. If a future feature will need an
-   operation, add the CLI command first.
+   The GUI (`niutero-gui`, Phase 2 — now built, egui) is a thin client over this
+   same surface, able to do nothing the CLI cannot. New features still land
+   engine → CLI → GUI, in that order.
 3. **`.bib` is the source of truth and stays niutero-agnostic.** Private data (tags,
    notes, saved views) lives in the hidden `.niutero/` sidecar, **never** in
    `references.bib`. A collaborator who doesn't use niutero must get a clean `.bib`.
@@ -31,20 +31,24 @@ durable rules and architecture; `plan.md` carries the milestone detail.
 
 ## Architecture
 
-A Cargo workspace that keeps domain logic out of any UI. Planned crates (built in
+A Cargo workspace that keeps domain logic out of any UI. Crates (built in
 milestone order — see `plan.md`):
 
 ```
 niutero-core    domain model (BibEntry + validate(), Library, filter) — no IO/UI
 niutero-bib     tolerant .bib parser + deterministic serializer   <- the foundation
 niutero-vault   vault IO: .niutero/ sidecar, atomic writes (temp + rename)
+niutero-sync    git sync by shelling out to system git
+niutero-norm    offline, propose-only normalization
+niutero-online  curl shell-out: DOI / Anthropic / HuggingFace
 niutero-engine  operations layer: init/open/list/show/add/edit/rm + owned EntryView DTO
-niutero-cli     thin arg-parse + output shell over niutero-engine
+niutero-cli     thin arg-parse + output shell over niutero-engine (binary: niutero-cli)
+niutero-gui     egui thin client over niutero-engine (binary: niutero)
 ```
 
 `niutero-engine` is the reusable surface that makes "CLI is the complete interface"
 real: every capability is an engine function over an open `Vault`, the CLI only
-parses args and formats output, and the Phase-2 GUI will call the engine directly
+parses args and formats output, and the Phase-2 GUI calls the engine directly
 (not shell out). Add new capabilities to the engine first, then expose a thin CLI
 command. Entries from untrusted input must pass `BibEntry::validate()` before being
 written (the serializer assumes valid, brace-balanced values).
@@ -61,9 +65,11 @@ path: the core must work fully offline with all of them disabled.
 
 ## Commands
 
-The workspace is scaffolded in M1; these are the standing conventions once crates
-exist. All `niutero-cli` subcommands take the vault folder as the first positional
-arg and support `--json`; exit codes are `0` ok / `1` error / `2` actionable (CI gate).
+All `niutero-cli` subcommands take the vault folder as the first positional arg
+and support `--json` — except `connector` (a blocking server), `cite` (a single
+literal line), `init`/`connect`/`forget` (trivial confirmations), and `sync`
+(status goes to exit codes). Exit codes are `0` ok / `1` error / `2` actionable
+(CI gate).
 
 ```sh
 cargo build --workspace
@@ -71,7 +77,7 @@ cargo test  --workspace
 cargo test  -p niutero-bib                       # one crate
 cargo test  -p niutero-bib roundtrip::byte_stable # one test (name filter)
 
-cargo run   -p niutero-cli -- <subcommand> <vault> [options]   # binary: niutero
+cargo run   -p niutero-cli -- <subcommand> <vault> [options]   # binary: niutero-cli (the GUI binary is niutero)
 
 cargo fmt    --all --check
 cargo clippy --workspace --all-targets -- -D warnings

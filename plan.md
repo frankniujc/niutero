@@ -47,7 +47,8 @@ assist, PDF attachments, browser connector.
 ## Architecture
 
 Fresh workspace in `niutero_2/`, written entirely from scratch — nothing is ported
-from `../niutero`. A Cargo workspace that keeps logic out of the UI:
+from `../niutero`. A Cargo workspace that keeps logic out of the UI — the original
+M1 sketch (the workspace has since grown to 9 crates; see `CLAUDE.md`):
 
 ```
 niutero-core    domain model (BibEntry, Library, config/meta/view types, filter) — no IO/UI
@@ -56,9 +57,10 @@ niutero-vault   vault IO: .niutero/ sidecar + machine-local registry
 niutero-cli     the complete interface — a thin wrapper over the above
 ```
 
-No GUI crate yet (that is Phase 2). The optional-feature crates
-(sync / norm / fetch / import / pdf / llm / server) are added one at a time as later
-milestones — also written fresh.
+Phase 2's `niutero-gui` (egui) now exists as a thin client over `niutero-engine`.
+The optional-feature crates (`niutero-sync` / `niutero-norm` / `niutero-online`,
+covering fetch / import / pdf / llm / server) landed as later milestones — also
+written fresh.
 
 ## CLI surface (base)
 

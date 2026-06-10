@@ -53,27 +53,30 @@ pub fn update_ai_config(f: impl FnOnce(&mut AiConfig)) -> Result<AiConfig, Strin
 pub(crate) fn resolve_ai() -> Result<(String, String), String> {
     let cfg = ai_config()?;
     if !cfg.enabled {
-        return Err("LLM assist is off — run `niutero ai config --enable true` \
+        return Err(
+            "LLM assist is off — run `niutero-cli ai config --enable true` \
                     or enable it in Settings → AI assistant"
-            .into());
+                .into(),
+        );
     }
     let provider = cfg.provider.trim();
     if !provider.is_empty() && !provider.eq_ignore_ascii_case("anthropic") {
         return Err(format!(
             "the AI provider \"{provider}\" isn't wired yet (only Anthropic is) — run \
-             `niutero ai config --provider anthropic` or change it in Settings → AI assistant"
+             `niutero-cli ai config --provider anthropic` or change it in Settings → AI assistant"
         ));
     }
     if !cfg.base_url.trim().is_empty() {
         return Err("a custom AI base URL isn't honored yet — clear it with \
-                    `niutero ai config --base-url \"\"` so requests can't be misrouted"
+                    `niutero-cli ai config --base-url \"\"` so requests can't be misrouted"
             .into());
     }
-    let key = if !cfg.api_key.trim().is_empty() {
+    let key_from_registry = !cfg.api_key.trim().is_empty();
+    let key = if key_from_registry {
         cfg.api_key.trim().to_string()
     } else {
         std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-            "no API key — run `niutero ai config --key …` \
+            "no API key — run `niutero-cli ai config --key …` \
              or add one in Settings → AI assistant"
                 .to_string()
         })?
@@ -83,6 +86,15 @@ pub(crate) fn resolve_ai() -> Result<(String, String), String> {
     } else {
         cfg.model
     };
+    // The SOURCE label only — never log the key (or its prefix or length).
+    log::debug!(
+        "ai: model={model}, key from {}",
+        if key_from_registry {
+            "registry config"
+        } else {
+            "$ANTHROPIC_API_KEY"
+        }
+    );
     Ok((key, model))
 }
 
@@ -109,7 +121,13 @@ pub fn ai_test() -> Result<String, String> {
 pub fn suggest_tags(v: &Vault, citekey: &str) -> Result<Vec<String>, String> {
     let view = show(v, citekey)?; // errors if the entry is absent
     let (key, model) = resolve_ai()?;
-    let (system, user) = tag_prompt(&view, &tag_vocabulary(v));
+    let vocab = tag_vocabulary(v);
+    // Bounded sizes only — never the prompt or response text.
+    log::debug!(
+        "ai suggest-tags: {citekey}, vocabulary {} tag(s)",
+        vocab.len()
+    );
+    let (system, user) = tag_prompt(&view, &vocab);
     let text = niutero_online::anthropic_text_with(&key, &model, 256, &system, &user)?;
     Ok(parse_tag_list(&text))
 }
@@ -126,6 +144,8 @@ pub fn ask(v: &Vault, question: &str) -> Result<String, String> {
     let (key, model) = resolve_ai()?;
     let items = read_items(v)?;
     let context = grounding_context(v, &items);
+    // Bounded sizes only — never the question, prompt, or response text.
+    log::debug!("ai ask: grounding context {}B", context.len());
     let system = "You are a research-librarian assistant for a personal citation library. Answer \
         ONLY from the entries provided — if the library doesn't cover it, say so. Be concise. When \
         you refer to a paper, cite its cite key in square brackets, e.g. [vaswani2017attention]."
@@ -203,6 +223,8 @@ pub fn organize_tags(v: &Vault, instructions: &str) -> Result<OrganizePlan, Stri
             new_tags: Vec::new(),
         });
     }
+    // Bounded sizes only — never the prompt or response text.
+    log::debug!("ai organize: vocabulary {} tag(s)", vocab.len());
     let listing = vocab
         .iter()
         .map(|(t, n)| format!("{t} ({n})"))
@@ -267,7 +289,7 @@ pub struct MergeApplied {
 /// hold. Captures per-merge errors and continues. `references.bib` is never
 /// touched. (The GUI Organize wizard and `ai organize --apply` both run this.)
 pub fn apply_tag_merges(v: &mut Vault, merges: &[TagMerge]) -> Vec<MergeApplied> {
-    merges
+    let results: Vec<MergeApplied> = merges
         .iter()
         .map(|m| match rename_tag(v, &m.from, &m.into) {
             Ok(changed) => MergeApplied {
@@ -283,7 +305,10 @@ pub fn apply_tag_merges(v: &mut Vault, merges: &[TagMerge]) -> Vec<MergeApplied>
                 error: Some(e),
             },
         })
-        .collect()
+        .collect();
+    let applied = results.iter().filter(|r| r.error.is_none()).count();
+    log::info!("tag merges: {applied}/{} applied", results.len());
+    results
 }
 
 /// Every distinct tag in use across the library, sorted.

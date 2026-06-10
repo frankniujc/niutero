@@ -54,6 +54,8 @@ pub fn serve_connector(v: &Vault, port: u16, token: &str) -> Result<(), String> 
     }
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
+    // Port only — NEVER the token.
+    log::info!("connector listening on 127.0.0.1:{port}");
     serve_loop(v, &listener, token, false)
 }
 
@@ -62,8 +64,11 @@ fn serve_loop(v: &Vault, listener: &TcpListener, token: &str, once: bool) -> Res
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
-                // One bad client connection shouldn't kill the server.
-                let _ = handle_connection(v, &mut s, token);
+                // One bad client connection shouldn't kill the server. Debug,
+                // not warn: client-caused, and port scanners would spam warns.
+                if let Err(e) = handle_connection(v, &mut s, token) {
+                    log::debug!("connector: connection error: {e}");
+                }
             }
             Err(e) => return Err(format!("accept: {e}")),
         }
@@ -87,7 +92,8 @@ fn handle_connection(v: &Vault, stream: &mut TcpStream, token: &str) -> io::Resu
         Err(ReadError::TooLarge) => {
             http_response("413 Payload Too Large", &json_error("body too large"))
         }
-        Err(ReadError::Io(_)) => {
+        Err(ReadError::Io(e)) => {
+            log::debug!("connector: malformed request: {e}");
             http_response("400 Bad Request", "{\"error\":\"malformed request\"}")
         }
     };
@@ -96,36 +102,48 @@ fn handle_connection(v: &Vault, stream: &mut TcpStream, token: &str) -> io::Resu
 
 /// Dispatch a parsed request to a (status line, JSON body).
 fn route(v: &Vault, req: &Request, token: &str) -> (&'static str, String) {
-    match (req.method.as_str(), req.path.as_str()) {
+    let mut capture_note = String::new();
+    let (status, body) = match (req.method.as_str(), req.path.as_str()) {
         ("OPTIONS", _) => ("204 No Content", String::new()),
         ("POST", "/capture") => {
             if !token_matches(req.auth.as_deref(), token) {
-                return (
+                (
                     "401 Unauthorized",
                     json_error("missing or wrong connector token"),
-                );
-            }
-            match crate::capture(v, &req.body) {
-                Ok(r) => {
-                    // A capture mutates references.bib, but it happens inside this
-                    // server loop — never on the CLI's run()-level path — so the
-                    // keep-updated export (#45) won't fire there. Trigger it here,
-                    // best-effort: a stale mirror shouldn't fail the capture. Notes
-                    // go to stderr (the HTTP body is the capture's machine output).
-                    if r.added > 0 {
-                        refresh_after_capture(v);
+                )
+            } else {
+                match crate::capture(v, &req.body) {
+                    Ok(r) => {
+                        // A capture mutates references.bib, but it happens inside this
+                        // server loop — never on the CLI's run()-level path — so the
+                        // post-mutation work (keep-updated exports, the opt-in
+                        // workflow hooks) must run here. All best-effort: a stale
+                        // mirror or failed hook must not fail the capture (the HTTP
+                        // body is the capture's machine output).
+                        if r.added > 0 {
+                            refresh_after_capture(v);
+                            run_capture_hooks(v, &r);
+                        }
+                        capture_note = format!(" (added {}, skipped {})", r.added, r.skipped);
+                        (
+                            "200 OK",
+                            format!("{{\"added\":{},\"skipped\":{}}}", r.added, r.skipped),
+                        )
                     }
-                    (
-                        "200 OK",
-                        format!("{{\"added\":{},\"skipped\":{}}}", r.added, r.skipped),
-                    )
+                    Err(e) => ("400 Bad Request", json_error(&e)),
                 }
-                Err(e) => ("400 Bad Request", json_error(&e)),
             }
         }
         ("GET", "/" | "/health") => ("200 OK", "{\"service\":\"niutero-connector\"}".into()),
         _ => ("404 Not Found", json_error("unknown endpoint")),
-    }
+    };
+    // NEVER log req.auth (the presented token) or req.body (user content).
+    log::debug!(
+        "connector: {} {} -> {status}{capture_note}",
+        req.method,
+        req.path
+    );
+    (status, body)
 }
 
 /// Constant-time-ish token comparison (no early exit on the first wrong
@@ -146,23 +164,46 @@ fn token_matches(got: Option<&str>, want: &str) -> bool {
     }
 }
 
-/// Re-export keep-updated targets after a capture (best-effort; stderr only).
+/// The same opt-in post-import hooks every other import path runs (CLI
+/// `import`, GUI imports): PDF auto-fetch, enrich-on-import, then the
+/// auto-commit — each a no-op without its pref, all best-effort.
+fn run_capture_hooks(v: &Vault, r: &crate::ImportReport) {
+    let keys = r.new_keys();
+    match crate::auto_fetch_pdfs(v, &keys) {
+        Ok((fetched, attempted)) if attempted > 0 => {
+            log::info!("capture: auto-fetched {fetched}/{attempted} PDF(s)");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("capture: PDF auto-fetch skipped: {e}"),
+    }
+    match crate::auto_enrich(v, &keys) {
+        Ok((filled, attempted)) if attempted > 0 => {
+            log::info!("capture: auto-enriched {filled}/{attempted} entr(ies)");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("capture: auto-enrich skipped: {e}"),
+    }
+    match crate::auto_commit_if_enabled(v) {
+        Ok(Some(msg)) => log::info!("capture: auto-committed: {msg}"),
+        Ok(None) => {}
+        Err(e) => log::warn!("capture: auto-commit failed: {e}"),
+    }
+}
+
+/// Re-export keep-updated targets after a capture (best-effort; logged only).
 fn refresh_after_capture(v: &Vault) {
     match crate::refresh_exports(v) {
         Ok(outcomes) => {
             for o in outcomes {
                 match o.error {
-                    None => eprintln!("  ↻ {} entr(ies) → {}", o.count, o.out.display()),
+                    None => log::info!("keep-updated: {} entr(ies) → {}", o.count, o.out.display()),
                     Some(e) => {
-                        eprintln!(
-                            "warning: keep-updated export to {} failed: {e}",
-                            o.out.display()
-                        )
+                        log::warn!("keep-updated export to {} failed: {e}", o.out.display())
                     }
                 }
             }
         }
-        Err(e) => eprintln!("warning: keep-updated export skipped: {e}"),
+        Err(e) => log::warn!("keep-updated export skipped: {e}"),
     }
 }
 
@@ -198,8 +239,8 @@ enum ReadError {
     /// Declared `Content-Length` over [`MAX_BODY`] — refused before any
     /// allocation, so a hostile length can't OOM the process.
     TooLarge,
-    /// Carried for future logging; the response is a generic 400 either way.
-    Io(#[allow(dead_code)] io::Error),
+    /// Logged at debug in the 400 branch; the response is a generic 400 either way.
+    Io(io::Error),
 }
 
 impl From<io::Error> for ReadError {
