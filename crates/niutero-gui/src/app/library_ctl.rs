@@ -32,7 +32,6 @@ impl NiuteroApp {
         match self.lib_view {
             LibView::Classic => library::classic(ctx, theme, entries, &mut self.lib, &mut actions),
             LibView::Reader => library::reader(ctx, theme, entries, &mut self.lib, &mut actions),
-            LibView::Board => library::board(ctx, theme, entries, &mut self.lib, &mut actions),
         }
         for a in actions {
             match a {
@@ -40,6 +39,24 @@ impl NiuteroApp {
                 // handled here rather than in `apply_lib_action`.
                 LibAction::NewEntry(status) => self.dialog = Some(Dialog::new_entry(status)),
                 LibAction::AddByDoi => self.dialog = Some(Dialog::add_by_doi()),
+                LibAction::AttachPdf => self.attach_pdf_flow(ctx),
+                LibAction::FetchPdf => {
+                    if let Some(key) = self.lib.selected.clone() {
+                        self.start_pdf_fetch(key, ctx);
+                    }
+                }
+                LibAction::PullPdf => {
+                    if let Some(key) = self.lib.selected.clone() {
+                        if self.hf_ready() {
+                            self.start_pdf_pull(key, ctx);
+                        } else {
+                            self.set_toast(
+                                "Configure an HF repo + token in Settings → PDF attachments \
+                                 first",
+                            );
+                        }
+                    }
+                }
                 LibAction::Delete(key) => {
                     // Re-borrow `self.library` (not the `entries` binding) so the
                     // immutable borrow doesn't span the loop and clash with the
@@ -70,6 +87,8 @@ impl NiuteroApp {
         // state only after a real mutation (read-only actions like Cite/OpenUrl
         // would otherwise spawn git subprocesses on every click).
         let mut dirtied = false;
+        // Deferred past the `lib` borrow: starting the HF pull needs &mut self.
+        let mut pull_pdf = false;
         match action {
             LibAction::Edit(field, value) => {
                 let (set, unset): (Vec<String>, Vec<String>) = if value.trim().is_empty() {
@@ -131,7 +150,9 @@ impl NiuteroApp {
                     };
                     ctx.open_url(egui::OpenUrl::new_tab(url));
                 } else {
-                    self.toast = Some("No PDF attached to this entry".into());
+                    // Stale view or never-cached file — try an HF pull after
+                    // the `lib` borrow ends (the job needs `&mut self`).
+                    pull_pdf = true;
                 }
             }
             // Field-assign + gen bump (set_toast would re-borrow all of self
@@ -159,13 +180,29 @@ impl NiuteroApp {
                     self.toast_gen += 1;
                 }
             },
-            // Handled in `body_library` (they open a dialog, need no selection).
-            LibAction::NewEntry(_) | LibAction::AddByDoi | LibAction::Delete(_) => {}
+            // Handled in `body_library` (they open a dialog / spawn a job and
+            // must not run inside this `lib` borrow).
+            LibAction::NewEntry(_)
+            | LibAction::AddByDoi
+            | LibAction::Delete(_)
+            | LibAction::AttachPdf
+            | LibAction::FetchPdf
+            | LibAction::PullPdf => {}
         }
         // Only a real .bib mutation dirties the git work tree; refresh the cached
         // status then (not on read-only Cite/BibTeX/Open actions).
         if dirtied {
             self.git = engine::git_status(&lib.vault.root);
+        }
+        if pull_pdf {
+            if self.hf_ready() {
+                self.start_pdf_pull(key, ctx);
+            } else {
+                self.set_toast(
+                    "No local PDF — configure an HF repo + token in Settings → PDF attachments \
+                     to pull it",
+                );
+            }
         }
     }
 
@@ -414,6 +451,36 @@ impl NiuteroApp {
         }
     }
 
+    /// Pick a local PDF (rfd) and attach it to the selected entry; when an HF
+    /// repo + token are configured the file is pushed there off-thread too.
+    fn attach_pdf_flow(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.lib.selected.clone() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .set_title("Attach a PDF")
+            .pick_file()
+        else {
+            return; // picker cancelled
+        };
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        match engine::attach_pdf(&lib.vault, &key, &path) {
+            Ok(_) => {
+                lib.reload(); // has_pdf flips in the views
+                self.lib.refresh();
+                if self.hf_ready() {
+                    self.start_pdf_push(key, ctx); // toasts when done
+                } else {
+                    self.set_toast("PDF attached");
+                }
+            }
+            Err(e) => self.set_toast(format!("Attach failed: {e}")),
+        }
+    }
+
     /// Delete `key` from the library via `engine::rm`, then reload.
     fn delete_entry(&mut self, key: &str) {
         let Some(lib) = self.library.as_mut() else {
@@ -426,7 +493,6 @@ impl NiuteroApp {
                     self.lib.selected = None;
                 }
                 self.lib.refresh();
-                self.lib.drawer_open = false;
                 self.git = engine::git_status(&lib.vault.root);
                 self.norm_cache = None;
                 self.toast = Some("Deleted entry".into());

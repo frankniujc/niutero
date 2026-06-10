@@ -48,12 +48,14 @@ pub enum Tool {
     Settings,
 }
 
-/// The three Library layouts (spec §4), switched from the titlebar.
+/// The Library layouts (spec §4), switched from the titlebar. The Board view
+/// (§4·C kanban) is temporarily removed — restore `library/board.rs` from git
+/// history when it returns; the status/stars machinery it used stays live in
+/// Reader and the detail panels.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LibView {
     Classic,
     Reader,
-    Board,
 }
 
 /// The open library plus its loaded entries.
@@ -193,7 +195,6 @@ impl NiuteroApp {
         };
         let lib_view = match std::env::var("NIU_VIEW").as_deref() {
             Ok("reader") => LibView::Reader,
-            Ok("board") => LibView::Board,
             _ => LibView::Classic,
         };
         let task = std::env::var("NIU_TASK").ok().map(|_| {
@@ -692,7 +693,6 @@ impl NiuteroApp {
                     for (label, glyph, v) in [
                         ("Classic", Glyph::Rows, LibView::Classic),
                         ("Reader", Glyph::Book, LibView::Reader),
-                        ("Board", Glyph::Grid, LibView::Board),
                     ] {
                         let on = self.lib_view == v;
                         let w = label.len() as f32 * 7.0 + 30.0;

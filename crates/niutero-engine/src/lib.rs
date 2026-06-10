@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 mod ai;
 mod connector;
+mod pdf_ops;
 mod sync_ops;
 mod tags;
 
@@ -18,6 +19,10 @@ pub use ai::{
     update_ai_config, MergeApplied, OrganizePlan, TagMerge, TagSuggestion, DEFAULT_MODEL,
 };
 pub use connector::{connector_token, serve_connector};
+pub use pdf_ops::{
+    auto_fetch_pdfs, create_pdf_repo, fetchable_pdf_url, hf_token_set, pdf_prefs, pdf_pull,
+    pdf_push, set_hf_token, update_pdf_prefs,
+};
 pub use sync_ops::{connect, history, sync, HistoryCommit, SyncStatus};
 pub use tags::{
     current_note, current_tags, delete_tag, list_tags, rename_tag, set_note, set_stars, set_status,
@@ -66,6 +71,10 @@ pub struct EntryView {
     /// Star rating 1–5, or `None` if unrated.
     pub stars: Option<u8>,
     pub added: Option<String>,
+    /// Whether `<vault>/pdfs/<key>.pdf` exists on disk — a real check, not a
+    /// url-presence proxy (`default` so older JSON still deserializes).
+    #[serde(default)]
+    pub has_pdf: bool,
 }
 
 /// Which entries [`list`] returns.
@@ -268,6 +277,21 @@ pub struct ImportReport {
     pub overwritten: usize,
     /// `(original, new)` for each renamed entry.
     pub renamed: Vec<(String, String)>,
+    /// Cite keys of the plainly-added entries (the renamed ones' new keys are
+    /// in `renamed`) — what post-import hooks like PDF auto-fetch operate on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub added_keys: Vec<String>,
+}
+
+impl ImportReport {
+    /// Every cite key this import created (added + renamed-to).
+    pub fn new_keys(&self) -> Vec<String> {
+        self.added_keys
+            .iter()
+            .cloned()
+            .chain(self.renamed.iter().map(|(_, n)| n.clone()))
+            .collect()
+    }
 }
 
 /// Merge the entries of an external `.bib` file into the library under
@@ -331,6 +355,7 @@ fn merge_incoming(
         } else {
             entry.validate()?;
             keys.insert(entry.citekey.clone());
+            report.added_keys.push(entry.citekey.clone());
             items.push(BibItem::Entry(entry));
             report.added += 1;
         }
@@ -455,7 +480,7 @@ pub fn fetch_pdf(v: &Vault, citekey: &str) -> Result<PathBuf, String> {
 }
 
 /// Create `pdfs/`, ensure it's git-ignored, and return the entry's PDF path.
-fn prepare_pdf_dir(v: &Vault, citekey: &str) -> Result<PathBuf, String> {
+pub(crate) fn prepare_pdf_dir(v: &Vault, citekey: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(v.root.join("pdfs")).map_err(|e| format!("create pdfs/: {e}"))?;
     ensure_pdfs_gitignored(v)?;
     Ok(pdf_path(v, citekey))
@@ -464,7 +489,7 @@ fn prepare_pdf_dir(v: &Vault, citekey: &str) -> Result<PathBuf, String> {
 /// A filesystem-safe stem for a cite key (cite keys may contain `:` or `/`,
 /// which are unsafe in file names): keep `[A-Za-z0-9._-]`, replace the rest with
 /// `_`, and never let it be empty or a `.`/`..` traversal.
-fn pdf_stem(citekey: &str) -> String {
+pub(crate) fn pdf_stem(citekey: &str) -> String {
     let stem: String = citekey
         .chars()
         .map(|c| {
@@ -1471,6 +1496,7 @@ fn view_of(entry: &BibEntry, v: &Vault) -> EntryView {
             .to_string(),
         stars: meta.and_then(|m| m.stars),
         added: meta.and_then(|m| m.added.clone()),
+        has_pdf: pdf_path(v, &entry.citekey).exists(),
     }
 }
 
@@ -3173,6 +3199,120 @@ mod tests {
         assert!(attach_pdf(&v, "ghost", &src)
             .unwrap_err()
             .contains("no entry with cite key 'ghost'"));
+    }
+
+    #[test]
+    fn pdf_prefs_roundtrip_and_coexist_with_other_registry_state() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            // Defaults: unset repo, auto-fetch off (base path stays offline).
+            let p = pdf_prefs(&v).unwrap();
+            assert!(p.repo.is_empty() && !p.auto_fetch);
+            assert!(!hf_token_set().unwrap());
+
+            // Locked RMW updates round-trip and preserve each other.
+            update_pdf_prefs(&v, |p| p.repo = "frank/papers".into()).unwrap();
+            update_pdf_prefs(&v, |p| p.auto_fetch = true).unwrap();
+            set_hf_token("  hf_secret  ").unwrap(); // stored trimmed
+            let p = pdf_prefs(&v).unwrap();
+            assert_eq!(p.repo, "frank/papers");
+            assert!(p.auto_fetch);
+            assert!(hf_token_set().unwrap());
+            // …and the AI config + vault records survive alongside.
+            set_ai_config(AiConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(pdf_prefs(&v).unwrap().repo, "frank/papers");
+            assert!(ai_config().unwrap().enabled);
+            // Clearing the token works.
+            set_hf_token("").unwrap();
+            assert!(!hf_token_set().unwrap());
+        });
+    }
+
+    #[test]
+    fn hf_ops_gate_offline_with_actionable_errors() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            add(&v, fields("misc", "k", &["title=T"])).unwrap();
+            // No token → both push and pull refuse before any network call.
+            let err = pdf_push(&v, "k").unwrap_err();
+            assert!(err.contains("no HuggingFace token"), "{err}");
+            // Token but no repo → the repo hint.
+            set_hf_token("hf_x").unwrap();
+            let err = pdf_pull(&v, "k").unwrap_err();
+            assert!(err.contains("no HF dataset repo"), "{err}");
+            // Token + repo but no local file → push explains, still offline.
+            update_pdf_prefs(&v, |p| p.repo = "u/r".into()).unwrap();
+            let err = pdf_push(&v, "k").unwrap_err();
+            assert!(err.contains("no local PDF"), "{err}");
+        });
+    }
+
+    #[test]
+    fn fetchable_pdf_url_only_accepts_direct_pdfs_and_arxiv_abs() {
+        // Direct PDFs pass through untouched (query strings allowed).
+        assert_eq!(
+            fetchable_pdf_url("https://aclanthology.org/N19-1423.pdf").as_deref(),
+            Some("https://aclanthology.org/N19-1423.pdf")
+        );
+        assert_eq!(
+            fetchable_pdf_url("https://x.org/a.PDF?dl=1").as_deref(),
+            Some("https://x.org/a.PDF?dl=1")
+        );
+        // arXiv abs pages map to their PDF.
+        assert_eq!(
+            fetchable_pdf_url("https://arxiv.org/abs/2406.01234").as_deref(),
+            Some("https://arxiv.org/pdf/2406.01234")
+        );
+        assert_eq!(
+            fetchable_pdf_url("http://arxiv.org/abs/1706.03762v5").as_deref(),
+            Some("https://arxiv.org/pdf/1706.03762v5")
+        );
+        // Publisher landing pages, non-http, and empties are refused.
+        for no in [
+            "https://dl.acm.org/doi/10.1145/3292500",
+            "https://arxiv.org/abs/",
+            "ftp://x/a.pdf",
+            "",
+            "  ",
+        ] {
+            assert_eq!(fetchable_pdf_url(no), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn auto_fetch_is_a_no_op_when_the_pref_is_off() {
+        with_registry(|| {
+            let (_d, v) = vault();
+            add(
+                &v,
+                fields("misc", "k", &["title=T", "url=https://x.org/a.pdf"]),
+            )
+            .unwrap();
+            // Pref off (the default): zero attempts, zero network.
+            assert_eq!(auto_fetch_pdfs(&v, &["k".into()]).unwrap(), (0, 0));
+        });
+    }
+
+    #[test]
+    fn entry_view_reports_a_real_pdf_not_a_url_proxy() {
+        let (_d, v) = vault();
+        add(
+            &v,
+            fields("misc", "k", &["title=T", "url=https://x.org/a.pdf"]),
+        )
+        .unwrap();
+        // A url alone is NOT a PDF.
+        assert!(!show(&v, "k").unwrap().has_pdf);
+        // An attached file is.
+        let src = _d.path().join("p.pdf");
+        std::fs::write(&src, b"%PDF-1.4").unwrap();
+        attach_pdf(&v, "k", &src).unwrap();
+        assert!(show(&v, "k").unwrap().has_pdf);
+        assert!(list(&v, Filter::All).unwrap()[0].has_pdf);
     }
 
     #[test]

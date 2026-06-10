@@ -29,7 +29,7 @@ use niutero_bib::{parse, to_bibtex, BibItem};
 use serde::{Deserialize, Serialize};
 
 pub mod registry;
-pub use registry::{AiConfig, ExportTarget, Registry, SyncPrefs, VaultRecord};
+pub use registry::{AiConfig, ExportTarget, PdfPrefs, Registry, SyncPrefs, VaultRecord};
 
 pub const SCHEMA_VERSION: u32 = 1;
 

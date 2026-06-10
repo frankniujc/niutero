@@ -122,6 +122,28 @@ niutero ai organize <vault> [--instructions S | --plan FILE] [--apply] [--json]
 `POST /capture` requires it (`Authorization: Bearer <t>` or `X-Niutero-Token`),
 wildcard CORS is gone, bodies are capped at 512 KB, sockets have timeouts.
 
+**PDF attachments** — binaries live in git-ignored `pdfs/`, never the `.bib`;
+sync goes to a private HuggingFace **dataset** repo:
+
+```
+niutero pdf <vault> <key> [--attach FILE | --fetch | --push | --pull]
+niutero pdf-config <vault> [--repo user/repo] [--auto-fetch BOOL]
+                           [--token S | --token-stdin] [--create-repo] [--json]
+```
+
+- `pdf-config`: repo + auto-fetch are saved **per vault**, the HF token **per
+  machine** — all in the registry, never the synced vault. The token is never
+  echoed (text and `--json` report only whether one is set); prefer
+  `--token-stdin` over `--token` on shared machines.
+- `--auto-fetch` (default **off**, so imports stay offline): after an import,
+  entries whose url is a direct `.pdf` or an arXiv abs page get their PDF
+  fetched best-effort (publisher landing pages are skipped); reported on
+  stderr, never failing the import. `show --json` exposes a real `has_pdf`
+  (an on-disk check, not a url proxy).
+- `--push`/`--pull` upload/download `pdfs/<key>.pdf` against the configured
+  repo; `--create-repo` creates it (private, idempotent). All HF calls refuse
+  with an actionable error until both a repo and a token are configured.
+
 **Everything else** that shipped beyond this plan, one line each (all take
 `<vault>` first and support `--json` where output exists): `history` (per-entry
 git log), `rekey` (key-pattern preview/`--write`), `status` / `stars` (reading

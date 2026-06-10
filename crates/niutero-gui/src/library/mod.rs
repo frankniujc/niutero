@@ -18,9 +18,10 @@ use niutero_engine::{EntryView, Status};
 use crate::icons::{self, Glyph};
 use crate::theme::{self, Theme};
 
-mod board;
+// The Board view (§4·C kanban) is temporarily removed — `board.rs` lives in
+// git history; its status/stars machinery stays live in Reader + the detail
+// panels.
 mod reader;
-pub use board::board;
 pub use reader::reader;
 
 /// Which Classic-list column the rows are sorted by (spec §4·A header).
@@ -71,10 +72,6 @@ pub struct LibState {
     pub hide_detail: bool,
     /// Reader: collapse the middle card list for a full-width read.
     pub hide_list: bool,
-    /// Board: whether the slide-in detail drawer is open for `selected`.
-    pub drawer_open: bool,
-    /// Board: `true` = kanban grid (default), `false` = a single-column list.
-    pub board_grid: bool,
     /// Classic: which column the list is sorted by, and the direction.
     pub sort: SortState,
     /// Cached Classic row order — indices into the loaded entries — plus a
@@ -122,8 +119,6 @@ impl Default for LibState {
             hide_tags: false,
             hide_detail: false,
             hide_list: false,
-            drawer_open: false,
-            board_grid: true,
             sort: SortState::default(),
             shown_cache: Vec::new(),
             shown_sig: None,
@@ -149,8 +144,15 @@ pub enum LibAction {
     AddTag(String),
     RemoveTag(String),
     OpenUrl(String),
-    /// Open the entry's attached PDF (`pdfs/<key>.pdf`) in the OS viewer.
+    /// Open the entry's attached PDF (`pdfs/<key>.pdf`) in the OS viewer —
+    /// pulling it from the HF dataset repo first when configured and absent.
     OpenPdf,
+    /// Pick a local PDF file and attach it (replaces any existing one).
+    AttachPdf,
+    /// Download the entry's PDF from its url (off-thread).
+    FetchPdf,
+    /// Download the entry's PDF from the configured HF dataset repo.
+    PullPdf,
     Cite,
     Bibtex,
     /// Open the "new entry" dialog; `Some(status)` pre-files it into a Board
@@ -186,6 +188,34 @@ pub(super) fn entry_context_menu(ui: &mut egui::Ui, e: &EntryView, actions: &mut
     }
     if has_pdf(e) && ui.button("Open PDF").clicked() {
         actions.push(LibAction::OpenPdf);
+        ui.close();
+    }
+    if ui
+        .button(if has_pdf(e) {
+            "Replace PDF…"
+        } else {
+            "Attach PDF…"
+        })
+        .clicked()
+    {
+        actions.push(LibAction::AttachPdf);
+        ui.close();
+    }
+    // Only offer a fetch when the url is actually fetchable (a direct .pdf or
+    // an arXiv abs page) — never invite downloading a publisher landing page.
+    if !has_pdf(e)
+        && e.fields
+            .get("url")
+            .is_some_and(|u| niutero_engine::fetchable_pdf_url(u).is_some())
+        && ui.button("Fetch PDF").clicked()
+    {
+        actions.push(LibAction::FetchPdf);
+        ui.close();
+    }
+    // Always offered without one: the app explains how to configure HF if it
+    // isn't yet (a collaborator's machine starts with no local PDFs at all).
+    if !has_pdf(e) && ui.button("Pull PDF from HF").clicked() {
+        actions.push(LibAction::PullPdf);
         ui.close();
     }
     ui.separator();
@@ -1645,9 +1675,10 @@ fn last_name(author: &str) -> String {
 }
 
 fn has_pdf(e: &EntryView) -> bool {
-    // The engine attaches PDFs under pdfs/<key>.pdf; here we use the presence of
-    // a url as a proxy in the mock (real PDF detection lands with the Reader wave).
-    e.fields.get("url").is_some_and(|u| !u.is_empty())
+    // Real detection: the engine stats `pdfs/<key>.pdf` when it builds the
+    // view (no more url-presence proxy — an indicator must not promise a PDF
+    // that isn't there).
+    e.has_pdf
 }
 
 pub(crate) fn type_label(t: &str) -> &'static str {

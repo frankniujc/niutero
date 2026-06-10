@@ -33,6 +33,11 @@ pub struct Registry {
     /// a synced vault — so an API key can't leak into git.
     #[serde(default, skip_serializing_if = "AiConfig::is_default")]
     pub ai: AiConfig,
+    /// HuggingFace access token for PDF sync (one per account, so it lives at
+    /// the registry root, not per-vault). Machine-local for the same reason as
+    /// the AI key: a secret must never ride the synced vault into git.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hf_token: String,
 }
 
 /// Machine-local LLM settings (Settings → AI assistant). The API key lives here
@@ -78,6 +83,32 @@ pub struct VaultRecord {
     /// This machine's sync strategy for the vault (#48).
     #[serde(default, skip_serializing_if = "SyncPrefs::is_default")]
     pub sync: SyncPrefs,
+    /// This machine's PDF-attachment prefs for the vault (HF repo + auto-fetch).
+    #[serde(default, skip_serializing_if = "PdfPrefs::is_default")]
+    pub pdf: PdfPrefs,
+}
+
+/// Machine-local PDF prefs for one vault: the HuggingFace **dataset** repo its
+/// `pdfs/` binaries push/pull to, and whether imports auto-fetch a likely PDF.
+/// Per-vault (different libraries use different repos); the account token is
+/// [`Registry::hf_token`]. `auto_fetch` defaults **off** — optional features
+/// must not put network calls on the base import path uninvited.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PdfPrefs {
+    /// HF dataset repo as `user/repo`; empty = HF sync not configured.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo: String,
+    /// After an import, fetch the new entries' PDFs when their url is a direct
+    /// `.pdf` or an arXiv abs page (publisher landing pages are skipped).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_fetch: bool,
+}
+
+impl PdfPrefs {
+    /// True when all-default, so the table is omitted from `vaults.toml`.
+    pub fn is_default(&self) -> bool {
+        *self == PdfPrefs::default()
+    }
 }
 
 /// A keep-updated export target (#45): an external `.bib` re-written whenever the

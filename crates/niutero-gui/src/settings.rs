@@ -88,11 +88,19 @@ pub struct SettingsState {
     /// Whether an AI text field has focus *this frame* (typing in progress —
     /// don't flush mid-keystroke).
     pub ai_field_focused: bool,
-    // PDF attachments (preview).
-    pub pdf_enabled: bool,
+    // PDF attachments (persisted: repo + auto-fetch per vault via
+    // engine::update_pdf_prefs, token per machine via engine::set_hf_token).
     pub pdf_repo: String,
-    pub pdf_token: String,
     pub pdf_auto: bool,
+    /// Token input buffer — drained into `set_hf_token` on flush; the stored
+    /// token itself is never read back into the UI.
+    pub pdf_token_buf: String,
+    /// Whether a machine token exists (display only).
+    pub pdf_token_set: bool,
+    /// (repo, auto_fetch) as last persisted — the dirty check.
+    pub pdf_saved: (String, bool),
+    /// A PDF text field has focus this frame — don't flush mid-keystroke.
+    pub pdf_field_focused: bool,
 }
 
 impl Default for SettingsState {
@@ -118,10 +126,12 @@ impl Default for SettingsState {
             ai_base: String::new(),
             ai_saved: AiConfig::default(),
             ai_field_focused: false,
-            pdf_enabled: true,
             pdf_repo: String::new(),
-            pdf_token: String::new(),
-            pdf_auto: true,
+            pdf_auto: false,
+            pdf_token_buf: String::new(),
+            pdf_token_set: false,
+            pdf_saved: (String::new(), false),
+            pdf_field_focused: false,
         }
     }
 }
@@ -135,6 +145,15 @@ pub enum SettingsAction {
     SetAi(AiConfig),
     /// Run a live connection test against the configured provider.
     TestAi,
+    /// Persist the open vault's PDF prefs (HF repo + auto-fetch).
+    SetPdfPrefs {
+        repo: String,
+        auto_fetch: bool,
+    },
+    /// Store (or clear, with an empty string) the machine-local HF token.
+    SetHfToken(String),
+    /// Create the vault's HF dataset repo (online, off-thread).
+    CreatePdfRepo,
     Toast(String),
 }
 
@@ -179,6 +198,26 @@ pub fn take_ai_dirty(st: &mut SettingsState) -> Option<AiConfig> {
 /// the dirty-flush doesn't immediately re-save what was just loaded.
 pub fn mark_ai_clean(st: &mut SettingsState) {
     st.ai_saved = current_ai(st);
+}
+
+/// The unsaved PDF prefs (repo, auto_fetch), if drifted from what was last
+/// persisted — and mark them saved. `None` while no vault is seeded or clean.
+pub fn take_pdf_dirty(st: &mut SettingsState) -> Option<(String, bool)> {
+    if !st.seeded {
+        return None; // prefs are per-vault; nothing to save without one
+    }
+    let cur = (st.pdf_repo.trim().to_string(), st.pdf_auto);
+    if cur != st.pdf_saved {
+        st.pdf_saved = cur.clone();
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+/// After seeding the PDF prefs, mark them clean.
+pub fn mark_pdf_clean(st: &mut SettingsState) {
+    st.pdf_saved = (st.pdf_repo.trim().to_string(), st.pdf_auto);
 }
 
 /// Render the Settings tool. `dark`/`accent_idx` reflect the live appearance
@@ -276,6 +315,23 @@ pub fn settings(
     if !st.ai_field_focused {
         if let Some(cfg) = take_ai_dirty(st) {
             actions.push(SettingsAction::SetAi(cfg));
+        }
+    }
+    // Same discipline for the PDF page: repo/auto-fetch drift flushes once no
+    // field has focus, and a typed token is drained into a save rather than
+    // silently dropped on navigation.
+    if st.view != SettingsView::Pdf {
+        st.pdf_field_focused = false;
+    }
+    if !st.pdf_field_focused {
+        if let Some((repo, auto_fetch)) = take_pdf_dirty(st) {
+            actions.push(SettingsAction::SetPdfPrefs { repo, auto_fetch });
+        }
+        let tok = st.pdf_token_buf.trim().to_string();
+        if !tok.is_empty() {
+            st.pdf_token_buf.clear();
+            st.pdf_token_set = true;
+            actions.push(SettingsAction::SetHfToken(tok));
         }
     }
 }
@@ -663,84 +719,104 @@ fn pdf_view(
     actions: &mut Vec<SettingsAction>,
 ) {
     section_title(ui, theme, "PDF attachments");
+    if !st.seeded {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Open a library to configure its PDF storage.")
+                .size(14.0)
+                .color(theme.muted),
+        );
+        return;
+    }
     lede(
         ui,
         theme,
         "Store each entry’s PDF in your own HuggingFace dataset repo. Repos are always created \
          private — you are responsible for any copyrighted content you upload.",
     );
+    let mut focused = false;
+    subhead(ui, theme, "Storage");
     row(
         ui,
         theme,
-        "Enable PDF attachments",
-        "Attach, cache and sync PDFs alongside the library.",
+        "HuggingFace dataset repo",
+        "As user/repo, saved for this library. Each PDF lands at pdfs/<citekey>.pdf on the \
+         remote and is cached under ${vault}/pdfs/ locally.",
         false,
         |ui| {
-            if widgets::toggle(ui, theme, st.pdf_enabled) {
-                st.pdf_enabled = !st.pdf_enabled;
+            let r = widgets::text_input(ui, theme, &mut st.pdf_repo, true);
+            focused |= r.has_focus();
+        },
+    );
+    row(
+        ui,
+        theme,
+        "HuggingFace token",
+        "Stored machine-local in vaults.toml — never in the library or git, and never shown \
+         again once saved. Saves when the field loses focus.",
+        false,
+        |ui| {
+            ui.horizontal(|ui| {
+                if st.pdf_token_set
+                    && widgets::button(ui, theme, None, "Clear", false, 30.0).clicked()
+                {
+                    st.pdf_token_set = false;
+                    st.pdf_token_buf.clear();
+                    actions.push(SettingsAction::SetHfToken(String::new()));
+                }
+                let hint = if st.pdf_token_set {
+                    "set — type to replace"
+                } else {
+                    "hf_…"
+                };
+                let r = widgets::password_input(ui, theme, &mut st.pdf_token_buf, hint);
+                focused |= r.has_focus();
+            });
+        },
+    );
+    subhead(ui, theme, "Auto-fetch");
+    row(
+        ui,
+        theme,
+        "Auto-fetch PDF on import",
+        "Off by default, so imports stay fully offline. When on, fetches an imported entry's \
+         url if it is a direct PDF or an arXiv abstract page — publisher landing pages are \
+         skipped.",
+        false,
+        |ui| {
+            if widgets::toggle(ui, theme, st.pdf_auto) {
+                st.pdf_auto = !st.pdf_auto;
             }
         },
     );
-    let enabled = st.pdf_enabled;
-    ui.add_enabled_ui(enabled, |ui| {
-        subhead(ui, theme, "Storage");
-        row(
-            ui,
-            theme,
-            "HuggingFace dataset repo",
-            "As user/repo. Each PDF lands at pdfs/<citekey>.pdf on the remote and is cached under \
-             ${vault}/pdfs/ locally.",
-            false,
-            |ui| {
-                widgets::text_input(ui, theme, &mut st.pdf_repo, true);
-            },
-        );
-        row(
-            ui,
-            theme,
-            "HuggingFace token",
-            "Coming soon. Nothing typed here would be stored yet, so the field stays locked \
-             until the engine can persist it — run `hf auth login` in the meantime.",
-            false,
-            |ui| {
-                // Locked, not just "preview": a password field that silently
-                // discards a real secret invites pasting one.
-                ui.add_enabled_ui(false, |ui| {
-                    widgets::password_input(ui, theme, &mut st.pdf_token, "coming soon");
-                });
-            },
-        );
-        subhead(ui, theme, "Auto-fetch");
-        row(
-            ui,
-            theme,
-            "Auto-fetch PDF on import",
-            "On import by DOI / connector / .bib, fetch the entry’s url if it points to a direct \
-             PDF or an arXiv abstract page. Publisher landing pages are skipped.",
-            false,
-            |ui| {
-                if widgets::toggle(ui, theme, st.pdf_auto) {
-                    st.pdf_auto = !st.pdf_auto;
+    subhead(ui, theme, "Maintenance");
+    row(
+        ui,
+        theme,
+        "Create dataset repo",
+        "Creates the repo as a private dataset. Safe to re-run if it already exists.",
+        true,
+        |ui| {
+            if widgets::button(ui, theme, Some(Glyph::Plus), "Create", false, 32.0).clicked() {
+                // Persist a just-typed repo first, so "type repo → Create"
+                // works in one click (actions apply in order).
+                if let Some((repo, auto_fetch)) = take_pdf_dirty(st) {
+                    actions.push(SettingsAction::SetPdfPrefs { repo, auto_fetch });
                 }
-            },
-        );
-        subhead(ui, theme, "Maintenance");
-        row(
-            ui,
-            theme,
-            "Create dataset repo",
-            "Creates the repo as a private dataset. Safe to re-run if it already exists.",
-            true,
-            |ui| {
-                if widgets::button(ui, theme, Some(Glyph::Plus), "Create", false, 32.0).clicked() {
-                    actions.push(SettingsAction::Toast(
-                        "Creating the dataset repo isn't wired yet".into(),
-                    ));
-                }
-            },
-        );
-    });
-    not_persisted_note(ui, theme);
+                actions.push(SettingsAction::CreatePdfRepo);
+            }
+        },
+    );
+    st.pdf_field_focused = focused;
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(
+            "Repo and auto-fetch are saved per library; the token is per machine. Nothing here \
+             is ever written into the library or git.",
+        )
+        .size(11.5)
+        .color(theme.faint),
+    );
 }
 
 /// The Integrations placeholder — a centered empty state (design's reset).

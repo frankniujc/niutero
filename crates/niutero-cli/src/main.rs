@@ -335,9 +335,10 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Manage an entry's attached PDF: show its path, --attach a file, or
-    /// --fetch it from the entry's url (online). Binaries live in `pdfs/`
-    /// (git-ignored), never in the .bib.
+    /// Manage an entry's attached PDF: show its path, --attach a file, --fetch
+    /// it from the entry's url, or --push/--pull it to/from the vault's HF
+    /// dataset repo (see `pdf-config`). Binaries live in `pdfs/` (git-ignored),
+    /// never in the .bib.
     Pdf {
         /// Vault folder.
         vault: PathBuf,
@@ -349,6 +350,39 @@ enum Cmd {
         /// Online: download the PDF from the entry's url.
         #[arg(long)]
         fetch: bool,
+        /// Online (HF): upload the local PDF to the dataset repo.
+        #[arg(long)]
+        push: bool,
+        /// Online (HF): download the PDF from the dataset repo.
+        #[arg(long)]
+        pull: bool,
+    },
+    /// Show or set this machine's PDF-attachment config for a vault: the HF
+    /// dataset repo its PDFs push/pull to, auto-fetch-on-import, and the HF
+    /// account token (all machine-local in vaults.toml — never synced).
+    PdfConfig {
+        /// Vault folder.
+        vault: PathBuf,
+        /// HF dataset repo as user/repo (an empty string clears it).
+        #[arg(long)]
+        repo: Option<String>,
+        /// After imports, auto-fetch PDFs whose url is a direct .pdf or an
+        /// arXiv abs page (off by default — keeps imports fully offline).
+        #[arg(long)]
+        auto_fetch: Option<bool>,
+        /// HF access token. Note: argv is visible in the process list and
+        /// shell history — prefer --token-stdin. An empty string clears it.
+        #[arg(long)]
+        token: Option<String>,
+        /// Read the HF token from stdin (first line) instead of argv.
+        #[arg(long, conflicts_with = "token")]
+        token_stdin: bool,
+        /// Online (HF): create the dataset repo (private; safe to re-run).
+        #[arg(long)]
+        create_repo: bool,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Online (LLM): suggest tags for an entry. Needs LLM assist enabled
     /// (`ai config --enable true`; key from the config or $ANTHROPIC_API_KEY).
@@ -803,7 +837,27 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             citekey,
             attach,
             fetch,
-        } => cmd_pdf(&vault, &citekey, attach, fetch).map(ok),
+            push,
+            pull,
+        } => cmd_pdf(&vault, &citekey, attach, fetch, push, pull).map(ok),
+        Cmd::PdfConfig {
+            vault,
+            repo,
+            auto_fetch,
+            token,
+            token_stdin,
+            create_repo,
+            json,
+        } => cmd_pdf_config(
+            &vault,
+            repo,
+            auto_fetch,
+            token,
+            token_stdin,
+            create_repo,
+            json,
+        )
+        .map(ok),
         Cmd::SuggestTags { vault, citekey } => cmd_suggest_tags(&vault, &citekey).map(ok),
         Cmd::Recent { json } => cmd_recent(json).map(ok),
         Cmd::Forget { vault } => cmd_forget(&vault).map(ok),
@@ -1380,6 +1434,16 @@ fn cmd_import(
         (None, Some(d)) => engine::import_doi(&v, &d, policy)?,
         (None, None) => return Err("specify a .bib file or --doi".into()),
     };
+    // Post-import PDF auto-fetch (opt-in via `pdf-config --auto-fetch true`;
+    // a no-op without the pref, so the base import path stays offline).
+    // Best-effort, on stderr — it must never corrupt the --json stdout.
+    match engine::auto_fetch_pdfs(&v, &r.new_keys()) {
+        Ok((fetched, attempted)) if attempted > 0 => {
+            eprintln!("  ⤓ auto-fetched {fetched}/{attempted} PDF(s)");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: PDF auto-fetch skipped: {e}"),
+    }
     if json {
         println!(
             "{}",
@@ -1431,9 +1495,15 @@ fn cmd_pdf(
     citekey: &str,
     attach: Option<PathBuf>,
     fetch: bool,
+    push: bool,
+    pull: bool,
 ) -> Result<(), String> {
-    if attach.is_some() && fetch {
-        return Err("use either --attach or --fetch, not both".into());
+    let picked = [attach.is_some(), fetch, push, pull]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if picked > 1 {
+        return Err("use only one of --attach / --fetch / --push / --pull".into());
     }
     let v = open_vault(vault)?;
     if let Some(src) = attach {
@@ -1442,6 +1512,15 @@ fn cmd_pdf(
     } else if fetch {
         let dest = engine::fetch_pdf(&v, citekey)?;
         println!("Downloaded PDF -> {}", dest.display());
+    } else if push {
+        let remote = engine::pdf_push(&v, citekey)?;
+        println!(
+            "Pushed {} -> {remote}",
+            engine::pdf_path(&v, citekey).display()
+        );
+    } else if pull {
+        let dest = engine::pdf_pull(&v, citekey)?;
+        println!("Pulled PDF -> {}", dest.display());
     } else {
         let path = engine::pdf_path(&v, citekey);
         let status = if path.exists() {
@@ -1450,6 +1529,87 @@ fn cmd_pdf(
             "not attached"
         };
         println!("{} ({status})", path.display());
+    }
+    Ok(())
+}
+
+fn cmd_pdf_config(
+    vault: &Path,
+    repo: Option<String>,
+    auto_fetch: Option<bool>,
+    token: Option<String>,
+    token_stdin: bool,
+    create_repo: bool,
+    json: bool,
+) -> Result<(), String> {
+    let v = open_vault(vault)?;
+    let token = if token_stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("read token from stdin: {e}"))?;
+        let t = line.trim().to_string();
+        if t.is_empty() {
+            return Err("no token arrived on stdin".into());
+        }
+        Some(t)
+    } else {
+        token
+    };
+    if let Some(t) = token {
+        engine::set_hf_token(&t)?;
+    }
+    let prefs = if repo.is_some() || auto_fetch.is_some() {
+        engine::update_pdf_prefs(&v, |p| {
+            if let Some(r) = repo {
+                p.repo = r.trim().to_string();
+            }
+            if let Some(a) = auto_fetch {
+                p.auto_fetch = a;
+            }
+        })?
+    } else {
+        engine::pdf_prefs(&v)?
+    };
+    // Create after the prefs land, so `--repo u/r --create-repo` works in one go.
+    let created = if create_repo {
+        Some(engine::create_pdf_repo(&v)?)
+    } else {
+        None
+    };
+    let token_set = engine::hf_token_set()?;
+    if json {
+        // The token itself never appears in any output — only whether one is set.
+        let mut out = serde_json::json!({
+            "repo": prefs.repo,
+            "auto_fetch": prefs.auto_fetch,
+            "token_set": token_set,
+        });
+        if let Some(c) = &created {
+            out["created"] = serde_json::json!(c);
+        }
+        emit(out)?;
+    } else {
+        println!(
+            "repo:       {}",
+            if prefs.repo.is_empty() {
+                "(unset)"
+            } else {
+                &prefs.repo
+            }
+        );
+        println!("auto-fetch: {}", prefs.auto_fetch);
+        println!(
+            "hf token:   {}",
+            if token_set {
+                "set (machine-local)"
+            } else {
+                "(unset)"
+            }
+        );
+        if let Some(c) = created {
+            println!("{c}");
+        }
     }
     Ok(())
 }

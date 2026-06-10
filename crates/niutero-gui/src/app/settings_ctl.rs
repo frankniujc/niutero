@@ -16,13 +16,32 @@ use super::jobs::AiJobKind;
 use super::{LibView, NiuteroApp, Tool};
 
 impl NiuteroApp {
-    /// Persist any unsaved AI-settings edit (the typed-key-then-navigate-away
-    /// case). Called when leaving the Settings tool, switching libraries, and
-    /// on app exit; a no-op when the state is clean or unseeded.
+    /// Persist any unsaved Settings edit (AI config, PDF prefs, a typed HF
+    /// token) — the typed-then-navigate-away case. Called when leaving the
+    /// Settings tool, switching libraries (BEFORE the old library is dropped,
+    /// since PDF prefs are per-vault), and on app exit. No-op when clean.
     pub(super) fn flush_ai_settings(&mut self) {
         if let Some(cfg) = settings::take_ai_dirty(&mut self.settings) {
             if let Err(e) = engine::set_ai_config(cfg) {
                 self.set_toast(format!("Couldn't save AI settings: {e}"));
+            }
+        }
+        if let Some((repo, auto_fetch)) = settings::take_pdf_dirty(&mut self.settings) {
+            if let Some(lib) = self.library.as_ref() {
+                if let Err(e) = engine::update_pdf_prefs(&lib.vault, |p| {
+                    p.repo = repo;
+                    p.auto_fetch = auto_fetch;
+                }) {
+                    self.set_toast(format!("Couldn't save PDF settings: {e}"));
+                }
+            }
+        }
+        let tok = self.settings.pdf_token_buf.trim().to_string();
+        if !tok.is_empty() {
+            self.settings.pdf_token_buf.clear();
+            self.settings.pdf_token_set = true;
+            if let Err(e) = engine::set_hf_token(&tok) {
+                self.set_toast(format!("Couldn't save the HF token: {e}"));
             }
         }
     }
@@ -133,7 +152,14 @@ impl NiuteroApp {
                 .citekey_pattern
                 .clone()
                 .unwrap_or_else(|| "{auth}{year}{title.1}{Title.2}".into());
+            // PDF prefs are per-vault, so they seed with the vault fields.
+            if let Ok(p) = engine::pdf_prefs(&lib.vault) {
+                self.settings.pdf_repo = p.repo;
+                self.settings.pdf_auto = p.auto_fetch;
+            }
+            self.settings.pdf_token_set = engine::hf_token_set().unwrap_or(false);
             self.settings.seeded = true;
+            settings::mark_pdf_clean(&mut self.settings);
         }
     }
 
@@ -161,6 +187,30 @@ impl NiuteroApp {
                 }
             }
             SettingsAction::TestAi => self.start_ai_test(ctx),
+            SettingsAction::SetPdfPrefs { repo, auto_fetch } => {
+                if let Some(lib) = self.library.as_ref() {
+                    if let Err(e) = engine::update_pdf_prefs(&lib.vault, |p| {
+                        p.repo = repo;
+                        p.auto_fetch = auto_fetch;
+                    }) {
+                        self.toast = Some(format!("Couldn't save PDF settings: {e}"));
+                    }
+                }
+            }
+            SettingsAction::SetHfToken(tok) => {
+                let clearing = tok.trim().is_empty();
+                match engine::set_hf_token(&tok) {
+                    Ok(()) => {
+                        self.set_toast(if clearing {
+                            "HF token cleared"
+                        } else {
+                            "HF token saved (machine-local)"
+                        });
+                    }
+                    Err(e) => self.set_toast(format!("Couldn't save the HF token: {e}")),
+                }
+            }
+            SettingsAction::CreatePdfRepo => self.start_create_pdf_repo(ctx),
             SettingsAction::Toast(m) => self.toast = Some(m),
         }
     }

@@ -234,11 +234,47 @@ preserved via re-exports); `niutero-gui` `tags.rs` split into
 `tags/{mod,wizards}.rs`; the `app.rs` impl split into an `app/` directory;
 duplicated private widgets unified into `widgets.rs`.
 
+## 2026-06-10 (later) — Board view removed; PDF attachments built for real
+
+- **Board view temporarily removed** (user request). `LibView::Board`, the
+  titlebar switcher entry, `NIU_VIEW=board`, and `library/board.rs` are gone —
+  restore the file from git history when it returns. The status/stars
+  machinery it used stays live (Reader filter, detail panels, `status:`
+  queries).
+- **PDF attachments are now a real feature** (engine → CLI → GUI, per the
+  architecture rule):
+  - Engine `pdf_ops`: per-vault `PdfPrefs { repo, auto_fetch }` + per-machine
+    `hf_token` in the registry (locked RMW; token never exposed back through
+    the API); `create_pdf_repo` / `pdf_push` / `pdf_pull` over new
+    `niutero-online` HF calls (create-repo, NDJSON commit upload, `resolve/`
+    download — token via `-K -` stdin like the LLM path; download keeps
+    `--fail` so an error page is never written as a "PDF"); pure
+    `fetchable_pdf_url` (direct `.pdf` / arXiv abs → pdf; landing pages
+    refused); `auto_fetch_pdfs` post-import hook (opt-in, best-effort, no
+    partial files). `EntryView.has_pdf` is now a real on-disk check.
+  - CLI: `pdf --push/--pull`, new `pdf-config` (see plan.md Post-M5);
+    `import` runs the auto-fetch hook (stderr-only reporting);
+    `ImportReport.added_keys`/`new_keys()` feed it.
+  - GUI: context menu gains Attach / Fetch (only for fetchable urls) / Pull
+    from HF; attach auto-pushes when HF is configured; Open PDF falls back to
+    an HF pull; the Settings PDF page is fully real (repo + auto-fetch per
+    vault, token per machine with the same navigate-away flush as the AI key,
+    Create-repo runs live off-thread). The `has_pdf` clip/indicator no longer
+    lies.
+  - **HF calls are network-unverified** (built offline, same standing as the
+    other externals): exercise create-repo → push → pull against a real repo
+    + `hf_` token before trusting them. The create-repo payload sends the
+    namespaced `name` — if the Hub rejects that form, split into
+    `name`/`organization` (noted in `niutero-online::hf_create_dataset`).
+  - Tests: +13 (online HF builders/base64/validation, engine prefs/gates/
+    auto-fetch/`has_pdf`, CLI `pdf-config` round-trip + offline gates +
+    opt-in auto-fetch via an RFC-2606 `.invalid` host).
+
 ### Follow-ups (next work, in rough priority)
 
 - **Live AI smoke** (planned right after this landing) + live verification of
-  the DOI / enrich / connector / PDF network paths — still
-  manually-verified-only.
+  the DOI / enrich / connector / PDF network paths — now including the HF
+  create-repo / push / pull trio — still manually-verified-only.
 - **Normalize ruleset engine API** — the GUI's ruleset toggles are still
   display-only; the engine has no ruleset read/write.
 - **Vault-config setters** — library name / citekey pattern (Settings fields
@@ -259,9 +295,10 @@ Phase 1 is complete; Phase 2's GUI tab surface (G1–G5) is built. What's left:
   PDF url, and a configured `ai test`/`ai ask`) and add network-path coverage.
 - **GUI polish** — see the follow-ups list above; also still GUI-less engine
   features: notes, history, dedupe-merge, saved views, export/export-targets,
-  per-entry enrich, attach/fetch PDF. Other known-mock GUI bits: workflow
-  toggles + fonts/density visual-only, keymap/integrations stubs, board
-  drag-and-drop not implemented, `has_pdf` indicator is a url-presence proxy.
+  per-entry enrich. Other known-mock GUI bits: workflow toggles + fonts/density
+  visual-only, keymap/integrations stubs. (PDF attach/fetch/pull and the PDF
+  settings page are real as of 2026-06-10; the Board view is temporarily
+  removed rather than half-mock.)
 - **Cross-platform CI matrix** — not set up.
 
 ## Known limitations (acceptable, documented)

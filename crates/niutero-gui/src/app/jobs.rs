@@ -235,6 +235,139 @@ impl NiuteroApp {
         true
     }
 
+    /// True when an HF push/pull can work right now: a repo configured for the
+    /// open vault and a machine token set. Two cheap registry reads — used on
+    /// clicks, never per frame.
+    pub(super) fn hf_ready(&self) -> bool {
+        self.library.as_ref().is_some_and(|l| {
+            engine::pdf_prefs(&l.vault)
+                .map(|p| !p.repo.trim().is_empty())
+                .unwrap_or(false)
+        }) && engine::hf_token_set().unwrap_or(false)
+    }
+
+    /// Download the entry's PDF from its url on a worker (then push it to the
+    /// HF repo when configured). Network never blocks the UI thread.
+    pub(super) fn start_pdf_fetch(&mut self, key: String, ctx: &egui::Context) {
+        if self.bg.is_some() {
+            self.set_toast("A background task is already running");
+            return;
+        }
+        let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) else {
+            return;
+        };
+        let push = self.hf_ready();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root).and_then(|v| {
+                engine::fetch_pdf(&v, &key)?;
+                let mut note = "PDF downloaded".to_string();
+                if push {
+                    match engine::pdf_push(&v, &key) {
+                        Ok(_) => note.push_str(" · pushed to HF"),
+                        Err(e) => note.push_str(&format!(" · HF push failed: {e}")),
+                    }
+                }
+                Ok(note)
+            }) {
+                Ok(n) => BgMsg::Done(n),
+                Err(e) => BgMsg::Failed(format!("PDF fetch failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running("Fetching PDF…", "PDF ready", 1));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    /// Upload an (already attached) PDF to the HF dataset repo on a worker.
+    pub(super) fn start_pdf_push(&mut self, key: String, ctx: &egui::Context) {
+        if self.bg.is_some() {
+            // The attach already succeeded — only the push is skipped.
+            self.set_toast("PDF attached (HF push skipped — a task is running)");
+            return;
+        }
+        let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root).and_then(|v| engine::pdf_push(&v, &key)) {
+                Ok(remote) => BgMsg::Done(format!("PDF attached · pushed to {remote}")),
+                Err(e) => BgMsg::Failed(format!("PDF attached, but the HF push failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running("Pushing PDF to HF…", "PDF pushed", 1));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    /// Download an entry's PDF from the HF dataset repo on a worker.
+    pub(super) fn start_pdf_pull(&mut self, key: String, ctx: &egui::Context) {
+        if self.bg.is_some() {
+            self.set_toast("A background task is already running");
+            return;
+        }
+        let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root).and_then(|v| engine::pdf_pull(&v, &key)) {
+                Ok(_) => BgMsg::Done("PDF pulled from HF".into()),
+                Err(e) => BgMsg::Failed(format!("HF pull failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running("Pulling PDF from HF…", "PDF pulled", 1));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    /// Create the vault's HF dataset repo on a worker (Settings → Create).
+    pub(super) fn start_create_pdf_repo(&mut self, ctx: &egui::Context) {
+        if self.bg.is_some() {
+            self.set_toast("A background task is already running");
+            return;
+        }
+        let Some(root) = self.library.as_ref().map(|l| l.vault.root.clone()) else {
+            self.set_toast("Open a library first");
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root).and_then(|v| engine::create_pdf_repo(&v)) {
+                Ok(m) => BgMsg::Done(m),
+                Err(e) => BgMsg::Failed(format!("Create repo failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running(
+            "Creating dataset repo…",
+            "Repo ready",
+            1,
+        ));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
     /// Drain the background worker's channel, updating the task toast and, on
     /// completion, reloading the library so new/enriched entries appear.
     pub(super) fn poll_background(&mut self, _ctx: &egui::Context) {

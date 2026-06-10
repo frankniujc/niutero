@@ -7,6 +7,15 @@
 > map (its line numbers are stale); where it disagrees with this block, this
 > block wins.
 >
+> **Same-day update (later on 2026-06-10):** the **Board view is temporarily
+> removed** (every "Board" claim below is moot until it returns from git
+> history), and the **PDF surface is now real**: `has_pdf` indicators are an
+> on-disk check (not the url proxy), the context menu gained Attach / Fetch /
+> Pull-from-HF, attach auto-pushes to the configured HF dataset repo, Open PDF
+> falls back to an HF pull, and Settings → PDF attachments persists for real
+> (repo + auto-fetch per vault, token per machine, live Create-repo). The HF
+> network calls themselves are still live-unverified.
+>
 > **Now real (was placeholder):**
 > - **Section A is wired, 1–6**: the add-entry dialog (Classic **+**, Board
 >   **Add**, per-column **+**), add-by-DOI / import `.bib` (🔗), Re-key
