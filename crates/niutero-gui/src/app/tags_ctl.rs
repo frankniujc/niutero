@@ -1,4 +1,4 @@
-//! Tags tool body and appliers: tag rename/merge/delete (with confirmation),
+﻿//! Tags tool body and appliers: tag rename/merge/delete (with confirmation),
 //! the tag-wizard modal step loop, and the wizard apply paths (organize /
 //! auto-tag / import).
 
@@ -105,7 +105,7 @@ impl NiuteroApp {
                         // Carry the session-local color across the rename (don't
                         // clobber the destination's own color on a merge).
                         self.tags.migrate_color(&from, &to);
-                        self.refresh_git();
+                        self.after_mutation();
                         self.set_toast(if merged_into {
                             format!("Merged '{from}' into '{to}' ({n} entr{})", plural_y(n))
                         } else {
@@ -135,7 +135,7 @@ impl NiuteroApp {
                         if self.lib.active_tag.as_deref() == Some(name.as_str()) {
                             self.lib.active_tag = None;
                         }
-                        self.refresh_git();
+                        self.after_mutation();
                         self.set_toast(format!("Deleted '{name}' from {n} entr{}", plural_y(n)));
                     }
                     Some(Err(e)) => self.set_toast(e),
@@ -273,7 +273,7 @@ impl NiuteroApp {
             }
             lib.reload();
             self.lib.refresh();
-            self.refresh_git();
+            self.after_mutation();
         }
         let mut msg = format!(
             "Merged {} tag{}",
@@ -324,7 +324,7 @@ impl NiuteroApp {
         if s.applied > 0 {
             lib.reload();
             self.lib.refresh();
-            self.refresh_git();
+            self.after_mutation();
         }
         match &s.first_error {
             Some(e) => self.set_toast(format!("Auto-tag failed: {e}")),
@@ -368,7 +368,7 @@ impl NiuteroApp {
         if s.applied > 0 {
             lib.reload();
             self.lib.refresh();
-            self.refresh_git();
+            self.after_mutation();
         }
         match &s.first_error {
             Some(e) => self.set_toast(format!("Tagging failed: {e}")),

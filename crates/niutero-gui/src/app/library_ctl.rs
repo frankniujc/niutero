@@ -189,10 +189,11 @@ impl NiuteroApp {
             | LibAction::FetchPdf
             | LibAction::PullPdf => {}
         }
-        // Only a real .bib mutation dirties the git work tree; refresh the cached
-        // status then (not on read-only Cite/BibTeX/Open actions).
+        // Only a real mutation dirties the work tree: run the post-mutation
+        // bookkeeping (opt-in auto-commit + git-status refresh) then — never
+        // on read-only Cite/BibTeX/Open actions.
         if dirtied {
-            self.git = engine::git_status(&lib.vault.root);
+            self.after_mutation();
         }
         if pull_pdf {
             if self.hf_ready() {
@@ -313,7 +314,7 @@ impl NiuteroApp {
                         // Cite keys changed → the Library selection is stale.
                         self.lib = LibState::default();
                         self.norm_cache = None;
-                        self.refresh_git();
+                        self.after_mutation();
                         let n = changes.len();
                         self.toast = Some(format!(
                             "Re-keyed {n} entr{}",
@@ -379,7 +380,7 @@ impl NiuteroApp {
                 self.norm_cache = None;
                 self.norm.done.clear();
                 self.norm.view = NormView::Overview;
-                self.refresh_git();
+                self.after_mutation();
                 self.toast = Some(format!(
                     "Applied {applied} change{}",
                     if applied == 1 { "" } else { "s" }
@@ -425,7 +426,7 @@ impl NiuteroApp {
                     .add_filter("BibTeX", &["bib"])
                     .pick_file()
                 {
-                    self.import_bib_file(&path);
+                    self.import_bib_file(&path, ctx);
                 } else {
                     self.dialog = Some(dialog); // picker cancelled — keep dialog
                 }
@@ -493,7 +494,7 @@ impl NiuteroApp {
                     self.lib.selected = None;
                 }
                 self.lib.refresh();
-                self.git = engine::git_status(&lib.vault.root);
+                self.after_mutation();
                 self.norm_cache = None;
                 self.toast = Some("Deleted entry".into());
             }
@@ -542,7 +543,7 @@ impl NiuteroApp {
                 if let Some(k) = key {
                     self.lib.selected = Some(k);
                 }
-                self.git = engine::git_status(&lib.vault.root);
+                self.after_mutation();
                 self.norm_cache = None;
                 self.toast = Some("Added entry".into());
                 true
@@ -554,24 +555,30 @@ impl NiuteroApp {
         }
     }
 
-    /// Import every entry from a local `.bib` file (offline). Renames on cite-key
-    /// clashes so an import never overwrites existing entries.
-    fn import_bib_file(&mut self, path: &std::path::Path) {
+    /// Import every entry from a local `.bib` file (offline). The duplicate
+    /// policy is the library's configured default (`config --on-dup`), else
+    /// rename — so a GUI import never silently drops entries.
+    fn import_bib_file(&mut self, path: &std::path::Path, ctx: &egui::Context) {
         let Some(lib) = self.library.as_mut() else {
             return;
         };
-        match engine::import(&lib.vault, path, engine::DupPolicy::Rename) {
+        let policy = engine::default_dup_policy(&lib.vault, engine::DupPolicy::Rename);
+        match engine::import(&lib.vault, path, policy) {
             Ok(rep) => {
                 lib.reload();
                 self.lib.refresh();
-                self.git = engine::git_status(&lib.vault.root);
+                self.after_mutation();
                 self.norm_cache = None;
                 self.toast = Some(format!(
-                    "Imported {} · renamed {} · skipped {}",
+                    "Imported {} · renamed {} · skipped {} · overwritten {}",
                     rep.added,
                     rep.renamed.len(),
-                    rep.skipped
+                    rep.skipped,
+                    rep.overwritten,
                 ));
+                // Opt-in post-import hooks (PDF auto-fetch / enrich-on-import)
+                // run off-thread; a no-op when both prefs are off.
+                self.start_post_import(rep.new_keys(), ctx);
             }
             Err(e) => self.toast = Some(format!("Import failed: {e}")),
         }

@@ -122,8 +122,29 @@ niutero ai organize <vault> [--instructions S | --plan FILE] [--apply] [--json]
 `POST /capture` requires it (`Authorization: Bearer <t>` or `X-Niutero-Token`),
 wildcard CORS is gone, bodies are capped at 512 KB, sockets have timeouts.
 
+**Library config** — `.niutero/config.toml` is the library's own, synced
+settings file; `config` is its CLI view:
+
+```
+niutero config <vault> [--name S] [--pattern S] [--enrich-on-import BOOL]
+                       [--auto-commit BOOL] [--on-dup skip|overwrite|rename] [--json]
+```
+
+- `--pattern ""` clears back to the built-in default. The three workflow
+  toggles are **real behaviors**, all default-off: `--enrich-on-import` fills
+  new entries from their DOIs after any import; `--auto-commit` git-commits
+  the vault after every mutation (no push; stats-aware messages); `--on-dup`
+  is the import default when a run doesn't pass `--on-dup` explicitly.
+- `sync-config` now also shows the `origin` remote, read straight from the
+  vault's git repo — configured once via `connect`, visible everywhere.
+- Machine-personal GUI appearance (theme + accent) persists in the registry's
+  `[ui]` table — deliberately NOT in the vault (it never syncs to
+  collaborators). It has no CLI command because it isn't a library operation.
+
 **PDF attachments** — binaries live in git-ignored `pdfs/`, never the `.bib`;
-sync goes to a private HuggingFace **dataset** repo:
+sync goes to a private HuggingFace **dataset** repo. The repo + auto-fetch
+are **library config** (`config.toml`, synced — configure once, every machine
+reads it from the vault); only the account token is machine-local:
 
 ```
 niutero pdf <vault> <key> [--attach FILE | --fetch | --push | --pull]

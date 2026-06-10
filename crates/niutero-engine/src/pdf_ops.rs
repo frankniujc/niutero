@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use niutero_vault::registry::with_registry_mut;
 use niutero_vault::{PdfPrefs, Registry, Vault};
 
-/// This machine's PDF prefs for `v` (HF repo + auto-fetch). Default when the
-/// vault has none recorded.
-pub fn pdf_prefs(v: &Vault) -> Result<PdfPrefs, String> {
+/// Legacy read of the machine-registry PDF prefs (the repo/auto-fetch briefly
+/// lived there before moving into the vault's own `config.toml`). Kept as a
+/// read-only fallback so existing setups don't lose their config.
+pub(crate) fn pdf_prefs(v: &Vault) -> Result<PdfPrefs, String> {
     Ok(Registry::load()
         .map_err(|e| format!("read PDF prefs: {e}"))?
         .get(&v.root)
@@ -24,10 +25,12 @@ pub fn pdf_prefs(v: &Vault) -> Result<PdfPrefs, String> {
         .unwrap_or_default())
 }
 
-/// Update this machine's PDF prefs for `v`, with the read-modify-write inside
-/// the registry's exclusive lock (the same discipline as the AI config).
-/// Returns the prefs as saved.
-pub fn update_pdf_prefs(v: &Vault, f: impl FnOnce(&mut PdfPrefs)) -> Result<PdfPrefs, String> {
+/// Legacy write access to the registry copy (used only to clear it once the
+/// value moves into the vault config).
+pub(crate) fn update_pdf_prefs(
+    v: &Vault,
+    f: impl FnOnce(&mut PdfPrefs),
+) -> Result<PdfPrefs, String> {
     let root = v.root.clone();
     with_registry_mut(|reg| {
         let rec = reg.entry_mut(&root);
@@ -35,6 +38,49 @@ pub fn update_pdf_prefs(v: &Vault, f: impl FnOnce(&mut PdfPrefs)) -> Result<PdfP
         rec.pdf.clone()
     })
     .map_err(|e| format!("save PDF prefs: {e}"))
+}
+
+/// The library's HF dataset repo: `.niutero/config.toml` first (synced — the
+/// repo is a library property collaborators share), with the legacy machine-
+/// registry copy as a read fallback.
+pub fn pdf_repo(v: &Vault) -> Result<Option<String>, String> {
+    if let Some(r) = v
+        .config
+        .pdf_repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        return Ok(Some(r.to_string()));
+    }
+    let legacy = pdf_prefs(v)?.repo.trim().to_string();
+    Ok((!legacy.is_empty()).then_some(legacy))
+}
+
+/// Set (or clear, with an empty string) the library's HF dataset repo in
+/// `config.toml`. Validates the `user/repo` shape up front, and clears the
+/// legacy registry copy so a cleared repo can't silently resurrect.
+pub fn set_pdf_repo(v: &mut Vault, repo: &str) -> Result<(), String> {
+    let repo = repo.trim();
+    if !repo.is_empty() && !niutero_online::valid_hf_repo(repo) {
+        return Err(format!(
+            "'{repo}' isn't a valid HF dataset id (want user/repo)"
+        ));
+    }
+    {
+        let _lock = crate::lock_vault(v)?;
+        v.config.pdf_repo = (!repo.is_empty()).then(|| repo.to_string());
+        v.save_sidecar().map_err(|e| format!("save config: {e}"))?;
+    }
+    // Best-effort legacy cleanup — the vault config is the single source now.
+    let _ = update_pdf_prefs(v, |p| p.repo = String::new());
+    Ok(())
+}
+
+/// Whether post-import PDF auto-fetch is on for this library: the synced
+/// `workflow.auto_fetch_pdf`, or the legacy machine-registry toggle.
+pub fn pdf_auto_fetch_enabled(v: &Vault) -> bool {
+    v.config.workflow.auto_fetch_pdf || pdf_prefs(v).map(|p| p.auto_fetch).unwrap_or(false)
 }
 
 /// Whether a HuggingFace token is configured (the token itself is never
@@ -66,16 +112,12 @@ fn resolve_hf(v: &Vault) -> Result<(String, String), String> {
                 .into(),
         );
     }
-    let repo = reg
-        .get(&v.root)
-        .map(|r| r.pdf.repo.trim().to_string())
-        .unwrap_or_default();
-    if repo.is_empty() {
-        return Err("no HF dataset repo configured for this vault — run \
+    let Some(repo) = pdf_repo(v)? else {
+        return Err("no HF dataset repo configured for this library — run \
                     `niutero pdf-config <vault> --repo user/repo` or set it in \
                     Settings → PDF attachments"
             .into());
-    }
+    };
     Ok((token, repo))
 }
 
@@ -152,8 +194,7 @@ pub fn fetchable_pdf_url(url: &str) -> Option<String> {
 /// `(fetched, attempted)`; `(0, 0)` without a single network call when the
 /// pref is off, keeping the base import path fully offline.
 pub fn auto_fetch_pdfs(v: &Vault, keys: &[String]) -> Result<(usize, usize), String> {
-    let prefs = pdf_prefs(v)?;
-    if !prefs.auto_fetch {
+    if !pdf_auto_fetch_enabled(v) {
         return Ok((0, 0));
     }
     let mut fetched = 0usize;

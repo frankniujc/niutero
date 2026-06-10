@@ -20,10 +20,16 @@ pub use ai::{
 };
 pub use connector::{connector_token, serve_connector};
 pub use pdf_ops::{
-    auto_fetch_pdfs, create_pdf_repo, fetchable_pdf_url, hf_token_set, pdf_prefs, pdf_pull,
-    pdf_push, set_hf_token, update_pdf_prefs,
+    auto_fetch_pdfs, create_pdf_repo, fetchable_pdf_url, hf_token_set, pdf_auto_fetch_enabled,
+    pdf_pull, pdf_push, pdf_repo, set_hf_token, set_pdf_repo,
 };
-pub use sync_ops::{connect, history, sync, HistoryCommit, SyncStatus};
+// Legacy registry copies — only the test module reaches them from the root
+// (pdf_ops uses them directly as the migration fallback).
+#[cfg(test)]
+pub(crate) use pdf_ops::{pdf_prefs, update_pdf_prefs};
+pub use sync_ops::{
+    auto_commit_if_enabled, connect, history, remote_url, sync, HistoryCommit, SyncStatus,
+};
 pub use tags::{
     current_note, current_tags, delete_tag, list_tags, rename_tag, set_note, set_stars, set_status,
     set_tags, set_tags_bulk,
@@ -52,8 +58,9 @@ use serde::{Deserialize, Serialize};
 
 pub use niutero_core::texdisplay;
 pub use niutero_core::texscan::TexReport;
+pub use niutero_vault::WorkflowConfig;
 pub use niutero_vault::{
-    AiConfig, EntryMeta, ExportTarget, Registry, Status, SyncPrefs, Vault, View,
+    AiConfig, EntryMeta, ExportTarget, Registry, Status, SyncPrefs, UiPrefs, Vault, View,
 };
 
 /// An owned, serializable view of an entry plus its sidecar tags/notes — the
@@ -841,6 +848,121 @@ pub fn set_sync_prefs(
         rec.sync.clone()
     })
     .map_err(|e| format!("update registry: {e}"))
+}
+
+// -------------------------------------------- vault config + machine UI prefs
+
+/// Update the library's name and/or citation-key pattern in
+/// `.niutero/config.toml` (synced — collaborators share these). `pattern`
+/// `Some("")` clears back to the built-in default. `KeyPattern::parse` is
+/// infallible by design (a typo'd token shows up verbatim in generated keys
+/// rather than vanishing), so any non-empty pattern is stored as given.
+pub fn set_library_meta(
+    v: &mut Vault,
+    name: Option<&str>,
+    pattern: Option<&str>,
+) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
+    if let Some(n) = name {
+        let n = n.trim();
+        if n.is_empty() {
+            return Err("the library name must not be empty".into());
+        }
+        v.config.name = n.to_string();
+    }
+    if let Some(p) = pattern {
+        let p = p.trim();
+        v.config.citekey_pattern = (!p.is_empty()).then(|| p.to_string());
+    }
+    v.save_sidecar().map_err(|e| format!("save config: {e}"))
+}
+
+/// Update the library's shared workflow toggles in `config.toml` (synced).
+/// `None` leaves a field unchanged; `on_dup` `Some("")` clears the default
+/// duplicate policy. Returns the resulting config.
+pub fn set_workflow(
+    v: &mut Vault,
+    enrich_on_import: Option<bool>,
+    auto_commit: Option<bool>,
+    on_dup: Option<&str>,
+    auto_fetch_pdf: Option<bool>,
+) -> Result<WorkflowConfig, String> {
+    let _lock = lock_vault(v)?;
+    if let Some(b) = enrich_on_import {
+        v.config.workflow.enrich_on_import = b;
+    }
+    if let Some(b) = auto_commit {
+        v.config.workflow.auto_commit = b;
+    }
+    if let Some(d) = on_dup {
+        let d = d.trim().to_ascii_lowercase();
+        v.config.workflow.on_dup = match d.as_str() {
+            "" => None,
+            "skip" | "overwrite" | "rename" => Some(d),
+            other => {
+                return Err(format!(
+                    "unknown duplicate policy '{other}' (want skip / overwrite / rename)"
+                ))
+            }
+        };
+    }
+    if let Some(b) = auto_fetch_pdf {
+        v.config.workflow.auto_fetch_pdf = b;
+    }
+    v.save_sidecar().map_err(|e| format!("save config: {e}"))?;
+    Ok(v.config.workflow.clone())
+}
+
+/// The duplicate policy an import should use when none was given explicitly:
+/// the library's configured default, else `fallback` (the calling tool's own
+/// default — Skip for the CLI, Rename for the GUI).
+pub fn default_dup_policy(v: &Vault, fallback: DupPolicy) -> DupPolicy {
+    match v.config.workflow.on_dup.as_deref() {
+        Some("skip") => DupPolicy::Skip,
+        Some("overwrite") => DupPolicy::Overwrite,
+        Some("rename") => DupPolicy::Rename,
+        _ => fallback,
+    }
+}
+
+/// Post-import hook: enrich `keys` from their DOIs when the library opted in
+/// (`config --enrich-on-import true`). Best-effort per entry — an entry
+/// without a DOI is skipped silently; a failed fetch counts as attempted.
+/// Returns `(filled, attempted)`; `(0, 0)` with zero network calls when the
+/// pref is off.
+pub fn auto_enrich(v: &Vault, keys: &[String]) -> Result<(usize, usize), String> {
+    if !v.config.workflow.enrich_on_import {
+        return Ok((0, 0));
+    }
+    let mut filled = 0usize;
+    let mut attempted = 0usize;
+    for k in keys {
+        match enrich(v, k) {
+            Ok(fields) => {
+                attempted += 1;
+                if !fields.is_empty() {
+                    filled += 1;
+                }
+            }
+            Err(e) if e.contains("no DOI") => {}
+            Err(_) => attempted += 1,
+        }
+    }
+    Ok((filled, attempted))
+}
+
+/// This machine's GUI appearance prefs (registry — personal, never synced).
+pub fn ui_prefs() -> Result<UiPrefs, String> {
+    Ok(Registry::load()
+        .map_err(|e| format!("read UI prefs: {e}"))?
+        .ui)
+}
+
+/// Persist the appearance prefs under the registry lock, so the app reopens
+/// looking the way it was left.
+pub fn set_ui_prefs(dark: bool, accent: usize) -> Result<(), String> {
+    niutero_vault::registry::with_registry_mut(|reg| reg.ui = UiPrefs { dark, accent })
+        .map_err(|e| format!("save UI prefs: {e}"))
 }
 
 // ------------------------------------------------------------------ rekey
@@ -3199,6 +3321,123 @@ mod tests {
         assert!(attach_pdf(&v, "ghost", &src)
             .unwrap_err()
             .contains("no entry with cite key 'ghost'"));
+    }
+
+    #[test]
+    fn set_library_meta_validates_and_drives_rekey_pattern() {
+        let (_d, mut v) = vault();
+        assert!(set_library_meta(&mut v, Some("  "), None)
+            .unwrap_err()
+            .contains("must not be empty"));
+        set_library_meta(&mut v, Some("My Papers"), Some("{auth}{year}")).unwrap();
+        let back = open(&v.root).unwrap();
+        assert_eq!(back.config.name, "My Papers");
+        assert_eq!(back.config.citekey_pattern.as_deref(), Some("{auth}{year}"));
+        // Clearing the pattern falls back to the built-in default.
+        set_library_meta(&mut v, None, Some("")).unwrap();
+        assert!(open(&v.root).unwrap().config.citekey_pattern.is_none());
+    }
+
+    #[test]
+    fn set_workflow_validates_on_dup_and_roundtrips() {
+        let (_d, mut v) = vault();
+        assert!(set_workflow(&mut v, None, None, Some("explode"), None)
+            .unwrap_err()
+            .contains("unknown duplicate policy"));
+        let w = set_workflow(
+            &mut v,
+            Some(true),
+            Some(true),
+            Some("Overwrite"),
+            Some(true),
+        )
+        .unwrap();
+        assert!(w.enrich_on_import && w.auto_commit && w.auto_fetch_pdf);
+        assert_eq!(w.on_dup.as_deref(), Some("overwrite")); // normalized
+        let back = open(&v.root).unwrap();
+        assert_eq!(
+            default_dup_policy(&back, DupPolicy::Skip),
+            DupPolicy::Overwrite
+        );
+        // Clearing restores the caller's fallback.
+        set_workflow(&mut v, None, None, Some(""), None).unwrap();
+        let back = open(&v.root).unwrap();
+        assert_eq!(default_dup_policy(&back, DupPolicy::Skip), DupPolicy::Skip);
+    }
+
+    #[test]
+    fn pdf_repo_prefers_vault_config_and_set_clears_legacy() {
+        with_registry(|| {
+            let (_d, mut v) = vault();
+            assert_eq!(pdf_repo(&v).unwrap(), None);
+            // A legacy registry value is still honored…
+            update_pdf_prefs(&v, |p| p.repo = "old/legacy".into()).unwrap();
+            assert_eq!(pdf_repo(&v).unwrap().as_deref(), Some("old/legacy"));
+            // …but the vault config wins, and setting it clears the legacy copy.
+            set_pdf_repo(&mut v, "frank/papers").unwrap();
+            assert_eq!(pdf_repo(&v).unwrap().as_deref(), Some("frank/papers"));
+            assert!(pdf_prefs(&v).unwrap().repo.is_empty());
+            // The repo travels with the vault (config.toml), not the machine.
+            let back = open(&v.root).unwrap();
+            assert_eq!(back.config.pdf_repo.as_deref(), Some("frank/papers"));
+            // Clearing really clears (no resurrection from the legacy copy).
+            set_pdf_repo(&mut v, "").unwrap();
+            assert_eq!(pdf_repo(&v).unwrap(), None);
+            // Shape is validated up front.
+            assert!(set_pdf_repo(&mut v, "not a repo").is_err());
+        });
+    }
+
+    #[test]
+    fn ui_prefs_roundtrip_in_the_registry() {
+        with_registry(|| {
+            let p = ui_prefs().unwrap();
+            assert!(!p.dark && p.accent == 0);
+            set_ui_prefs(true, 3).unwrap();
+            let p = ui_prefs().unwrap();
+            assert!(p.dark);
+            assert_eq!(p.accent, 3);
+        });
+    }
+
+    #[test]
+    fn remote_url_reads_origin_after_connect() {
+        let (_d, v) = vault();
+        assert_eq!(remote_url(&v), None); // not a repo yet
+        connect(&v, "https://example.com/lib.git").unwrap();
+        assert_eq!(
+            remote_url(&v).as_deref(),
+            Some("https://example.com/lib.git")
+        );
+    }
+
+    #[test]
+    fn auto_commit_hook_is_gated_and_commits_once() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "a", &["title=A"])).unwrap();
+        // Pref off: no-op even in a repo.
+        connect(&v, "https://example.com/r.git").unwrap();
+        assert_eq!(auto_commit_if_enabled(&v).unwrap(), None);
+        // Pref on: commits the pending state once, then reports clean.
+        set_workflow(&mut v, None, Some(true), None, None).unwrap();
+        let msg = auto_commit_if_enabled(&v).unwrap();
+        assert!(msg.is_some(), "expected a commit");
+        assert_eq!(auto_commit_if_enabled(&v).unwrap(), None);
+        // The commit is visible to history.
+        add(&v, fields("misc", "b", &["title=B"])).unwrap();
+        let msg = auto_commit_if_enabled(&v).unwrap().unwrap();
+        assert!(msg.contains("added"), "{msg}");
+    }
+
+    #[test]
+    fn auto_enrich_is_gated_and_skips_doiless_entries_offline() {
+        let (_d, mut v) = vault();
+        add(&v, fields("misc", "k", &["title=T"])).unwrap();
+        // Off: nothing, no network.
+        assert_eq!(auto_enrich(&v, &["k".into()]).unwrap(), (0, 0));
+        // On, but the entry has no DOI: skipped silently — still no network.
+        set_workflow(&mut v, Some(true), None, None, None).unwrap();
+        assert_eq!(auto_enrich(&v, &["k".into()]).unwrap(), (0, 0));
     }
 
     #[test]

@@ -228,8 +228,11 @@ impl NiuteroApp {
             Ok("import") => Some(tags::Wizard::new(tags::WizardKind::Import)),
             _ => None,
         };
+        // Appearance is a machine-local pref: the app reopens looking the way
+        // it was left (vaults.toml [ui] — personal, never synced).
+        let ui = engine::ui_prefs().unwrap_or_default();
         NiuteroApp {
-            dark: false,
+            dark: ui.dark,
             tool,
             lib_view,
             library,
@@ -244,7 +247,7 @@ impl NiuteroApp {
             settings: SettingsState::default(),
             tags: TagsState::default(),
             tag_wizard,
-            accent_idx: 0,
+            accent_idx: ui.accent.min(settings::ACCENTS.len() - 1),
             ai_popup_open: std::env::var("NIU_POPUP").is_ok(),
             ai_popup_input: String::new(),
             task,
@@ -266,6 +269,26 @@ impl NiuteroApp {
     fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some(msg.into());
         self.toast_gen += 1;
+    }
+
+    /// Persist the appearance (theme + accent) so the app reopens as left.
+    pub(super) fn persist_ui_prefs(&mut self) {
+        if let Err(e) = engine::set_ui_prefs(self.dark, self.accent_idx) {
+            self.set_toast(format!("Couldn't save appearance: {e}"));
+        }
+    }
+
+    /// Post-mutation bookkeeping: the opt-in auto-commit (the library's
+    /// `workflow.auto_commit`), then a git-status refresh (the commit changes
+    /// it). Call after every successful library mutation — never after a
+    /// plain open/load, which must not commit a user's pending edits.
+    pub(super) fn after_mutation(&mut self) {
+        if let Some(lib) = self.library.as_ref() {
+            if let Err(e) = engine::auto_commit_if_enabled(&lib.vault) {
+                self.set_toast(format!("Auto-commit failed: {e}"));
+            }
+        }
+        self.refresh_git();
     }
 
     /// Recompute the cached git branch/dirty state from the open vault. Cheap
@@ -641,6 +664,7 @@ impl NiuteroApp {
                 {
                     self.dark = !self.dark;
                     info!("theme → {}", if self.dark { "dark" } else { "light" });
+                    self.persist_ui_prefs();
                 }
             });
         });

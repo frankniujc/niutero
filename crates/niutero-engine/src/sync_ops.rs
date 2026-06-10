@@ -163,6 +163,33 @@ fn try_resolve_merge(v: &Vault) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The vault's `origin` remote URL, if it is a git repo with one configured —
+/// what Settings → Sync shows instead of an empty field.
+pub fn remote_url(v: &Vault) -> Option<String> {
+    if !git::is_repo(&v.root) {
+        return None;
+    }
+    git::remote_url(&v.root, "origin")
+}
+
+/// Commit the vault (no pull/push) when the library's `workflow.auto_commit`
+/// is on and the vault is a git repo. Returns `Some(message)` when a commit
+/// was made; `None` when the pref is off, the vault isn't a repo, or there
+/// was nothing to commit — all without touching the network. Hooks call this
+/// after a successful mutation; failures surface, they're never silent.
+pub fn auto_commit_if_enabled(v: &Vault) -> Result<Option<String>, String> {
+    if !v.config.workflow.auto_commit || !git::is_repo(&v.root) {
+        return Ok(None);
+    }
+    ensure_repo_hygiene(v)?;
+    let msg = auto_commit_message(v);
+    if git::commit_all(&v.root, &msg)? {
+        Ok(Some(msg))
+    } else {
+        Ok(None)
+    }
+}
+
 /// A commit message describing what changed in `references.bib` since `HEAD`,
 /// at the granularity of entries (e.g. `niutero: 3 added, 1 changed`).
 fn auto_commit_message(v: &Vault) -> String {

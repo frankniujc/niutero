@@ -217,10 +217,30 @@ impl NiuteroApp {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let msg = match engine::open(&root)
-                .and_then(|v| engine::import_doi(&v, &doi, engine::DupPolicy::Skip))
-            {
-                Ok(rep) if rep.added > 0 => BgMsg::Done(format!("Imported {} from DOI", rep.added)),
+            let msg = match engine::open(&root).and_then(|v| {
+                // The library's configured duplicate default applies here too.
+                let policy = engine::default_dup_policy(&v, engine::DupPolicy::Skip);
+                let rep = engine::import_doi(&v, &doi, policy)?;
+                // Opt-in post-import hooks; both are no-ops without their pref.
+                let mut extra = String::new();
+                let keys = rep.new_keys();
+                if !keys.is_empty() {
+                    if let Ok((f, a)) = engine::auto_fetch_pdfs(&v, &keys) {
+                        if a > 0 {
+                            extra.push_str(&format!(" · {f}/{a} PDF(s)"));
+                        }
+                    }
+                    if let Ok((f, a)) = engine::auto_enrich(&v, &keys) {
+                        if a > 0 {
+                            extra.push_str(&format!(" · enriched {f}/{a}"));
+                        }
+                    }
+                }
+                Ok((rep, extra))
+            }) {
+                Ok((rep, extra)) if rep.added > 0 => {
+                    BgMsg::Done(format!("Imported {} from DOI{extra}", rep.added))
+                }
                 Ok(_) => BgMsg::Done("Already in the library".into()),
                 Err(e) => BgMsg::Failed(format!("DOI fetch failed: {e}")),
             };
@@ -235,13 +255,62 @@ impl NiuteroApp {
         true
     }
 
+    /// Run the opt-in post-import hooks (PDF auto-fetch, enrich-on-import)
+    /// for freshly imported keys on a worker. Silently a no-op when both
+    /// prefs are off, the key list is empty, or a task is already running —
+    /// the hooks are best-effort by contract.
+    pub(super) fn start_post_import(&mut self, keys: Vec<String>, ctx: &egui::Context) {
+        if keys.is_empty() || self.bg.is_some() {
+            return;
+        }
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+        if !engine::pdf_auto_fetch_enabled(&lib.vault)
+            && !lib.vault.config.workflow.enrich_on_import
+        {
+            return;
+        }
+        let root = lib.vault.root.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match engine::open(&root).and_then(|v| {
+                let mut parts = Vec::new();
+                let (f, a) = engine::auto_fetch_pdfs(&v, &keys)?;
+                if a > 0 {
+                    parts.push(format!("{f}/{a} PDF(s)"));
+                }
+                let (f, a) = engine::auto_enrich(&v, &keys)?;
+                if a > 0 {
+                    parts.push(format!("enriched {f}/{a}"));
+                }
+                Ok(if parts.is_empty() {
+                    "nothing applicable".to_string()
+                } else {
+                    parts.join(" · ")
+                })
+            }) {
+                Ok(s) => BgMsg::Done(format!("Post-import: {s}")),
+                Err(e) => BgMsg::Failed(format!("Post-import hooks failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+        self.task = Some(TaskState::running("Post-import…", "Post-import done", 1));
+        self.bg = Some(BgHandle {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
     /// True when an HF push/pull can work right now: a repo configured for the
     /// open vault and a machine token set. Two cheap registry reads — used on
     /// clicks, never per frame.
     pub(super) fn hf_ready(&self) -> bool {
         self.library.as_ref().is_some_and(|l| {
-            engine::pdf_prefs(&l.vault)
-                .map(|p| !p.repo.trim().is_empty())
+            engine::pdf_repo(&l.vault)
+                .map(|r| r.is_some())
                 .unwrap_or(false)
         }) && engine::hf_token_set().unwrap_or(false)
     }
@@ -418,7 +487,7 @@ impl NiuteroApp {
         // to push (Err) still dirtied/advanced the work tree, so the status bar
         // must not keep showing the pre-sync state.
         if terminal {
-            self.refresh_git();
+            self.after_mutation();
         }
     }
 

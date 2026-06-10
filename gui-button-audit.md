@@ -16,6 +16,14 @@
 > (repo + auto-fetch per vault, token per machine, live Create-repo). The HF
 > network calls themselves are still live-unverified.
 >
+> **Third update (same day):** every remaining Settings page persists —
+> **Library** (name + citekey pattern) and **Workflow** (enrich-on-import /
+> auto-commit / on-duplicate, all real behaviors now) write the vault's own
+> `config.toml`; **Appearance** (theme + accent) persists machine-locally and
+> is applied again at launch; the **Sync** page's Git remote field shows the
+> repo's actual `origin`. The only visual-only leftovers: font pickers,
+> density, the settings search box, and the Keymap / Integrations stubs.
+>
 > **Now real (was placeholder):**
 > - **Section A is wired, 1–6**: the add-entry dialog (Classic **+**, Board
 >   **Add**, per-column **+**), add-by-DOI / import `.bib` (🔗), Re-key

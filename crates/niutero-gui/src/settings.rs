@@ -1,14 +1,19 @@
 //! Settings (design spec §9). Sub-navigation: Library · Workflow · AI assistant ·
 //! PDF attachments · Appearance · Keymap · Sync & sharing · Integrations.
 //!
-//! Wired to the engine where the engine supports it: **Appearance → Theme** and
-//! **Accent** are live; **Sync → Git remote** points `origin` via
-//! `engine::connect`; **AI assistant** persists to the machine-local registry
-//! (`engine::set_ai_config`) and its **Test** runs a live `engine::ai_test`. The
-//! library name / key-pattern, the workflow toggles, and the **PDF attachments**
-//! config (HF repo / token, auto-fetch) are preview-only — the engine has no
-//! config-setter for them yet — and the font pickers are visual. Honest about
-//! which controls do something (a "not persisted" note marks the preview pages).
+//! Every page persists to its proper home now:
+//! - **Library** (name, citekey pattern), **Workflow** (enrich-on-import,
+//!   auto-commit, on-duplicate) and the **PDF** repo/auto-fetch live in the
+//!   vault's own `.niutero/config.toml` (synced — collaborators share them).
+//! - **AI assistant** and the **HF/AI secrets** live in the machine-local
+//!   registry (`vaults.toml`); **Appearance** (theme + accent) too — personal,
+//!   applied again at next launch.
+//! - **Sync → Git remote** is read back from the repo itself (`origin`) and
+//!   set via `engine::connect`.
+//! Text edits flush on focus-loss AND on navigate-away (`take_*_dirty` from
+//! `settings()`'s end-of-frame pass), so a typed value is never silently lost.
+//! Still visual-only: font pickers, density, the settings search box, Keymap /
+//! Integrations stubs.
 
 use eframe::egui::{self, Color32, RichText};
 use niutero_engine::AiConfig;
@@ -101,6 +106,10 @@ pub struct SettingsState {
     pub pdf_saved: (String, bool),
     /// A PDF text field has focus this frame — don't flush mid-keystroke.
     pub pdf_field_focused: bool,
+    /// (name, pattern) as last persisted — the Library page's dirty check.
+    pub lib_saved: (String, String),
+    /// A Library text field has focus this frame.
+    pub lib_field_focused: bool,
 }
 
 impl Default for SettingsState {
@@ -132,6 +141,8 @@ impl Default for SettingsState {
             pdf_token_set: false,
             pdf_saved: (String::new(), false),
             pdf_field_focused: false,
+            lib_saved: (String::new(), String::new()),
+            lib_field_focused: false,
         }
     }
 }
@@ -149,6 +160,18 @@ pub enum SettingsAction {
     SetPdfPrefs {
         repo: String,
         auto_fetch: bool,
+    },
+    /// Persist the library's name + citekey pattern (vault config, synced).
+    SetLibraryMeta {
+        name: String,
+        pattern: String,
+    },
+    /// Persist the library's workflow toggles (vault config, synced).
+    SetWorkflow {
+        enrich_on_import: bool,
+        auto_commit: bool,
+        /// "skip" / "overwrite" / "rename", or "" for the tool default.
+        on_dup: String,
     },
     /// Store (or clear, with an empty string) the machine-local HF token.
     SetHfToken(String),
@@ -220,6 +243,25 @@ pub fn mark_pdf_clean(st: &mut SettingsState) {
     st.pdf_saved = (st.pdf_repo.trim().to_string(), st.pdf_auto);
 }
 
+/// The unsaved Library name/pattern, if drifted — and mark them saved.
+pub fn take_lib_dirty(st: &mut SettingsState) -> Option<(String, String)> {
+    if !st.seeded {
+        return None;
+    }
+    let cur = (st.name.trim().to_string(), st.pattern.trim().to_string());
+    if cur != st.lib_saved {
+        st.lib_saved = cur.clone();
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+/// After seeding the Library fields, mark them clean.
+pub fn mark_lib_clean(st: &mut SettingsState) {
+    st.lib_saved = (st.name.trim().to_string(), st.pattern.trim().to_string());
+}
+
 /// Render the Settings tool. `dark`/`accent_idx` reflect the live appearance
 /// state; engine/app requests come back in `actions`.
 pub fn settings(
@@ -288,8 +330,8 @@ pub fn settings(
                         })
                         .show(ui, |ui| {
                             widgets::centered_column(ui, 820.0, |ui| match st.view {
-                                SettingsView::Library => lib_view(ui, theme, st),
-                                SettingsView::Workflow => workflow_view(ui, theme, st),
+                                SettingsView::Library => lib_view(ui, theme, st, actions),
+                                SettingsView::Workflow => workflow_view(ui, theme, st, actions),
                                 SettingsView::Ai => ai_view(ui, theme, st, actions),
                                 SettingsView::Pdf => pdf_view(ui, theme, st, actions),
                                 SettingsView::Appearance => {
@@ -334,20 +376,45 @@ pub fn settings(
             actions.push(SettingsAction::SetHfToken(tok));
         }
     }
+    // And the Library page's name/pattern, with the same focus discipline.
+    if st.view != SettingsView::Library {
+        st.lib_field_focused = false;
+    }
+    if !st.lib_field_focused {
+        if let Some((name, pattern)) = take_lib_dirty(st) {
+            actions.push(SettingsAction::SetLibraryMeta { name, pattern });
+        }
+    }
 }
 
 // --------------------------------------------------------------------- views
 
-fn lib_view(ui: &mut egui::Ui, theme: &Theme, st: &mut SettingsState) {
+fn lib_view(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    st: &mut SettingsState,
+    actions: &mut Vec<SettingsAction>,
+) {
     section_title(ui, theme, "Library");
+    if !st.seeded {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Open a library to edit its settings.")
+                .size(14.0)
+                .color(theme.muted),
+        );
+        return;
+    }
+    let mut focused = false;
     row(
         ui,
         theme,
         "Library name",
-        "A label for this library.",
+        "A label for this library — saved to its own config (synced with the library).",
         false,
         |ui| {
-            widgets::text_input(ui, theme, &mut st.name, false);
+            let r = widgets::text_input(ui, theme, &mut st.name, false);
+            focused |= r.has_focus();
         },
     );
     row(
@@ -355,11 +422,12 @@ fn lib_view(ui: &mut egui::Ui, theme: &Theme, st: &mut SettingsState) {
         theme,
         "Citation key pattern",
         "Tokens take an optional .N index; casing follows the token. Imports get this key; Re-key \
-         applies it to existing entries.",
+         applies it to existing entries. Cleared = the built-in default.",
         true,
         |ui| {
             ui.vertical(|ui| {
-                widgets::text_input(ui, theme, &mut st.pattern, true);
+                let r = widgets::text_input(ui, theme, &mut st.pattern, true);
+                focused |= r.has_focus();
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     for tok in [
@@ -385,20 +453,44 @@ fn lib_view(ui: &mut egui::Ui, theme: &Theme, st: &mut SettingsState) {
             });
         },
     );
-    not_persisted_note(ui, theme);
+    st.lib_field_focused = focused;
+    let _ = actions; // edits flush from `settings()` once focus leaves
 }
 
-fn workflow_view(ui: &mut egui::Ui, theme: &Theme, st: &mut SettingsState) {
+fn workflow_view(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    st: &mut SettingsState,
+    actions: &mut Vec<SettingsAction>,
+) {
     section_title(ui, theme, "Workflow");
+    if !st.seeded {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Open a library to edit its workflow.")
+                .size(14.0)
+                .color(theme.muted),
+        );
+        return;
+    }
+    lede(
+        ui,
+        theme,
+        "Saved in the library's own config, so collaborators share one policy. All of these are \
+         off by default — nothing touches the network or your git history uninvited.",
+    );
+    let mut changed = false;
     row(
         ui,
         theme,
         "Enrich on import",
-        "When the browser connector captures an entry, look up a published version automatically.",
+        "After any import (file / DOI / connector), fill each new entry's missing fields from \
+         its DOI (online).",
         false,
         |ui| {
             if widgets::toggle(ui, theme, st.enrich) {
                 st.enrich = !st.enrich;
+                changed = true;
             }
         },
     );
@@ -406,33 +498,66 @@ fn workflow_view(ui: &mut egui::Ui, theme: &Theme, st: &mut SettingsState) {
         ui,
         theme,
         "Auto-commit changes",
-        "Commit to git after each batch of edits so the library has a full history.",
+        "git-commit the vault after every change (no push), so the library keeps a full history.",
         false,
         |ui| {
             if widgets::toggle(ui, theme, st.commit) {
                 st.commit = !st.commit;
+                changed = true;
             }
         },
     );
     row(
         ui,
         theme,
-        "On duplicate capture",
-        "What to do when a captured paper already exists in the library.",
+        "On duplicate import",
+        "What imports do when a cite key already exists, unless a run overrides it explicitly.",
         true,
         |ui| {
             if let Some(i) = widgets::segmented(
                 ui,
                 theme,
-                &[("Ask", None), ("Merge", None), ("Skip", None)],
+                &[
+                    ("Default", None),
+                    ("Skip", None),
+                    ("Overwrite", None),
+                    ("Rename", None),
+                ],
                 st.dupes,
                 false,
             ) {
                 st.dupes = i;
+                changed = true;
             }
         },
     );
-    not_persisted_note(ui, theme);
+    if changed {
+        actions.push(SettingsAction::SetWorkflow {
+            enrich_on_import: st.enrich,
+            auto_commit: st.commit,
+            on_dup: dup_value(st.dupes),
+        });
+    }
+}
+
+/// Map the duplicate-policy segmented index to the stored value.
+pub fn dup_value(idx: usize) -> String {
+    match idx {
+        1 => "skip".into(),
+        2 => "overwrite".into(),
+        3 => "rename".into(),
+        _ => String::new(), // Default — clears the override
+    }
+}
+
+/// Map a stored duplicate policy back to the segmented index.
+pub fn dup_index(on_dup: Option<&str>) -> usize {
+    match on_dup {
+        Some("skip") => 1,
+        Some("overwrite") => 2,
+        Some("rename") => 3,
+        _ => 0,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -968,13 +1093,4 @@ fn token_chip(ui: &mut egui::Ui, theme: &Theme, tok: &str) {
                     .color(theme.text_2),
             );
         });
-}
-
-fn not_persisted_note(ui: &mut egui::Ui, theme: &Theme) {
-    ui.add_space(10.0);
-    ui.label(
-        RichText::new("These fields aren't persisted yet — they preview the planned controls.")
-            .size(11.5)
-            .color(theme.faint),
-    );
 }

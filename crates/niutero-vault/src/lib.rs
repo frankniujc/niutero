@@ -29,7 +29,7 @@ use niutero_bib::{parse, to_bibtex, BibItem};
 use serde::{Deserialize, Serialize};
 
 pub mod registry;
-pub use registry::{AiConfig, ExportTarget, PdfPrefs, Registry, SyncPrefs, VaultRecord};
+pub use registry::{AiConfig, ExportTarget, PdfPrefs, Registry, SyncPrefs, UiPrefs, VaultRecord};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -37,7 +37,10 @@ fn default_schema() -> u32 {
     SCHEMA_VERSION
 }
 
-/// `.niutero/config.toml` — library-level settings.
+/// `.niutero/config.toml` — library-level settings. Everything here travels
+/// WITH the library (synced via git), so it holds the library's properties —
+/// never machine-personal prefs (those live in the registry) and never
+/// secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub name: String,
@@ -48,6 +51,42 @@ pub struct Config {
     /// library, so collaborators share one key convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citekey_pattern: Option<String>,
+    /// HuggingFace **dataset** repo (`user/repo`) this library's PDFs push/pull
+    /// to. Library property (collaborators share the repo); the account token
+    /// stays machine-local in the registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_repo: Option<String>,
+    /// Shared workflow behavior for this library (all default-off so the base
+    /// path stays offline and nothing commits uninvited).
+    #[serde(default, skip_serializing_if = "WorkflowConfig::is_default")]
+    pub workflow: WorkflowConfig,
+}
+
+/// Library-wide workflow toggles (Settings → Workflow). Synced with the
+/// library so collaborators share one policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowConfig {
+    /// After an import, fill missing fields from each new entry's DOI.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enrich_on_import: bool,
+    /// After every library mutation, `git commit` the vault (no push).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_commit: bool,
+    /// Default duplicate policy for imports when none is given explicitly:
+    /// `skip` / `overwrite` / `rename`. `None` = the tool's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_dup: Option<String>,
+    /// After an import, fetch new entries' PDFs when their url is a direct
+    /// `.pdf` or an arXiv abs page.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_fetch_pdf: bool,
+}
+
+impl WorkflowConfig {
+    /// True when all-default, so the table is omitted from `config.toml`.
+    pub fn is_default(&self) -> bool {
+        *self == WorkflowConfig::default()
+    }
 }
 
 impl Config {
@@ -56,6 +95,8 @@ impl Config {
             name: name.into(),
             schema: SCHEMA_VERSION,
             citekey_pattern: None,
+            pdf_repo: None,
+            workflow: WorkflowConfig::default(),
         }
     }
 }
@@ -448,6 +489,32 @@ mod tests {
         assert_eq!(entries(&v.read_items().unwrap()).count(), 1);
         // nothing was written
         assert!(!dir.path().join(".niutero").exists());
+    }
+
+    #[test]
+    fn config_roundtrips_pdf_repo_and_workflow() {
+        let dir = tmp();
+        let mut v = Vault::init(dir.path()).unwrap();
+        // Defaults are omitted on disk entirely.
+        let text = fs::read_to_string(v.config_path()).unwrap();
+        assert!(
+            !text.contains("workflow") && !text.contains("pdf_repo"),
+            "{text}"
+        );
+
+        v.config.pdf_repo = Some("frank/papers".into());
+        v.config.workflow.enrich_on_import = true;
+        v.config.workflow.on_dup = Some("overwrite".into());
+        v.save_sidecar().unwrap();
+        let back = Vault::open(dir.path()).unwrap();
+        assert_eq!(back.config.pdf_repo.as_deref(), Some("frank/papers"));
+        assert!(back.config.workflow.enrich_on_import);
+        assert!(!back.config.workflow.auto_commit);
+        assert_eq!(back.config.workflow.on_dup.as_deref(), Some("overwrite"));
+        // An old config.toml without the new tables still opens (serde defaults).
+        fs::write(v.config_path(), "name = \"old\"\nschema = 1\n").unwrap();
+        let old = Vault::open(dir.path()).unwrap();
+        assert!(old.config.workflow.is_default() && old.config.pdf_repo.is_none());
     }
 
     #[test]

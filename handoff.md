@@ -270,6 +270,43 @@ duplicated private widgets unified into `widgets.rs`.
     auto-fetch/`has_pdf`, CLI `pdf-config` round-trip + offline gates +
     opt-in auto-fetch via an RFC-2606 `.invalid` host).
 
+## 2026-06-10 (third landing) — every setting persists to its proper home
+
+User decisions: appearance → machine-local; workflow → the vault's own config.
+
+- **Vault `config.toml` grew** (synced, collaborators share it): `pdf_repo`
+  (moved out of the machine registry; legacy registry value still honored as
+  a read fallback, cleared on the next set) and `[workflow]`
+  (`enrich_on_import` / `auto_commit` / `on_dup` / `auto_fetch_pdf` — all
+  default-off so the base path stays offline and nothing commits uninvited).
+- **The workflow toggles are real behaviors now**, engine-first:
+  `auto_commit_if_enabled` (commit-only, stats-aware message, fires after
+  every successful CLI mutation incl. sidecar-only ones, and after every GUI
+  mutation via `after_mutation`); `auto_enrich` post-import hook (DOI fill);
+  `default_dup_policy` (import's default when no `--on-dup`); PDF auto-fetch
+  moved onto the same config. GUI imports honor all of them (post-import
+  hooks run off-thread as a task toast).
+- **New CLI `config <vault>`** (get/set name / pattern / the workflow trio,
+  `--json`); `sync-config` shows the `origin` remote read straight from the
+  repo; `import --on-dup` became optional (flag > config > skip);
+  `pdf-config --repo/--auto-fetch` write the vault config now.
+- **Engine**: `set_library_meta` (validated name; pattern stored as given —
+  `KeyPattern::parse` is infallible by design), `set_workflow`, `pdf_repo`
+  resolution (config → legacy), `set_pdf_repo`, `remote_url`, `ui_prefs` /
+  `set_ui_prefs`, `auto_commit_if_enabled`, `auto_enrich`.
+- **Registry** gained `[ui]` (dark + accent — personal, never synced). The
+  GUI loads it at boot and persists on every theme/accent change, so the app
+  reopens looking the way it was left.
+- **GUI Settings**: Library and Workflow pages are fully real (same
+  navigate-away flush as the AI key); the Sync page's Git remote field seeds
+  from the repo; the PDF page reads/writes the vault config; the
+  "not persisted yet" note is gone because nothing needs it anymore. Still
+  visual-only: font pickers, density, settings search, Keymap/Integrations.
+- Tests: 336 passing (+9): vault config/UiPrefs round-trips, engine setter
+  validation + pdf-repo precedence + auto-commit/auto-enrich gating +
+  remote_url, CLI `config` black-box (incl. config.toml contents, on-dup
+  honored by import, auto-commit end-to-end, remote display).
+
 ### Follow-ups (next work, in rough priority)
 
 - **Live AI smoke** (planned right after this landing) + live verification of

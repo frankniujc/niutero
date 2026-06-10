@@ -168,9 +168,10 @@ enum Cmd {
         /// Online: fetch this DOI's BibTeX from doi.org instead of a file.
         #[arg(long)]
         doi: Option<String>,
-        /// What to do when a cite key already exists.
-        #[arg(long = "on-dup", value_enum, default_value_t = OnDup::Skip)]
-        on_dup: OnDup,
+        /// What to do when a cite key already exists. Omitted: the library's
+        /// configured default (`config --on-dup …`), else skip.
+        #[arg(long = "on-dup", value_enum)]
+        on_dup: Option<OnDup>,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -413,6 +414,35 @@ enum Cmd {
         #[command(subcommand)]
         action: ExportTargetAction,
     },
+    /// Show or set the library's own config (`.niutero/config.toml`, synced
+    /// with the library): name, citation-key pattern, and the shared workflow
+    /// toggles. With no flags, prints the current config.
+    Config {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Rename the library.
+        #[arg(long)]
+        name: Option<String>,
+        /// Citation-key pattern (e.g. "{auth}{year}{Title.2}"); "" clears
+        /// back to the built-in default.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// After imports, fill new entries' missing fields from their DOIs
+        /// (online; off by default so imports stay offline).
+        #[arg(long)]
+        enrich_on_import: Option<bool>,
+        /// After every library mutation, git-commit the vault (no push; off
+        /// by default).
+        #[arg(long)]
+        auto_commit: Option<bool>,
+        /// Default duplicate policy for imports when --on-dup isn't given:
+        /// skip / overwrite / rename; "" clears it.
+        #[arg(long)]
+        on_dup: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or set this machine's sync strategy for a vault (pull/push toggles;
     /// machine-local, so each machine can sync differently).
     SyncConfig {
@@ -645,11 +675,69 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     // of any keep-updated export targets afterwards (#45). Captured before the
     // match moves `cli.cmd`.
     let exportable_change = mutated_vault(&cli.cmd);
+    // Any vault mutation (exportable or sidecar-only) is an auto-commit
+    // candidate when the library opted in (`config --auto-commit true`).
+    let commit_target = exportable_change
+        .clone()
+        .or_else(|| sidecar_mutation(&cli.cmd));
     let result = dispatch(cli.cmd);
-    if let (Ok(_), Some(vault)) = (&result, &exportable_change) {
-        refresh_keep_updated(vault);
+    if result.is_ok() {
+        if let Some(vault) = &exportable_change {
+            refresh_keep_updated(vault);
+        }
+        if let Some(vault) = &commit_target {
+            auto_commit_note(vault);
+        }
     }
     result
+}
+
+/// Best-effort post-mutation auto-commit (stderr only — it must never change
+/// the command's exit code or its `--json` stdout).
+fn auto_commit_note(vault: &Path) {
+    let Ok(v) = engine::open(vault) else { return };
+    match engine::auto_commit_if_enabled(&v) {
+        Ok(Some(msg)) => eprintln!("  ✓ auto-committed: {msg}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: auto-commit failed: {e}"),
+    }
+}
+
+/// Commands that mutate only the sidecar / vault config (no exportable-state
+/// change, so no keep-updated refresh) but still dirty the repo for
+/// auto-commit purposes.
+fn sidecar_mutation(cmd: &Cmd) -> Option<PathBuf> {
+    match cmd {
+        Cmd::Note {
+            vault, set, clear, ..
+        } if set.is_some() || *clear => Some(vault.clone()),
+        Cmd::View { vault, action } if !matches!(action, ViewAction::List { .. }) => {
+            Some(vault.clone())
+        }
+        Cmd::Config {
+            vault,
+            name,
+            pattern,
+            enrich_on_import,
+            auto_commit,
+            on_dup,
+            ..
+        } if name.is_some()
+            || pattern.is_some()
+            || enrich_on_import.is_some()
+            || auto_commit.is_some()
+            || on_dup.is_some() =>
+        {
+            Some(vault.clone())
+        }
+        Cmd::PdfConfig {
+            vault,
+            repo,
+            auto_fetch,
+            ..
+        } if repo.is_some() || auto_fetch.is_some() => Some(vault.clone()),
+        _ => None,
+    }
 }
 
 /// The vault whose exportable state a command changes, or `None` for read-only
@@ -862,6 +950,24 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
         Cmd::Recent { json } => cmd_recent(json).map(ok),
         Cmd::Forget { vault } => cmd_forget(&vault).map(ok),
         Cmd::ExportTarget { vault, action } => cmd_export_target(&vault, action).map(ok),
+        Cmd::Config {
+            vault,
+            name,
+            pattern,
+            enrich_on_import,
+            auto_commit,
+            on_dup,
+            json,
+        } => cmd_config(
+            &vault,
+            name,
+            pattern,
+            enrich_on_import,
+            auto_commit,
+            on_dup,
+            json,
+        )
+        .map(ok),
         Cmd::SyncConfig {
             vault,
             pull,
@@ -869,6 +975,63 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             json,
         } => cmd_sync_config(&vault, pull, push, json).map(ok),
     }
+}
+
+fn cmd_config(
+    vault: &Path,
+    name: Option<String>,
+    pattern: Option<String>,
+    enrich_on_import: Option<bool>,
+    auto_commit: Option<bool>,
+    on_dup: Option<String>,
+    json: bool,
+) -> Result<(), String> {
+    let mut v = open_vault(vault)?;
+    if name.is_some() || pattern.is_some() {
+        engine::set_library_meta(&mut v, name.as_deref(), pattern.as_deref())?;
+    }
+    if enrich_on_import.is_some() || auto_commit.is_some() || on_dup.is_some() {
+        engine::set_workflow(
+            &mut v,
+            enrich_on_import,
+            auto_commit,
+            on_dup.as_deref(),
+            None,
+        )?;
+    }
+    let c = &v.config;
+    if json {
+        emit(serde_json::json!({
+            "name": c.name,
+            "citekey_pattern": c.citekey_pattern,
+            "pdf_repo": c.pdf_repo,
+            "workflow": {
+                "enrich_on_import": c.workflow.enrich_on_import,
+                "auto_commit": c.workflow.auto_commit,
+                "on_dup": c.workflow.on_dup,
+                "auto_fetch_pdf": c.workflow.auto_fetch_pdf,
+            },
+        }))?;
+    } else {
+        println!("name:            {}", c.name);
+        println!(
+            "citekey pattern: {}",
+            c.citekey_pattern.as_deref().unwrap_or("(default)")
+        );
+        println!(
+            "pdf repo:        {}",
+            c.pdf_repo.as_deref().unwrap_or("(unset)")
+        );
+        println!("workflow:");
+        println!("  enrich on import: {}", c.workflow.enrich_on_import);
+        println!("  auto-commit:      {}", c.workflow.auto_commit);
+        println!(
+            "  on duplicate:     {}",
+            c.workflow.on_dup.as_deref().unwrap_or("(tool default)")
+        );
+        println!("  auto-fetch pdf:   {}", c.workflow.auto_fetch_pdf);
+    }
+    Ok(())
 }
 
 /// Translate `--query` / `--view` into a [`Filter`], rejecting both at once.
@@ -1419,14 +1582,16 @@ fn cmd_import(
     vault: &Path,
     file: Option<PathBuf>,
     doi: Option<String>,
-    on_dup: OnDup,
+    on_dup: Option<OnDup>,
     json: bool,
 ) -> Result<(), String> {
     let v = open_vault(vault)?;
+    // Explicit flag wins; otherwise the library's configured default; else skip.
     let policy = match on_dup {
-        OnDup::Skip => DupPolicy::Skip,
-        OnDup::Overwrite => DupPolicy::Overwrite,
-        OnDup::Rename => DupPolicy::Rename,
+        Some(OnDup::Skip) => DupPolicy::Skip,
+        Some(OnDup::Overwrite) => DupPolicy::Overwrite,
+        Some(OnDup::Rename) => DupPolicy::Rename,
+        None => engine::default_dup_policy(&v, DupPolicy::Skip),
     };
     let r = match (file, doi) {
         (Some(_), Some(_)) => return Err("use either a .bib file or --doi, not both".into()),
@@ -1434,15 +1599,22 @@ fn cmd_import(
         (None, Some(d)) => engine::import_doi(&v, &d, policy)?,
         (None, None) => return Err("specify a .bib file or --doi".into()),
     };
-    // Post-import PDF auto-fetch (opt-in via `pdf-config --auto-fetch true`;
-    // a no-op without the pref, so the base import path stays offline).
-    // Best-effort, on stderr — it must never corrupt the --json stdout.
+    // Post-import hooks (both opt-in and no-ops without their pref, so the
+    // base import path stays offline). Best-effort, on stderr — they must
+    // never corrupt the --json stdout or fail the import.
     match engine::auto_fetch_pdfs(&v, &r.new_keys()) {
         Ok((fetched, attempted)) if attempted > 0 => {
             eprintln!("  ⤓ auto-fetched {fetched}/{attempted} PDF(s)");
         }
         Ok(_) => {}
         Err(e) => eprintln!("warning: PDF auto-fetch skipped: {e}"),
+    }
+    match engine::auto_enrich(&v, &r.new_keys()) {
+        Ok((filled, attempted)) if attempted > 0 => {
+            eprintln!("  ✚ auto-enriched {filled}/{attempted} entr(ies)");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: auto-enrich skipped: {e}"),
     }
     if json {
         println!(
@@ -1542,7 +1714,7 @@ fn cmd_pdf_config(
     create_repo: bool,
     json: bool,
 ) -> Result<(), String> {
-    let v = open_vault(vault)?;
+    let mut v = open_vault(vault)?;
     let token = if token_stdin {
         let mut line = String::new();
         std::io::stdin()
@@ -1559,30 +1731,28 @@ fn cmd_pdf_config(
     if let Some(t) = token {
         engine::set_hf_token(&t)?;
     }
-    let prefs = if repo.is_some() || auto_fetch.is_some() {
-        engine::update_pdf_prefs(&v, |p| {
-            if let Some(r) = repo {
-                p.repo = r.trim().to_string();
-            }
-            if let Some(a) = auto_fetch {
-                p.auto_fetch = a;
-            }
-        })?
-    } else {
-        engine::pdf_prefs(&v)?
-    };
-    // Create after the prefs land, so `--repo u/r --create-repo` works in one go.
+    // Repo + auto-fetch are LIBRARY properties (.niutero/config.toml, synced):
+    // configure once and every machine/collaborator reads them from the vault.
+    if let Some(r) = repo {
+        engine::set_pdf_repo(&mut v, &r)?;
+    }
+    if let Some(a) = auto_fetch {
+        engine::set_workflow(&mut v, None, None, None, Some(a))?;
+    }
+    // Create after the config lands, so `--repo u/r --create-repo` works in one go.
     let created = if create_repo {
         Some(engine::create_pdf_repo(&v)?)
     } else {
         None
     };
+    let repo_now = engine::pdf_repo(&v)?;
+    let auto_now = engine::pdf_auto_fetch_enabled(&v);
     let token_set = engine::hf_token_set()?;
     if json {
         // The token itself never appears in any output — only whether one is set.
         let mut out = serde_json::json!({
-            "repo": prefs.repo,
-            "auto_fetch": prefs.auto_fetch,
+            "repo": repo_now.clone().unwrap_or_default(),
+            "auto_fetch": auto_now,
             "token_set": token_set,
         });
         if let Some(c) = &created {
@@ -1590,15 +1760,8 @@ fn cmd_pdf_config(
         }
         emit(out)?;
     } else {
-        println!(
-            "repo:       {}",
-            if prefs.repo.is_empty() {
-                "(unset)"
-            } else {
-                &prefs.repo
-            }
-        );
-        println!("auto-fetch: {}", prefs.auto_fetch);
+        println!("repo:       {}", repo_now.as_deref().unwrap_or("(unset)"));
+        println!("auto-fetch: {auto_now}");
         println!(
             "hf token:   {}",
             if token_set {
@@ -2028,13 +2191,21 @@ fn cmd_sync_config(
     } else {
         engine::sync_prefs(&v)?
     };
+    // The remote is read straight from the vault's git repo (set via
+    // `connect`), so an already-configured vault shows it without re-entry.
+    let remote = engine::remote_url(&v);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?
-        );
+        emit(serde_json::json!({
+            "pull": prefs.pull,
+            "push": prefs.push,
+            "remote": remote,
+        }))?;
     } else {
         println!("sync strategy: pull={}, push={}", prefs.pull, prefs.push);
+        println!(
+            "remote:        {}",
+            remote.as_deref().unwrap_or("(none — run `connect`)")
+        );
     }
     Ok(())
 }

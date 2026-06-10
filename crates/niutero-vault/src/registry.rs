@@ -38,6 +38,32 @@ pub struct Registry {
     /// the AI key: a secret must never ride the synced vault into git.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hf_token: String,
+    /// This machine's GUI appearance (theme + accent). Personal — applies to
+    /// every library on this machine and never syncs to collaborators.
+    #[serde(default, skip_serializing_if = "UiPrefs::is_default")]
+    pub ui: UiPrefs,
+}
+
+/// Machine-local GUI appearance prefs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UiPrefs {
+    /// Dark mode (default light).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dark: bool,
+    /// Accent swatch index (0 = the theme's own default green).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub accent: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl UiPrefs {
+    /// True when all-default, so the table is omitted from `vaults.toml`.
+    pub fn is_default(&self) -> bool {
+        *self == UiPrefs::default()
+    }
 }
 
 /// Machine-local LLM settings (Settings → AI assistant). The API key lives here
@@ -439,6 +465,23 @@ mod tests {
         reg.save_to(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "registry must be owner-only, got {mode:o}");
+    }
+
+    #[test]
+    fn ui_prefs_roundtrip_and_defaults_are_omitted() {
+        let dir = tmp();
+        let path = dir.path().join("vaults.toml");
+        let mut reg = Registry::default();
+        reg.save_to(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("[ui]"));
+        reg.ui = UiPrefs {
+            dark: true,
+            accent: 2,
+        };
+        reg.save_to(&path).unwrap();
+        let back = Registry::load_from(&path).unwrap();
+        assert!(back.ui.dark);
+        assert_eq!(back.ui.accent, 2);
     }
 
     #[test]

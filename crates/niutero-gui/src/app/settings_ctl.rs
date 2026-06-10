@@ -27,11 +27,12 @@ impl NiuteroApp {
             }
         }
         if let Some((repo, auto_fetch)) = settings::take_pdf_dirty(&mut self.settings) {
-            if let Some(lib) = self.library.as_ref() {
-                if let Err(e) = engine::update_pdf_prefs(&lib.vault, |p| {
-                    p.repo = repo;
-                    p.auto_fetch = auto_fetch;
-                }) {
+            if let Some(lib) = self.library.as_mut() {
+                if let Err(e) = engine::set_pdf_repo(&mut lib.vault, &repo) {
+                    self.set_toast(format!("Couldn't save the PDF repo: {e}"));
+                } else if let Err(e) =
+                    engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch))
+                {
                     self.set_toast(format!("Couldn't save PDF settings: {e}"));
                 }
             }
@@ -42,6 +43,15 @@ impl NiuteroApp {
             self.settings.pdf_token_set = true;
             if let Err(e) = engine::set_hf_token(&tok) {
                 self.set_toast(format!("Couldn't save the HF token: {e}"));
+            }
+        }
+        if let Some((name, pattern)) = settings::take_lib_dirty(&mut self.settings) {
+            if let Some(lib) = self.library.as_mut() {
+                if let Err(e) =
+                    engine::set_library_meta(&mut lib.vault, Some(&name), Some(&pattern))
+                {
+                    self.set_toast(format!("Couldn't save library settings: {e}"));
+                }
             }
         }
     }
@@ -146,27 +156,40 @@ impl NiuteroApp {
         }
         if let Some(lib) = self.library.as_ref() {
             self.settings.name = lib.vault.config.name.clone();
-            self.settings.pattern = lib
-                .vault
-                .config
-                .citekey_pattern
-                .clone()
-                .unwrap_or_else(|| "{auth}{year}{title.1}{Title.2}".into());
-            // PDF prefs are per-vault, so they seed with the vault fields.
-            if let Ok(p) = engine::pdf_prefs(&lib.vault) {
-                self.settings.pdf_repo = p.repo;
-                self.settings.pdf_auto = p.auto_fetch;
-            }
+            // The pattern field shows exactly what's stored; empty = default.
+            self.settings.pattern = lib.vault.config.citekey_pattern.clone().unwrap_or_default();
+            // Workflow toggles seed from the library's own config.
+            let w = &lib.vault.config.workflow;
+            self.settings.enrich = w.enrich_on_import;
+            self.settings.commit = w.auto_commit;
+            self.settings.dupes = settings::dup_index(w.on_dup.as_deref());
+            // The git remote is read straight from the repo — an
+            // already-connected vault shows it without re-entry.
+            self.settings.remote = engine::remote_url(&lib.vault).unwrap_or_default();
+            // PDF: repo/auto-fetch live in the vault config (legacy registry
+            // values still honored by the resolution fns).
+            self.settings.pdf_repo = engine::pdf_repo(&lib.vault)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            self.settings.pdf_auto = engine::pdf_auto_fetch_enabled(&lib.vault);
             self.settings.pdf_token_set = engine::hf_token_set().unwrap_or(false);
             self.settings.seeded = true;
             settings::mark_pdf_clean(&mut self.settings);
+            settings::mark_lib_clean(&mut self.settings);
         }
     }
 
     fn apply_settings_action(&mut self, action: SettingsAction, ctx: &egui::Context) {
         match action {
-            SettingsAction::SetTheme(dark) => self.dark = dark,
-            SettingsAction::SetAccent(i) => self.accent_idx = i,
+            SettingsAction::SetTheme(dark) => {
+                self.dark = dark;
+                self.persist_ui_prefs();
+            }
+            SettingsAction::SetAccent(i) => {
+                self.accent_idx = i;
+                self.persist_ui_prefs();
+            }
             SettingsAction::SetGitRemote(url) => {
                 let r = self
                     .library
@@ -188,12 +211,41 @@ impl NiuteroApp {
             }
             SettingsAction::TestAi => self.start_ai_test(ctx),
             SettingsAction::SetPdfPrefs { repo, auto_fetch } => {
-                if let Some(lib) = self.library.as_ref() {
-                    if let Err(e) = engine::update_pdf_prefs(&lib.vault, |p| {
-                        p.repo = repo;
-                        p.auto_fetch = auto_fetch;
-                    }) {
+                if let Some(lib) = self.library.as_mut() {
+                    // Repo + auto-fetch are library properties now (synced
+                    // config.toml), not machine prefs.
+                    if let Err(e) = engine::set_pdf_repo(&mut lib.vault, &repo) {
+                        self.toast = Some(format!("Couldn't save the PDF repo: {e}"));
+                    } else if let Err(e) =
+                        engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch))
+                    {
                         self.toast = Some(format!("Couldn't save PDF settings: {e}"));
+                    }
+                }
+            }
+            SettingsAction::SetLibraryMeta { name, pattern } => {
+                if let Some(lib) = self.library.as_mut() {
+                    match engine::set_library_meta(&mut lib.vault, Some(&name), Some(&pattern)) {
+                        // The titlebar shows vault.config.name — updated in place.
+                        Ok(()) => {}
+                        Err(e) => self.toast = Some(format!("Couldn't save library settings: {e}")),
+                    }
+                }
+            }
+            SettingsAction::SetWorkflow {
+                enrich_on_import,
+                auto_commit,
+                on_dup,
+            } => {
+                if let Some(lib) = self.library.as_mut() {
+                    if let Err(e) = engine::set_workflow(
+                        &mut lib.vault,
+                        Some(enrich_on_import),
+                        Some(auto_commit),
+                        Some(&on_dup),
+                        None,
+                    ) {
+                        self.toast = Some(format!("Couldn't save workflow settings: {e}"));
                     }
                 }
             }

@@ -153,8 +153,9 @@ fn extract_text(raw: &str) -> Result<String, String> {
 // Same transport discipline as the LLM path: the token rides a `-K -` curl
 // config on stdin — never argv, never disk.
 
-/// Is `repo` a plausible `user/repo` dataset id? Pure.
-fn valid_hf_repo(repo: &str) -> bool {
+/// Is `repo` a plausible `user/repo` dataset id? Pure. Public so the engine
+/// can validate a repo at config-set time, not just at call time.
+pub fn valid_hf_repo(repo: &str) -> bool {
     let mut parts = repo.split('/');
     matches!(
         (parts.next(), parts.next(), parts.next()),
