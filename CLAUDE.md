@@ -63,6 +63,11 @@ Optional features (git sync, normalization, online enrich, import-by-DOI, LaTeX
 tex-scan, LLM, PDF, browser connector) layer on later and must stay off the base
 path: the core must work fully offline with all of them disabled.
 
+The browser connector's client — a Manifest V3 Chrome extension — lives in
+`extension/` (plain JS, not a workspace crate). It is a thin client too: it only
+POSTs to the loopback `connector` endpoints, so it can do nothing the connector
+can't. DOIs resolve server-side (the extension stays loopback-only).
+
 ## Commands
 
 All `niutero-cli` subcommands take the vault folder as the first positional arg

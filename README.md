@@ -30,6 +30,10 @@ use niutero still gets a clean, tool-agnostic bibliography.
   3-way merge that auto-resolves entry/field-level conflicts in `references.bib`.
 - **Maintain**: per-entry git `history`, an offline `analyze` health report, and
   duplicate detection + merge (`dedupe`).
+- **Capture from the browser**: `connector` runs a token-gated loopback server,
+  and a Manifest V3 Chrome extension (`extension/`) grabs the citation on the
+  page you're viewing — DOI pages resolve to canonical BibTeX server-side, others
+  build from the page's `citation_*` meta tags. Talks only to `127.0.0.1`.
 
 ## Quick start
 

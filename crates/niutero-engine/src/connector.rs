@@ -2,16 +2,24 @@
 //! by a browser extension and adds it to the vault via [`crate::capture`].
 //!
 //! It binds `127.0.0.1` only and speaks just enough HTTP/1.1 by hand (no
-//! dependency, the same spirit as shelling out elsewhere). The *extension* (the
-//! browser-side JS that POSTs a page's citation here) is out of scope for this
-//! crate; this is the endpoint it talks to. Everything but the actual socket
-//! accept loop is pure and unit-tested, and the loop itself is covered by a
-//! loopback integration test.
+//! dependency, the same spirit as shelling out elsewhere). The browser-side JS
+//! that POSTs a page's citation here lives in `extension/` at the repo root (a
+//! Manifest V3 Chrome extension); this crate is just the endpoint it talks to.
+//! Everything but the actual socket accept loop is pure and unit-tested, and
+//! the loop itself is covered by a loopback integration test.
 //!
-//! **Hardening.** The mutating route (`POST /capture`) requires the per-session
-//! bearer token the server was started with — loopback alone is not an
-//! authorization boundary (any web page or local process can hit 127.0.0.1, so
-//! without the token a malicious page could inject entries into the library).
+//! Two mutating routes, both token-gated and both merging with
+//! [`crate::DupPolicy::Skip`]:
+//! - `POST /capture` — body is BibTeX (the extension built it from the page's
+//!   `citation_*` meta tags). Resolved offline by [`crate::capture`].
+//! - `POST /capture/doi` — body is a bare DOI; resolved server-side to canonical
+//!   BibTeX via [`crate::import_doi`] (doi.org). This keeps the extension's host
+//!   permissions to loopback only — it never has to reach the network itself.
+//!
+//! **Hardening.** Both mutating routes require the per-session bearer token the
+//! server was started with — loopback alone is not an authorization boundary
+//! (any web page or local process can hit 127.0.0.1, so without the token a
+//! malicious page could inject entries into the library).
 //! No CORS-allow headers are emitted: the extension talks to us with host
 //! permissions (exempt from CORS), and a random page's script must NOT be able
 //! to read responses. Bodies are capped and sockets time out, so one slow or
@@ -107,30 +115,29 @@ fn route(v: &Vault, req: &Request, token: &str) -> (&'static str, String) {
         ("OPTIONS", _) => ("204 No Content", String::new()),
         ("POST", "/capture") => {
             if !token_matches(req.auth.as_deref(), token) {
-                (
-                    "401 Unauthorized",
-                    json_error("missing or wrong connector token"),
-                )
+                unauthorized()
             } else {
                 match crate::capture(v, &req.body) {
-                    Ok(r) => {
-                        // A capture mutates references.bib, but it happens inside this
-                        // server loop — never on the CLI's run()-level path — so the
-                        // post-mutation work (keep-updated exports, the opt-in
-                        // workflow hooks) must run here. All best-effort: a stale
-                        // mirror or failed hook must not fail the capture (the HTTP
-                        // body is the capture's machine output).
-                        if r.added > 0 {
-                            refresh_after_capture(v);
-                            run_capture_hooks(v, &r);
-                        }
-                        capture_note = format!(" (added {}, skipped {})", r.added, r.skipped);
-                        (
-                            "200 OK",
-                            format!("{{\"added\":{},\"skipped\":{}}}", r.added, r.skipped),
-                        )
-                    }
+                    Ok(r) => finish_capture(v, &r, &mut capture_note),
                     Err(e) => ("400 Bad Request", json_error(&e)),
+                }
+            }
+        }
+        ("POST", "/capture/doi") => {
+            if !token_matches(req.auth.as_deref(), token) {
+                unauthorized()
+            } else {
+                let doi = req.body.trim();
+                if doi.is_empty() {
+                    ("400 Bad Request", json_error("no DOI in the request body"))
+                } else {
+                    // Server-side resolution: the engine's tested doi.org path
+                    // turns the DOI into canonical BibTeX, so the extension never
+                    // touches the network — its only host is this loopback port.
+                    match crate::import_doi(v, doi, crate::DupPolicy::Skip) {
+                        Ok(r) => finish_capture(v, &r, &mut capture_note),
+                        Err(e) => ("400 Bad Request", json_error(&e)),
+                    }
                 }
             }
         }
@@ -144,6 +151,32 @@ fn route(v: &Vault, req: &Request, token: &str) -> (&'static str, String) {
         req.path
     );
     (status, body)
+}
+
+/// The shared tail of a successful capture (BibTeX or DOI). A capture mutates
+/// references.bib inside this server loop — never on the CLI's run()-level path
+/// — so the post-mutation work (keep-updated exports, the opt-in workflow hooks)
+/// must run here. All best-effort: a stale mirror or a failed hook must not fail
+/// the capture (the HTTP body is the capture's machine output). Sets the debug
+/// `note` and returns the 200 body.
+fn finish_capture(v: &Vault, r: &crate::ImportReport, note: &mut String) -> (&'static str, String) {
+    if r.added > 0 {
+        refresh_after_capture(v);
+        run_capture_hooks(v, r);
+    }
+    *note = format!(" (added {}, skipped {})", r.added, r.skipped);
+    (
+        "200 OK",
+        format!("{{\"added\":{},\"skipped\":{}}}", r.added, r.skipped),
+    )
+}
+
+/// The 401 both mutating routes return when the token is missing or wrong.
+fn unauthorized() -> (&'static str, String) {
+    (
+        "401 Unauthorized",
+        json_error("missing or wrong connector token"),
+    )
 }
 
 /// Constant-time-ish token comparison (no early exit on the first wrong
@@ -445,6 +478,41 @@ mod tests {
         // Nothing was added either time.
         let reopened = crate::open(dir.path()).unwrap();
         assert!(crate::show(&reopened, "evil").is_err());
+    }
+
+    #[test]
+    fn capture_doi_without_the_token_is_refused() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let v = crate::init(dir.path()).unwrap();
+        let body = "10.1145/3292500.3330701";
+        let response = one_shot(
+            v,
+            "tok123",
+            format!(
+                "POST /capture/doi HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        // 401 before any network call — a missing token never reaches doi.org.
+        assert!(response.starts_with("HTTP/1.1 401"), "got: {response}");
+    }
+
+    #[test]
+    fn capture_doi_with_an_empty_body_is_400_before_any_network() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let v = crate::init(dir.path()).unwrap();
+        // Authorized but empty: rejected up front, so the test stays offline.
+        let response = one_shot(
+            v,
+            "tok123",
+            "POST /capture/doi HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tok123\r\n\
+             Content-Length: 0\r\n\r\n"
+                .to_string(),
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+        assert!(response.contains("no DOI"), "got: {response}");
     }
 
     #[test]

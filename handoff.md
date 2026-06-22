@@ -348,11 +348,48 @@ before pushing:
   initializes `env_logger`; secrets are never logged), plus assorted
   stale-doc / dead-code cleanup.
 
+## 2026-06-22 — browser extension (connector client) built
+
+The browser connector finally has its client: a **Manifest V3 Chrome extension
+in `extension/`** (plain JS, not a workspace crate). It captures the citation on
+the active tab and POSTs it to the local connector. It is a thin client — it
+only talks to the loopback endpoints, so it can do nothing the connector can't.
+
+- **Architecture decision: the extension talks ONLY to `127.0.0.1`.** DOIs
+  resolve server-side: the extension extracts a DOI (publisher meta, JSON-LD,
+  arXiv→DataCite) and POSTs the bare DOI to the **new `POST /capture/doi`**
+  route, which calls the engine's tested `import_doi` (doi.org). Non-DOI pages
+  build BibTeX from Highwire `citation_*` / Dublin Core meta tags locally and
+  POST it to `/capture`. This keeps `host_permissions` to loopback only and
+  reuses the engine's canonical-BibTeX path. Page access is `activeTab` +
+  `chrome.scripting.executeScript` (no broad content script).
+- **Engine change** (`crates/niutero-engine/src/connector.rs`): added
+  `/capture/doi`; refactored the shared post-capture tail into `finish_capture`
+  (runs the keep-updated refresh + opt-in hooks only when `added > 0`) and the
+  401 into `unauthorized()`. 2 new offline-safe tests (401, empty-DOI 400) —
+  connector suite now 9. The DOI happy-path needs the network, so it's covered
+  by the existing `import_doi` path, not a connector unit test.
+- **Extension layout**: `manifest.json`, `background.js` (service worker),
+  `popup.*`, `options.*`, `lib/{extract,bibtex,connector,config,capture}.js`,
+  generated `icons/*.png` (pure-stdlib `gen-icons.py`), `README.md`. The pure
+  BibTeX builder has `node --test` coverage (`test/bibtex.test.mjs`, 7 tests).
+- **Reviewed by a 5-dimension adversarial workflow; all 5 confirmed findings
+  fixed**: (HIGH) authors were doubled when a page emitted both Highwire and
+  Dublin Core author tags → pick one source by precedence + dedup; digit-leading
+  cite keys → `ref`-prefix guard; JSON-LD `@graph`/array-`sameAs`/`identifier`
+  DOIs now found; `hasMeta` now accepts conference/booktitle pages; SICI DOIs no
+  longer truncated at `<`. Also removed the unused `localhost` host permission.
+- **Install**: `chrome://extensions` → Developer mode → Load unpacked →
+  `extension/`. Start `niutero-cli connector <vault>`, paste the printed token
+  into the extension's Options. **Not yet verified in a live browser** (no Chrome
+  load on this dev machine) — the logic is unit-tested and the connector route
+  is integration-tested, but an end-to-end capture from a real page is untested.
+
 ### Follow-ups (next work, in rough priority)
 
-- **Live AI smoke** (planned right after this landing) + live verification of
-  the DOI / enrich / connector / PDF network paths — now including the HF
-  create-repo / push / pull trio — still manually-verified-only.
+- **Live AI smoke** + live verification of the DOI / enrich / connector / PDF
+  network paths — now including the HF create-repo / push / pull trio and a
+  **real-browser end-to-end test of the extension** — still manually-verified-only.
 - **Normalize ruleset engine API** — the GUI's ruleset toggles are still
   display-only; the engine has no ruleset read/write.
 - **Vault-config setters** — library name / citekey pattern (Settings fields

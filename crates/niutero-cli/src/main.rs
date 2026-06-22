@@ -1707,10 +1707,14 @@ fn cmd_enrich(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
 fn cmd_connector(vault: &Path, port: u16, token: Option<String>) -> Result<(), String> {
     let v = open_vault(vault)?;
     let token = token.unwrap_or_else(engine::connector_token);
-    println!("Browser connector listening on http://127.0.0.1:{port}  (POST BibTeX to /capture; Ctrl-C to stop)");
+    println!("Browser connector listening on http://127.0.0.1:{port}  (Ctrl-C to stop)");
+    println!("  POST BibTeX to /capture, or a bare DOI to /capture/doi");
     println!("session token: {token}");
     println!(
         "  captures must send it as 'Authorization: Bearer {token}' or 'X-Niutero-Token: {token}'"
+    );
+    println!(
+        "  paste the token into the niutero browser extension (extension/) to capture by click"
     );
     engine::serve_connector(&v, port, &token)
 }

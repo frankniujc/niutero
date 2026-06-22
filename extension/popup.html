@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand">niutero</span>
+      <span id="conn" class="dot" title="connector status"></span>
+    </header>
+
+    <div id="detect" class="detect">Reading this page…</div>
+
+    <button id="capture" class="primary" disabled>Capture citation</button>
+
+    <div id="status" class="status" hidden></div>
+
+    <footer><a id="opts" href="#">Options</a></footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
