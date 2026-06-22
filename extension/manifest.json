@@ -1,14 +1,13 @@
 {
   "manifest_version": 3,
   "name": "niutero connector",
-  "version": "1.0.0",
-  "description": "Capture the citation on the current page and send it to your local niutero library.",
+  "version": "2.0.0",
+  "description": "Save the current page's reference into the niutero library you have open.",
   "minimum_chrome_version": "102",
-  "permissions": ["activeTab", "scripting", "storage", "contextMenus", "notifications"],
-  "host_permissions": ["http://127.0.0.1/*"],
-  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1:23510/*"],
   "action": {
-    "default_title": "Capture citation to niutero",
+    "default_title": "Save to niutero",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",
@@ -17,17 +16,16 @@
       "128": "icons/icon-128.png"
     }
   },
-  "options_ui": { "page": "options.html", "open_in_tab": true },
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-  "commands": {
-    "capture": {
-      "suggested_key": { "default": "Alt+Shift+S" },
-      "description": "Capture this page's citation to niutero"
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "niutero-connector@niutero.local",
+      "strict_min_version": "115.0"
     }
   }
 }

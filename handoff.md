@@ -348,7 +348,61 @@ before pushing:
   initializes `env_logger`; secrets are never logged), plus assorted
   stale-doc / dead-code cleanup.
 
-## 2026-06-22 — browser extension (connector client) built
+## 2026-06-23 — connector rebuilt (no token, GUI-hosted, normalize-on-import)
+
+**This supersedes the 2026-06-22 design below** (`POST /capture` + `/capture/doi`
++ a per-session token + the `background.js`/`options.*`/`lib/*` extension). The
+connector was rebuilt from scratch, modeled on the older `../niutero` design
+(read as a design reference only; no code copied), because the token + separate
+`niutero-cli connector <vault>` process was clumsy.
+
+- **No token.** Zotero-Connector-style security in `connector.rs`: bind
+  `127.0.0.1` only, require a loopback `Host` (anti DNS-rebinding) + an extension
+  `Origin` (`*-extension://`; anti CSRF), emit no CORS. Other local processes are
+  out of the threat model, on purpose.
+- **GUI hosts the server while open** (`app/mod.rs` `ConnectorState` +
+  `sync_connector`), importing into the **currently-open** library — no separate
+  process, no path argument. Toggle: Settings → Sync & sharing → Browser
+  connector (persisted machine-local in `UiPrefs::connector_enabled`); a live
+  status line shows the bound port. `niutero-cli connector <vault>` still hosts
+  the same server headless (parks the main thread).
+- **Routes:** `GET /ping` → `{app,ok,version,library}`; `POST /import`
+  `{identifier?, metadata?, tags?}`. The **server** resolves: a DOI / `arXiv:<id>`
+  via the engine's tested `import_doi` (doi.org → canonical BibTeX), else it
+  builds a `BibEntry` from scraped meta (`build_entry_from_metadata`, keyed by
+  the library's pattern at the **base** key so re-captures dedupe). Merges with
+  the vault's dup policy; applies tags; runs the import hooks.
+- **normalize-on-import** (user request): new `[workflow] normalize_on_import`
+  toggle (vault `config.toml`, synced, default off). `normalize_apply_keys` +
+  `auto_normalize` normalize **only** the new entries; wired into every import
+  path (connector, CLI file/DOI, GUI DOI + `start_post_import`).
+- **Extension** slimmed to the old design's shape: `manifest.json`, `popup.*`,
+  `scrape.js`, `gen-icons.py`, `icons/`, `README.md` (no token / options /
+  background SW / lib). `scrape.js` returns `{identifier, metadata}`; the popup
+  pings (shows the open library), POSTs, shows the result. Chrome **and Firefox**.
+  The BibTeX builder moved to Rust, so the prior review's robustness fixes live
+  in `scrape.js` (author single-scheme dedup, JSON-LD `@graph`/array-`sameAs`/
+  `identifier`, SICI DOI, arXiv id+version).
+- **Removed**: the dead `engine::capture()`, the old `serve_connector` /
+  `connector_token` exports, the `/capture` + `/capture/doi` routes.
+- **Verified end-to-end via curl** (offline + live): `/ping` reports the library;
+  a bad `Host` and a web `Origin` both get 403; a metadata `POST /import` adds +
+  dedupes a re-capture + applies tags; **a live DOI import resolved
+  `10.1145/3292500.3330701` → canonical CrossRef BibTeX**. Engine connector
+  suite: 9 tests. Still **not exercised in a real browser** (no Chrome on this
+  dev machine) — load `extension/` unpacked to finish that.
+- **Reviewed by a 5-dimension adversarial workflow.** Fixed: the metadata import
+  branch wrote `references.bib` **without the vault lock** (lost-update race vs a
+  concurrent writer) — now locks around build+merge like `import_doi`; README's
+  "token-gated" line; a misleading error-clear comment.
+- **Known limitation (low):** while the GUI hosts the connector, a user sidecar
+  edit (tags/note/status/stars) in the *same frame* a capture lands can clobber
+  the just-captured entry's connector **tags** (not the entry, not the `.bib` —
+  those re-read under the lock). Narrow (~ms, needs two simultaneous edits); the
+  real fix is to make the engine's sidecar ops re-read `meta.json` under the lock
+  before writing. Deferred.
+
+## 2026-06-22 — browser extension (connector client) built  [SUPERSEDED 2026-06-23]
 
 The browser connector finally has its client: a **Manifest V3 Chrome extension
 in `extension/`** (plain JS, not a workspace crate). It captures the citation on

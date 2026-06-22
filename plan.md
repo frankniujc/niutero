@@ -120,9 +120,14 @@ niutero ai organize <vault> [--instructions S | --plan FILE] [--apply] [--json]
   are always advisory — a tag exists only on entries. Exit codes: `0` ok /
   `1` error.
 
-**Connector hardening** — `niutero connector` prints a per-session token;
-`POST /capture` requires it (`Authorization: Bearer <t>` or `X-Niutero-Token`),
-wildcard CORS is gone, bodies are capped at 512 KB, sockets have timeouts.
+**Connector** — a loopback server (the GUI hosts it while open; `niutero
+connector <vault>` hosts it headless). No token: Zotero-Connector-style
+security — bind `127.0.0.1` only, require a loopback `Host` (anti
+DNS-rebinding) and an extension `Origin` (anti CSRF), emit no CORS. Routes:
+`GET /ping` and `POST /import {identifier?, metadata?, tags?}`; the server
+resolves a DOI/arXiv id (doi.org) or builds from scraped metadata, merges with
+the vault's dup policy, and runs the import hooks. Bodies capped, sockets time
+out. The browser-side client is the MV3 extension in `extension/`.
 
 **Library config** — `.niutero/config.toml` is the library's own, synced
 settings file; `config` is its CLI view:
@@ -175,7 +180,7 @@ state), `analyze` (offline health report), `dedupe [--merge]`,
 `sync-config` (machine-local pull/push toggles), `recent` / `forget` (registry),
 `suggest-tags` (LLM, needs `ai config --enable true`), `enrich` (DOI fill),
 `import --doi`, `pdf [--attach|--fetch]`, `cite`, `connect`. Browser capture is
-the connector's `POST /capture` endpoint, not a subcommand.
+the connector's `POST /import` endpoint, not a subcommand.
 
 ## Testing (this is the point of Phase 1)
 

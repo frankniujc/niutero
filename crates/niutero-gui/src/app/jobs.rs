@@ -244,6 +244,11 @@ impl NiuteroApp {
                             extra.push_str(&format!(" · enriched {f}/{a}"));
                         }
                     }
+                    if let Ok(n) = engine::auto_normalize(&v, &keys) {
+                        if n > 0 {
+                            extra.push_str(&format!(" · normalized {n}"));
+                        }
+                    }
                 }
                 Ok((rep, extra))
             }) {
@@ -278,6 +283,7 @@ impl NiuteroApp {
         };
         if !engine::pdf_auto_fetch_enabled(&lib.vault)
             && !lib.vault.config.workflow.enrich_on_import
+            && !lib.vault.config.workflow.normalize_on_import
         {
             return;
         }
@@ -294,6 +300,10 @@ impl NiuteroApp {
                 let (f, a) = engine::auto_enrich(&v, &keys)?;
                 if a > 0 {
                     parts.push(format!("enriched {f}/{a}"));
+                }
+                let n = engine::auto_normalize(&v, &keys)?;
+                if n > 0 {
+                    parts.push(format!("normalized {n}"));
                 }
                 Ok(if parts.is_empty() {
                     "nothing applicable".to_string()

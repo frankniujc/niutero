@@ -75,7 +75,8 @@ impl NiuteroApp {
             return;
         };
         let r = engine::set_pdf_repo(&mut lib.vault, &repo).and_then(|()| {
-            engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch)).map(|_| ())
+            engine::set_workflow(&mut lib.vault, None, None, None, Some(auto_fetch), None)
+                .map(|_| ())
         });
         match r {
             Ok(()) => self.after_mutation(),
@@ -101,7 +102,7 @@ impl NiuteroApp {
     }
 
     /// Persist the library's workflow toggles (synced config).
-    fn persist_workflow(&mut self, enrich: bool, commit: bool, on_dup: String) {
+    fn persist_workflow(&mut self, enrich: bool, commit: bool, on_dup: String, normalize: bool) {
         let Some(lib) = self.library.as_mut() else {
             return;
         };
@@ -111,6 +112,7 @@ impl NiuteroApp {
             Some(commit),
             Some(&on_dup),
             None,
+            Some(normalize),
         ) {
             Ok(_) => self.after_mutation(),
             Err(e) => {
@@ -258,6 +260,7 @@ impl NiuteroApp {
             let w = &lib.vault.config.workflow;
             self.settings.enrich = w.enrich_on_import;
             self.settings.commit = w.auto_commit;
+            self.settings.normalize = w.normalize_on_import;
             self.settings.dupes = settings::dup_index(w.on_dup.as_deref());
             // The git remote is read straight from the repo — an
             // already-connected vault shows it without re-entry.
@@ -312,9 +315,17 @@ impl NiuteroApp {
                 enrich_on_import,
                 auto_commit,
                 on_dup,
-            } => self.persist_workflow(enrich_on_import, auto_commit, on_dup),
+                normalize_on_import,
+            } => self.persist_workflow(enrich_on_import, auto_commit, on_dup, normalize_on_import),
             SettingsAction::SetHfToken(tok) => self.persist_token(tok, false),
             SettingsAction::CreatePdfRepo => self.start_create_pdf_repo(ctx),
+            SettingsAction::SetConnectorEnabled(on) => {
+                // The actual start/stop happens next frame in `sync_connector`;
+                // here we just flip the flag and persist it (machine-local).
+                self.connector.enabled = on;
+                self.connector.error = None; // a fresh attempt clears a prior failure
+                self.persist_ui_prefs();
+            }
             SettingsAction::Toast(m) => self.toast = Some(m),
         }
     }

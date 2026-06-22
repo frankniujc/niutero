@@ -76,6 +76,7 @@ pub struct SettingsState {
     pub remote: String,
     pub enrich: bool,
     pub commit: bool,
+    pub normalize: bool,
     pub dupes: usize,
     pub density: usize,
     pub seeded: bool,
@@ -111,6 +112,10 @@ pub struct SettingsState {
     pub lib_saved: (String, String),
     /// A Library text field has focus this frame.
     pub lib_field_focused: bool,
+    /// Browser connector: the machine-local "run while open" toggle and a live
+    /// status line, both pushed in each frame by the app (read-only here).
+    pub connector_enabled: bool,
+    pub connector_status: String,
 }
 
 impl Default for SettingsState {
@@ -123,6 +128,7 @@ impl Default for SettingsState {
             remote: String::new(),
             enrich: true,
             commit: true,
+            normalize: false,
             dupes: 0,
             density: 0,
             seeded: false,
@@ -144,6 +150,8 @@ impl Default for SettingsState {
             pdf_field_focused: false,
             lib_saved: (String::new(), String::new()),
             lib_field_focused: false,
+            connector_enabled: false,
+            connector_status: String::new(),
         }
     }
 }
@@ -181,11 +189,15 @@ pub enum SettingsAction {
         auto_commit: bool,
         /// "skip" / "overwrite" / "rename", or "" for the tool default.
         on_dup: String,
+        normalize_on_import: bool,
     },
     /// Store (or clear, with an empty string) the machine-local HF token.
     SetHfToken(String),
     /// Create the vault's HF dataset repo (online, off-thread).
     CreatePdfRepo,
+    /// Run (or stop) the browser-connector server while the app is open
+    /// (machine-local toggle).
+    SetConnectorEnabled(bool),
     Toast(String),
 }
 
@@ -529,6 +541,20 @@ fn workflow_view(
     row(
         ui,
         theme,
+        "Normalize on import",
+        "After any import (file / DOI / connector), apply the library's normalization ruleset to \
+         the new entries only (offline).",
+        false,
+        |ui| {
+            if widgets::toggle(ui, theme, st.normalize) {
+                st.normalize = !st.normalize;
+                changed = true;
+            }
+        },
+    );
+    row(
+        ui,
+        theme,
         "On duplicate import",
         "What imports do when a cite key already exists, unless a run overrides it explicitly.",
         true,
@@ -555,6 +581,7 @@ fn workflow_view(
             enrich_on_import: st.enrich,
             auto_commit: st.commit,
             on_dup: dup_value(st.dupes),
+            normalize_on_import: st.normalize,
         });
     }
 }
@@ -714,20 +741,40 @@ fn sync_view(
         ui,
         theme,
         "Browser connector",
-        "Local port the capture extension talks to.",
+        "Run a local capture server while niutero is open, so the browser extension \
+         saves references into the library you have open. No token — loopback only.",
         false,
         |ui| {
-            ui.horizontal(|ui| {
-                let dot = ui
-                    .allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover())
-                    .0;
-                ui.painter().circle_filled(dot.center(), 4.0, theme.accent);
-                ui.label(
-                    RichText::new("127.0.0.1:23510")
-                        .font(theme::mono(13.0))
-                        .color(theme.text_2),
-                );
-            });
+            if widgets::toggle(ui, theme, st.connector_enabled) {
+                actions.push(SettingsAction::SetConnectorEnabled(!st.connector_enabled));
+            }
+        },
+    );
+    row(
+        ui,
+        theme,
+        "Connector status",
+        "Whether the capture server is listening (and on which loopback port).",
+        false,
+        |ui| {
+            let up = st.connector_status.starts_with("Listening");
+            let dot = ui
+                .allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover())
+                .0;
+            ui.painter().circle_filled(
+                dot.center(),
+                4.0,
+                if up { theme.accent } else { theme.muted },
+            );
+            ui.label(
+                RichText::new(if st.connector_status.is_empty() {
+                    "Off"
+                } else {
+                    &st.connector_status
+                })
+                .font(theme::mono(13.0))
+                .color(theme.text_2),
+            );
         },
     );
     row(

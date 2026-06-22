@@ -6,19 +6,13 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <header>
-      <span class="brand">niutero</span>
-      <span id="conn" class="dot" title="connector status"></span>
-    </header>
-
-    <div id="detect" class="detect">Reading this page…</div>
-
-    <button id="capture" class="primary" disabled>Capture citation</button>
-
-    <div id="status" class="status" hidden></div>
-
-    <footer><a id="opts" href="#">Options</a></footer>
-
-    <script type="module" src="popup.js"></script>
+    <header><span class="brand">niutero</span></header>
+    <div id="conn" class="status muted">Checking…</div>
+    <div id="detected" class="detected">Reading this page…</div>
+    <label class="lbl" for="tags">Tags (comma-separated)</label>
+    <input id="tags" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. nlp, to-read" />
+    <button id="save" class="primary" disabled>Save to niutero</button>
+    <div id="result" class="status"></div>
+    <script src="popup.js"></script>
   </body>
 </html>

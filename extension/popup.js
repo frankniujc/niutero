@@ -1,117 +1,123 @@
-import { extractCitation } from "./lib/extract.js";
-import { getConfig } from "./lib/config.js";
-import { health } from "./lib/connector.js";
+"use strict";
+
+// Single source of truth for the endpoint. Must match niutero-server's
+// DEFAULT_PORT (the Rust `connector::DEFAULT_PORT`) and the manifest
+// "host_permissions". Change all three together if you change the port.
+const NIUTERO = "http://127.0.0.1:23510";
+
+// Firefox exposes promise-based `browser.*`; Chrome uses `chrome.*` (also
+// promise-based for tabs/scripting in MV3). This works on both.
+const api = typeof browser !== "undefined" ? browser : chrome;
 
 const $ = (id) => document.getElementById(id);
+let scraped = null;
 
-async function activeTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab;
+function setStatus(id, text, cls) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "status " + (cls || "muted");
 }
 
-async function init() {
-  $("opts").addEventListener("click", (e) => {
-    e.preventDefault();
-    chrome.runtime.openOptionsPage();
-  });
-  $("capture").addEventListener("click", onCapture);
-
-  const cfg = await getConfig();
-
-  // Connector reachability dot (non-blocking).
-  health(cfg).then((up) => {
-    const dot = $("conn");
-    dot.classList.toggle("up", up);
-    dot.classList.toggle("down", !up);
-    dot.title = up
-      ? `connector up on 127.0.0.1:${cfg.port}`
-      : `connector not reachable on 127.0.0.1:${cfg.port}`;
-  });
-
-  if (!cfg.token) {
-    $("detect").innerHTML =
-      'No session token set. <a id="go" href="#">Open options</a> and paste the token printed by <code>niutero-cli connector</code>.';
-    const go = $("go");
-    if (go)
-      go.addEventListener("click", (e) => {
-        e.preventDefault();
-        chrome.runtime.openOptionsPage();
-      });
-    return;
-  }
-
-  // Preview what we'd capture.
-  const tab = await activeTab();
-  if (!tab || !/^https?:/i.test(tab.url || "")) {
-    $("detect").textContent = "This isn't a normal web page.";
-    return;
-  }
+async function ping() {
   try {
-    const [inj] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: extractCitation,
-    });
-    renderDetect(inj && inj.result);
-  } catch {
-    $("detect").textContent = "Can't read this page.";
-  }
-}
-
-function renderDetect(d) {
-  const el = $("detect");
-  el.textContent = "";
-  if (!d || (!d.doi && !d.hasMeta)) {
-    el.textContent = "No citation found on this page.";
-    $("capture").disabled = true;
-    return;
-  }
-  const title = (d.fields && d.fields.title) || d.pageTitle || "(untitled)";
-  const via = d.doi ? `DOI ${d.doi}` : "page metadata";
-  const t = document.createElement("div");
-  t.className = "title";
-  t.textContent = title;
-  const s = document.createElement("div");
-  s.className = "sub";
-  s.textContent = "via " + via;
-  el.append(t, s);
-  $("capture").disabled = false;
-}
-
-async function onCapture() {
-  const btn = $("capture");
-  btn.disabled = true;
-  btn.textContent = "Capturing…";
-  let result;
-  try {
-    result = await chrome.runtime.sendMessage({ type: "capture" });
-  } catch (e) {
-    result = { ok: false, error: "The extension worker did not respond." };
-  }
-  showStatus(result);
-  btn.textContent = "Capture citation";
-  btn.disabled = false;
-}
-
-function showStatus(r) {
-  const st = $("status");
-  st.hidden = false;
-  if (!r) {
-    st.className = "status bad";
-    st.textContent = "No response.";
-    return;
-  }
-  if (r.ok) {
-    if (r.added) {
-      st.className = "status good";
-      st.textContent = `Added to your library${r.via === "doi" ? "" : " (from page tags)"}.`;
-    } else {
-      st.className = "status dup";
-      st.textContent = "Already in your library.";
+    const r = await fetch(NIUTERO + "/ping", { method: "GET" });
+    const j = await r.json();
+    if (j && j.ok) {
+      setStatus(
+        "conn",
+        j.library ? 'Connected — library "' + j.library + '"' : "Connected — no library open",
+        j.library ? "ok" : "bad",
+      );
+      return Boolean(j.library);
     }
-  } else {
-    st.className = "status bad";
-    st.textContent = r.error || "Capture failed.";
+  } catch {
+    /* fall through */
+  }
+  setStatus(
+    "conn",
+    "niutero is not reachable. Open it and enable the connector in Settings → Sync & sharing.",
+    "bad",
+  );
+  return false;
+}
+
+async function scrapeActiveTab() {
+  const tabs = await api.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs && tabs[0];
+  if (!tab || !tab.id) throw new Error("no active tab");
+  const res = await api.scripting.executeScript({
+    target: { tabId: tab.id },
+    files: ["scrape.js"],
+  });
+  return (res && res[0] && res[0].result) || { metadata: {} };
+}
+
+function describe(s) {
+  const m = s.metadata || {};
+  if (m.title) {
+    return { title: m.title, sub: s.identifier || (m.authors && m.authors[0]) || "" };
+  }
+  if (s.identifier) return { title: s.identifier, sub: "" };
+  return null;
+}
+
+async function save() {
+  if (!scraped) return;
+  $("save").disabled = true;
+  setStatus("result", "Saving…", "muted");
+  const tags = $("tags")
+    .value.split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  const body = { metadata: scraped.metadata || {}, tags };
+  if (scraped.identifier) body.identifier = scraped.identifier;
+  try {
+    const r = await fetch(NIUTERO + "/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (j && j.ok) {
+      if (j.added > 0) {
+        setStatus("result", "Saved: " + (j.title || j.citekey || "done"), "ok");
+      } else {
+        setStatus("result", "Already in your library", "muted");
+      }
+    } else {
+      setStatus("result", "Not saved: " + ((j && j.error) || "unknown error"), "bad");
+      $("save").disabled = false;
+    }
+  } catch (e) {
+    setStatus("result", "Request failed: " + e.message, "bad");
+    $("save").disabled = false;
   }
 }
 
-init();
+(async () => {
+  const reachable = await ping();
+  try {
+    scraped = await scrapeActiveTab();
+  } catch (e) {
+    $("detected").textContent = "Cannot read this page (" + e.message + ").";
+    return;
+  }
+  const d = describe(scraped);
+  if (d) {
+    $("detected").textContent = "";
+    const t = document.createElement("div");
+    t.className = "title";
+    t.textContent = d.title;
+    $("detected").appendChild(t);
+    if (d.sub) {
+      const s = document.createElement("div");
+      s.className = "sub";
+      s.textContent = d.sub;
+      $("detected").appendChild(s);
+    }
+    $("save").disabled = !reachable;
+  } else {
+    $("detected").textContent = "No DOI, arXiv id, or citation metadata found on this page.";
+  }
+  $("save").addEventListener("click", save);
+})();

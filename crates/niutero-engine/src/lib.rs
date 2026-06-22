@@ -18,7 +18,10 @@ pub use ai::{
     ai_config, ai_test, apply_tag_merges, ask, organize_tags, set_ai_config, suggest_tags,
     update_ai_config, MergeApplied, OrganizePlan, TagMerge, TagSuggestion, DEFAULT_MODEL,
 };
-pub use connector::{connector_token, serve_connector};
+pub use connector::{
+    connector_import, start as start_connector, ConnectorConfig, ConnectorShared, ImportOutcome,
+    ImportRequest, ScrapedMetadata, ServerHandle, DEFAULT_PORT as CONNECTOR_DEFAULT_PORT,
+};
 pub use pdf_ops::{
     auto_fetch_pdfs, create_pdf_repo, fetchable_pdf_url, hf_token_set, pdf_auto_fetch_enabled,
     pdf_pull, pdf_push, pdf_repo, set_hf_token, set_pdf_repo,
@@ -446,20 +449,6 @@ fn fill_missing(entry: &mut BibEntry, fetched: &BibEntry) -> Vec<String> {
         }
     }
     filled
-}
-
-// ----------------------------------------------------------- browser connector
-
-/// Add BibTeX captured by the browser connector, skipping any entry whose cite
-/// key already exists (re-capturing a saved paper is a no-op). The server loop
-/// lives in [`serve_connector`]; this is the per-capture operation.
-pub fn capture(v: &Vault, bibtex: &str) -> Result<ImportReport, String> {
-    let _lock = lock_vault(v)?;
-    let incoming: Vec<BibEntry> = entries(&parse(bibtex)).cloned().collect();
-    if incoming.is_empty() {
-        return Err("no BibTeX entries in the captured payload".into());
-    }
-    merge_incoming(v, incoming, DupPolicy::Skip)
 }
 
 // ------------------------------------------------------------------- PDFs
@@ -901,6 +890,7 @@ pub fn set_workflow(
     auto_commit: Option<bool>,
     on_dup: Option<&str>,
     auto_fetch_pdf: Option<bool>,
+    normalize_on_import: Option<bool>,
 ) -> Result<WorkflowConfig, String> {
     let _lock = lock_vault(v)?;
     if let Some(b) = enrich_on_import {
@@ -908,6 +898,9 @@ pub fn set_workflow(
     }
     if let Some(b) = auto_commit {
         v.config.workflow.auto_commit = b;
+    }
+    if let Some(b) = normalize_on_import {
+        v.config.workflow.normalize_on_import = b;
     }
     if let Some(d) = on_dup {
         let d = d.trim().to_ascii_lowercase();
@@ -1463,6 +1456,59 @@ pub fn normalize_apply(v: &Vault, profile: Option<&str>) -> Result<Vec<NormChang
         log::info!("normalize: changed {} entr(ies)", changes.len());
     }
     Ok(changes)
+}
+
+/// Apply offline normalization to **only** the entries whose citekey is in
+/// `keys`, leaving every other entry (and all verbatim blocks) byte-identical.
+/// Writes only if something changed. Used by the import hook so a capture
+/// normalizes the entry it just added without rewriting the rest of the library.
+pub fn normalize_apply_keys(
+    v: &Vault,
+    keys: &[String],
+    profile: Option<&str>,
+) -> Result<Vec<NormChange>, String> {
+    let _lock = lock_vault(v)?;
+    let items = read_items(v)?;
+    let cfg = NormConfig::resolve(&v.niutero_dir(), profile)?;
+    let want: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let mut out = Vec::with_capacity(items.len());
+    let mut changes = Vec::new();
+    for it in &items {
+        match it {
+            BibItem::Entry(e) if want.contains(e.citekey.as_str()) => {
+                let (normalized, notes) = normalize_entry(e, &cfg);
+                let diffs = entry_field_diff(e, &normalized);
+                if !notes.is_empty() || !diffs.is_empty() {
+                    changes.push(NormChange {
+                        citekey: e.citekey.clone(),
+                        notes,
+                        diffs,
+                    });
+                }
+                out.push(BibItem::Entry(normalized));
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    if !changes.is_empty() {
+        write_items(v, &out)?;
+        log::info!(
+            "normalize-on-import: changed {} of {} new entr(ies)",
+            changes.len(),
+            keys.len()
+        );
+    }
+    Ok(changes)
+}
+
+/// **Import hook.** When `workflow.normalize_on_import` is set, normalize just
+/// the newly-imported `keys`. Returns how many of them changed. A no-op (and no
+/// lock taken) when the toggle is off or `keys` is empty.
+pub fn auto_normalize(v: &Vault, keys: &[String]) -> Result<usize, String> {
+    if !v.config.workflow.normalize_on_import || keys.is_empty() {
+        return Ok(0);
+    }
+    Ok(normalize_apply_keys(v, keys, None)?.len())
 }
 
 fn norm_changes(items: &[BibItem], cfg: &NormConfig) -> (Vec<BibItem>, Vec<NormChange>) {
@@ -3031,6 +3077,31 @@ mod tests {
     }
 
     #[test]
+    fn normalize_on_import_is_gated_and_scoped_to_the_given_keys() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{a, title={T A}, abstract={x}}".into()),
+        )
+        .unwrap();
+        add(
+            &v,
+            AddSource::Bibtex("@article{b, title={T B}, abstract={y}}".into()),
+        )
+        .unwrap();
+
+        // Off by default: a no-op even though both carry a droppable abstract.
+        assert_eq!(auto_normalize(&v, &["a".into(), "b".into()]).unwrap(), 0);
+        assert!(show(&v, "a").unwrap().fields.get("abstract").is_some());
+
+        // Enabled, but applied to only `a`: `b` stays byte-identical.
+        set_workflow(&mut v, None, None, None, None, Some(true)).unwrap();
+        assert_eq!(auto_normalize(&v, &["a".into()]).unwrap(), 1);
+        assert!(show(&v, "a").unwrap().fields.get("abstract").is_none());
+        assert!(show(&v, "b").unwrap().fields.get("abstract").is_some());
+    }
+
+    #[test]
     fn normalize_respects_norm_toml() {
         let (_d, v) = vault();
         add(
@@ -3375,18 +3446,21 @@ mod tests {
     #[test]
     fn set_workflow_validates_on_dup_and_roundtrips() {
         let (_d, mut v) = vault();
-        assert!(set_workflow(&mut v, None, None, Some("explode"), None)
-            .unwrap_err()
-            .contains("unknown duplicate policy"));
+        assert!(
+            set_workflow(&mut v, None, None, Some("explode"), None, None)
+                .unwrap_err()
+                .contains("unknown duplicate policy")
+        );
         let w = set_workflow(
             &mut v,
             Some(true),
             Some(true),
             Some("Overwrite"),
             Some(true),
+            Some(true),
         )
         .unwrap();
-        assert!(w.enrich_on_import && w.auto_commit && w.auto_fetch_pdf);
+        assert!(w.enrich_on_import && w.auto_commit && w.auto_fetch_pdf && w.normalize_on_import);
         assert_eq!(w.on_dup.as_deref(), Some("overwrite")); // normalized
         let back = open(&v.root).unwrap();
         assert_eq!(
@@ -3394,7 +3468,7 @@ mod tests {
             DupPolicy::Overwrite
         );
         // Clearing restores the caller's fallback.
-        set_workflow(&mut v, None, None, Some(""), None).unwrap();
+        set_workflow(&mut v, None, None, Some(""), None, None).unwrap();
         let back = open(&v.root).unwrap();
         assert_eq!(default_dup_policy(&back, DupPolicy::Skip), DupPolicy::Skip);
     }
@@ -3431,10 +3505,11 @@ mod tests {
                 dark: true,
                 accent: 3,
                 author_first_last: true,
+                connector_enabled: true,
             })
             .unwrap();
             let p = ui_prefs().unwrap();
-            assert!(p.dark && p.author_first_last);
+            assert!(p.dark && p.author_first_last && p.connector_enabled);
             assert_eq!(p.accent, 3);
         });
     }
@@ -3458,7 +3533,7 @@ mod tests {
         connect(&v, "https://example.com/r.git").unwrap();
         assert_eq!(auto_commit_if_enabled(&v).unwrap(), None);
         // Pref on: commits the pending state once, then reports clean.
-        set_workflow(&mut v, None, Some(true), None, None).unwrap();
+        set_workflow(&mut v, None, Some(true), None, None, None).unwrap();
         let msg = auto_commit_if_enabled(&v).unwrap();
         assert!(msg.is_some(), "expected a commit");
         assert_eq!(auto_commit_if_enabled(&v).unwrap(), None);
@@ -3475,7 +3550,7 @@ mod tests {
         // Off: nothing, no network.
         assert_eq!(auto_enrich(&v, &["k".into()]).unwrap(), (0, 0));
         // On, but the entry has no DOI: skipped silently — still no network.
-        set_workflow(&mut v, Some(true), None, None, None).unwrap();
+        set_workflow(&mut v, Some(true), None, None, None, None).unwrap();
         assert_eq!(auto_enrich(&v, &["k".into()]).unwrap(), (0, 0));
     }
 
@@ -3570,7 +3645,7 @@ mod tests {
             assert!(pdf_auto_fetch_enabled(&v));
             // …must be able to turn it OFF: the explicit set clears the
             // legacy copy, or the OR-fallback would re-enable it forever.
-            set_workflow(&mut v, None, None, None, Some(false)).unwrap();
+            set_workflow(&mut v, None, None, None, Some(false), None).unwrap();
             assert!(!pdf_auto_fetch_enabled(&v));
             assert!(!pdf_prefs(&v).unwrap().auto_fetch);
         });

@@ -80,6 +80,10 @@ pub struct WorkflowConfig {
     /// `.pdf` or an arXiv abs page.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_fetch_pdf: bool,
+    /// After an import, apply the vault's offline normalization ruleset to the
+    /// newly-imported entries (only those — never the rest of the library).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub normalize_on_import: bool,
 }
 
 impl WorkflowConfig {

@@ -326,19 +326,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run the browser-connector server (loopback) until stopped (Ctrl-C).
-    /// Captures require the printed session token (`Authorization: Bearer …`
-    /// or `X-Niutero-Token: …`), so a random web page can't inject entries.
+    /// Run the browser-connector server (loopback) until stopped (Ctrl-C),
+    /// importing captures into this vault. No token: the server only accepts
+    /// requests from an extension origin on a loopback host (the browser
+    /// extension in `extension/`). The GUI hosts the same server while open.
     Connector {
         /// Vault folder.
         vault: PathBuf,
         /// Loopback port to listen on.
         #[arg(long, default_value_t = 23510)]
         port: u16,
-        /// Session token captures must present (default: generate and print
-        /// a fresh one).
-        #[arg(long)]
-        token: Option<String>,
     },
     /// Manage an entry's attached PDF: show its path, --attach a file, --fetch
     /// it from the entry's url, or --push/--pull it to/from the vault's HF
@@ -450,6 +447,10 @@ enum Cmd {
         /// skip / overwrite / rename; "" clears it.
         #[arg(long)]
         on_dup: Option<String>,
+        /// After imports, apply the vault's normalization ruleset to the new
+        /// entries only (offline; off by default).
+        #[arg(long)]
+        normalize_on_import: Option<bool>,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -747,12 +748,14 @@ fn sidecar_mutation(cmd: &Cmd) -> Option<PathBuf> {
             enrich_on_import,
             auto_commit,
             on_dup,
+            normalize_on_import,
             ..
         } if name.is_some()
             || pattern.is_some()
             || enrich_on_import.is_some()
             || auto_commit.is_some()
-            || on_dup.is_some() =>
+            || on_dup.is_some()
+            || normalize_on_import.is_some() =>
         {
             Some(vault.clone())
         }
@@ -954,7 +957,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             citekey,
             json,
         } => cmd_enrich(&vault, &citekey, json).map(ok),
-        Cmd::Connector { vault, port, token } => cmd_connector(&vault, port, token).map(ok),
+        Cmd::Connector { vault, port } => cmd_connector(&vault, port).map(ok),
         Cmd::Pdf {
             vault,
             citekey,
@@ -997,6 +1000,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             enrich_on_import,
             auto_commit,
             on_dup,
+            normalize_on_import,
             json,
         } => cmd_config(
             &vault,
@@ -1005,6 +1009,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             enrich_on_import,
             auto_commit,
             on_dup,
+            normalize_on_import,
             json,
         )
         .map(ok),
@@ -1017,6 +1022,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_config(
     vault: &Path,
     name: Option<String>,
@@ -1024,19 +1030,25 @@ fn cmd_config(
     enrich_on_import: Option<bool>,
     auto_commit: Option<bool>,
     on_dup: Option<String>,
+    normalize_on_import: Option<bool>,
     json: bool,
 ) -> Result<(), String> {
     let mut v = open_vault(vault)?;
     if name.is_some() || pattern.is_some() {
         engine::set_library_meta(&mut v, name.as_deref(), pattern.as_deref())?;
     }
-    if enrich_on_import.is_some() || auto_commit.is_some() || on_dup.is_some() {
+    if enrich_on_import.is_some()
+        || auto_commit.is_some()
+        || on_dup.is_some()
+        || normalize_on_import.is_some()
+    {
         engine::set_workflow(
             &mut v,
             enrich_on_import,
             auto_commit,
             on_dup.as_deref(),
             None,
+            normalize_on_import,
         )?;
     }
     let c = &v.config;
@@ -1050,6 +1062,7 @@ fn cmd_config(
                 "auto_commit": c.workflow.auto_commit,
                 "on_dup": c.workflow.on_dup,
                 "auto_fetch_pdf": c.workflow.auto_fetch_pdf,
+                "normalize_on_import": c.workflow.normalize_on_import,
             },
         }))?;
     } else {
@@ -1070,6 +1083,7 @@ fn cmd_config(
             c.workflow.on_dup.as_deref().unwrap_or("(tool default)")
         );
         println!("  auto-fetch pdf:   {}", c.workflow.auto_fetch_pdf);
+        println!("  normalize on import: {}", c.workflow.normalize_on_import);
     }
     Ok(())
 }
@@ -1667,6 +1681,11 @@ fn cmd_import(
         Ok(_) => {}
         Err(e) => eprintln!("warning: auto-enrich skipped: {e}"),
     }
+    match engine::auto_normalize(&v, &r.new_keys()) {
+        Ok(n) if n > 0 => eprintln!("  ◇ normalized {n} new entr(ies)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: normalize-on-import skipped: {e}"),
+    }
     if json {
         println!(
             "{}",
@@ -1704,19 +1723,33 @@ fn cmd_enrich(vault: &Path, citekey: &str, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_connector(vault: &Path, port: u16, token: Option<String>) -> Result<(), String> {
+fn cmd_connector(vault: &Path, port: u16) -> Result<(), String> {
     let v = open_vault(vault)?;
-    let token = token.unwrap_or_else(engine::connector_token);
-    println!("Browser connector listening on http://127.0.0.1:{port}  (Ctrl-C to stop)");
-    println!("  POST BibTeX to /capture, or a bare DOI to /capture/doi");
-    println!("session token: {token}");
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(engine::ConnectorShared {
+        vault_root: Some(v.root.clone()),
+        library: Some(v.config.name.clone()),
+    }));
+    let cfg = engine::ConnectorConfig {
+        port,
+        shared,
+        on_import: std::sync::Arc::new(|| {}),
+    };
+    let handle = engine::start_connector(cfg).map_err(|e| format!("start connector: {e}"))?;
     println!(
-        "  captures must send it as 'Authorization: Bearer {token}' or 'X-Niutero-Token: {token}'"
+        "Browser connector listening on http://127.0.0.1:{}  (Ctrl-C to stop)",
+        handle.port()
     );
+    println!("  load the niutero browser extension (extension/) and click Save on a paper page");
     println!(
-        "  paste the token into the niutero browser extension (extension/) to capture by click"
+        "  captures import into: {} ({})",
+        v.root.display(),
+        v.config.name
     );
-    engine::serve_connector(&v, port, &token)
+    // The server runs on its own thread; block this one until the process is
+    // killed (Ctrl-C). Dropping `handle` would stop the server, so keep it.
+    loop {
+        std::thread::park();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1818,7 +1851,7 @@ fn cmd_pdf_config(
         engine::set_pdf_repo(&mut v, &r)?;
     }
     if let Some(a) = auto_fetch {
-        engine::set_workflow(&mut v, None, None, None, Some(a))?;
+        engine::set_workflow(&mut v, None, None, None, Some(a), None)?;
     }
     // Create after the config lands, so `--repo u/r --create-repo` works in one go.
     let created = if create_repo {

@@ -14,7 +14,8 @@
 //! write never overlap.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText};
 use log::{info, warn};
@@ -91,6 +92,34 @@ impl Library {
     }
 }
 
+/// GUI-hosted browser connector: the server runs (on a background thread) while
+/// the app is open and `enabled`, importing captures into the currently-open
+/// library. `shared` is rewritten each frame to track that library; `refresh` is
+/// set by the server thread after an import so the next frame reloads + toasts.
+struct ConnectorState {
+    /// User toggle, persisted machine-local in `UiPrefs::connector_enabled`.
+    enabled: bool,
+    shared: Arc<Mutex<engine::ConnectorShared>>,
+    refresh: Arc<AtomicBool>,
+    handle: Option<engine::ServerHandle>,
+    /// Last start failure (e.g. port busy); also gates the start retry.
+    error: Option<String>,
+    port: u16,
+}
+
+impl Default for ConnectorState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            shared: Arc::new(Mutex::new(engine::ConnectorShared::default())),
+            refresh: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            error: None,
+            port: engine::CONNECTOR_DEFAULT_PORT,
+        }
+    }
+}
+
 pub struct NiuteroApp {
     dark: bool,
     /// Display authors as `First Last` (default: as stored, `Last, First`).
@@ -148,6 +177,8 @@ pub struct NiuteroApp {
     /// auto-dismiss window (string comparison alone can't see the repeat).
     toast_gen: u64,
     toast_gen_armed: u64,
+    /// GUI-hosted browser connector (server + its open-library tracking).
+    connector: ConnectorState,
 }
 
 impl NiuteroApp {
@@ -265,6 +296,10 @@ impl NiuteroApp {
             ai_job: None,
             toast_gen: 0,
             toast_gen_armed: 0,
+            connector: ConnectorState {
+                enabled: ui.connector_enabled,
+                ..ConnectorState::default()
+            },
         }
     }
 
@@ -283,6 +318,7 @@ impl NiuteroApp {
             dark: self.dark,
             accent: self.accent_idx,
             author_first_last: self.author_first_last,
+            connector_enabled: self.connector.enabled,
         };
         if let Err(e) = engine::set_ui_prefs(prefs) {
             self.set_toast(format!("Couldn't save appearance: {e}"));
@@ -300,6 +336,88 @@ impl NiuteroApp {
             }
         }
         self.refresh_git();
+    }
+
+    /// Per-frame browser-connector upkeep: point the server at the open library,
+    /// drain a finished capture (reload + toast), start/stop to match the toggle,
+    /// and refresh the status the Settings page shows. Cheap (a lock, an atomic
+    /// swap, and — only on a real start/stop — a thread spawn/join).
+    fn sync_connector(&mut self, ctx: &egui::Context) {
+        // Keep the server aimed at the currently-open library.
+        if let Ok(mut s) = self.connector.shared.lock() {
+            match self.library.as_ref() {
+                Some(lib) => {
+                    s.vault_root = Some(lib.vault.root.clone());
+                    s.library = Some(lib.vault.config.name.clone());
+                }
+                None => {
+                    s.vault_root = None;
+                    s.library = None;
+                }
+            }
+        }
+
+        // A capture landed on the server thread, which wrote through its own
+        // vault instance (the .bib AND the sidecar tags). Re-open so the GUI's
+        // in-memory config/meta match disk, then re-list; a plain reload would
+        // miss the sidecar changes.
+        if self.connector.refresh.swap(false, Ordering::SeqCst) {
+            if let Some(lib) = self.library.as_mut() {
+                let root = lib.vault.root.clone();
+                match engine::open(&root) {
+                    Ok(v) => lib.vault = v,
+                    Err(e) => warn!("connector refresh: reopen failed: {e}"),
+                }
+                lib.reload();
+            }
+            self.refresh_git();
+            self.set_toast("Captured a reference from the browser");
+        }
+
+        // Start or stop to match the toggle.
+        if self.connector.enabled {
+            if self.connector.handle.is_none() && self.connector.error.is_none() {
+                let refresh = Arc::clone(&self.connector.refresh);
+                let ctx = ctx.clone();
+                let cfg = engine::ConnectorConfig {
+                    port: self.connector.port,
+                    shared: Arc::clone(&self.connector.shared),
+                    on_import: Arc::new(move || {
+                        refresh.store(true, Ordering::SeqCst);
+                        ctx.request_repaint();
+                    }),
+                };
+                match engine::start_connector(cfg) {
+                    Ok(h) => {
+                        self.connector.port = h.port();
+                        self.connector.handle = Some(h);
+                        info!("connector enabled on 127.0.0.1:{}", self.connector.port);
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        warn!("connector failed to start: {msg}");
+                        self.connector.error = Some(msg);
+                    }
+                }
+            }
+        } else if let Some(h) = self.connector.handle.take() {
+            // Toggling off stops a *running* server; a prior start error is
+            // cleared by the toggle handler (SetConnectorEnabled), not here.
+            h.stop();
+            info!("connector disabled");
+        }
+
+        // Surface the live status to the Settings page.
+        self.settings.connector_enabled = self.connector.enabled;
+        self.settings.connector_status = if let Some(e) = &self.connector.error {
+            format!("Error: {e}")
+        } else if self.connector.handle.is_some() {
+            format!("Listening on 127.0.0.1:{}", self.connector.port)
+        } else if self.connector.enabled {
+            "Starting…".to_string()
+        } else {
+            "Off".to_string()
+        };
     }
 
     /// Recompute the cached git branch/dirty state from the open vault. Cheap
@@ -516,6 +634,10 @@ impl eframe::App for NiuteroApp {
             }
         }
         theme.apply(ctx);
+
+        // Browser connector upkeep (start/stop, track the open library, drain
+        // captures) before any panel draws, so Settings shows fresh status.
+        self.sync_connector(ctx);
 
         // Titlebar (top), status (bottom), rail (left), tool body (center).
         egui::TopBottomPanel::top("niu-titlebar")

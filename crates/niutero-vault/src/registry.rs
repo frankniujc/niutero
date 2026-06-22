@@ -59,6 +59,10 @@ pub struct UiPrefs {
     /// `Last, First` (display-only — the stored field is never rewritten).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub author_first_last: bool,
+    /// Run the browser-connector server while the GUI is open (machine-local:
+    /// it's about this machine hosting a localhost port, not the shared library).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connector_enabled: bool,
 }
 
 fn is_zero(n: &usize) -> bool {
