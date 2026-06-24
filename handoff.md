@@ -348,6 +348,61 @@ before pushing:
   initializes `env_logger`; secrets are never logged), plus assorted
   stale-doc / dead-code cleanup.
 
+## 2026-06-24 — connector imports a clean entry: OpenReview BibTeX + always-normalize
+
+User report: connector imports weren't good — an OpenReview page like
+`openreview.net/forum?id=2DtxPCL3T5` should fetch the *canonical* BibTeX and
+apply the normalize rules, so a capture lands as a finished entry. Done:
+
+- **OpenReview resolution (server-side).** New `niutero_online::fetch_openreview_bibtex(id)`
+  GETs `api2.openreview.net/notes?id=<id>` (falls back to v1 `api.openreview.net`)
+  and pulls the venue's official `_bibtex` (`notes[0].content._bibtex.value` on v2,
+  bare string on v1) via `extract_openreview_bibtex` (pure, tested). The forum page
+  has no usable DOI, but its venue BibTeX is one API call away — far better than the
+  sparse `citation_*` meta tags.
+- **`connector.rs` reworked around `resolve_entries`** — prefers a canonical source:
+  OpenReview id → venue BibTeX, else DOI/arXiv → doi.org, else the offline metadata
+  fallback. The network fetch now runs **outside** the vault lock; only the merge is
+  locked (was: `import_doi` fetched inside the lock). `openreview_id` parses both
+  `openreview:<id>` and an `openreview.net …?id=<id>` URL, and **validates the id is a
+  plain token** (alnum + `_-.`) before it's interpolated unescaped into the API URL
+  (anti-injection).
+- **Every connector entry is re-keyed to the library's base pattern**
+  (`rekey_to_base_pattern`), uniformly across the OpenReview / DOI / metadata paths
+  (before this, only the metadata path re-keyed; the DOI path kept the upstream key).
+  Computed from pre-normalization fields, so a re-capture renders the same key and
+  dedupes.
+- **Connector ALWAYS normalizes** its new entries (`normalize_apply_keys`,
+  unconditional), independent of the `normalize_on_import` toggle (which still
+  governs CLI/bulk imports). Rationale: the connector's whole job is to hand back a
+  clean entry. Best-effort — a normalize error is logged, never fails the import.
+- **Extension** `scrape.js`: detects `openreview.net` and sends
+  `identifier: "openreview:<id>"`; stays loopback-only (the server fetches). No
+  protocol change (rides the existing `identifier`).
+- **Verified live end-to-end via curl** against a scratch vault with
+  `normalize_on_import` **off**: `POST /import {"identifier":"openreview:2DtxPCL3T5"}`
+  → `added:1`, re-keyed `mu2023learningToCompress`, stored as
+  `@inproceedings` with `booktitle = {Advances in Neural Information Processing
+  Systems (NeurIPS)}` (normalization canonicalized the venue) and a
+  `{{…}}`-protected title; a re-capture via the **URL form**
+  (`forum?id=2DtxPCL3T5`) returned `skipped:1` (dedupe + URL-form id parsing both
+  work); tags applied. Full gate green: workspace tests (engine 110, online 12),
+  fmt + clippy clean.
+- **Reviewed by a 4-dimension adversarial workflow** (read-only reviewers).
+  Fixed all confirmed findings: (1, medium) the **`on_dup = overwrite` path
+  bypassed the always-normalize/tag guarantee** — `new_keys()` omits overwritten
+  keys, so a re-capture landed raw with dropped tags. Added
+  `ImportReport::overwritten_keys` + `touched_keys()` (= added + renamed +
+  overwritten); the connector now runs all hooks over `touched_keys()` and gates
+  exports/auto-commit on any `.bib` write. `ImportOutcome` gained `overwritten`
+  (popup shows "Updated"). (2, low) `openreview_id` glued a URL `#fragment` onto
+  the id → now stripped. (3, low) `fetch_openreview_bibtex` surfaced the wrong
+  endpoint's error in a mixed-failure ordering → a reached-but-empty endpoint now
+  owns the message. A `contains("openreview.net")` SSRF sub-claim was **refuted**
+  (the fetch host is hardcoded to `api2.openreview.net`). Verified live: an
+  overwrite-configured vault re-captured `openreview:2DtxPCL3T5` → `overwritten:1`,
+  entry stayed normalized `@inproceedings`, tags merged (`v1`+`v2`), no twin.
+
 ## 2026-06-23 — connector rebuilt (no token, GUI-hosted, normalize-on-import)
 
 **This supersedes the 2026-06-22 design below** (`POST /capture` + `/capture/doi`

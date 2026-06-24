@@ -81,6 +81,8 @@ async function save() {
     if (j && j.ok) {
       if (j.added > 0) {
         setStatus("result", "Saved: " + (j.title || j.citekey || "done"), "ok");
+      } else if (j.overwritten > 0) {
+        setStatus("result", "Updated: " + (j.title || j.citekey || "done"), "ok");
       } else {
         setStatus("result", "Already in your library", "muted");
       }

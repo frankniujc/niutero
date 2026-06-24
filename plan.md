@@ -124,10 +124,16 @@ niutero ai organize <vault> [--instructions S | --plan FILE] [--apply] [--json]
 connector <vault>` hosts it headless). No token: Zotero-Connector-style
 security — bind `127.0.0.1` only, require a loopback `Host` (anti
 DNS-rebinding) and an extension `Origin` (anti CSRF), emit no CORS. Routes:
-`GET /ping` and `POST /import {identifier?, metadata?, tags?}`; the server
-resolves a DOI/arXiv id (doi.org) or builds from scraped metadata, merges with
-the vault's dup policy, and runs the import hooks. Bodies capped, sockets time
-out. The browser-side client is the MV3 extension in `extension/`.
+`GET /ping` and `POST /import {identifier?, metadata?, tags?}`. The server
+resolves to a *canonical* source where it can — an OpenReview submission id
+(its venue BibTeX, via the OpenReview API), then a DOI/arXiv id (doi.org) —
+and only falls back to the page's scraped metadata; it re-keys every entry to
+the library's cite-key pattern (so re-captures dedupe), merges with the vault's
+dup policy, and **always normalizes** the result (the connector's job is to hand
+back a clean, ready-to-use entry, so it normalizes regardless of the
+`normalize_on_import` toggle that governs CLI/bulk imports). Bodies capped,
+sockets time out. The browser-side client is the MV3 extension in `extension/`
+(it stays loopback-only — the server does the OpenReview/DOI fetch).
 
 **Library config** — `.niutero/config.toml` is the library's own, synced
 settings file; `config` is its CLI view:

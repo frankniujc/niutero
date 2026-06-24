@@ -294,6 +294,12 @@ pub struct ImportReport {
     /// in `renamed`) — what post-import hooks like PDF auto-fetch operate on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub added_keys: Vec<String>,
+    /// Cite keys of entries replaced in place under `DupPolicy::Overwrite`.
+    /// Separate from `added_keys` so existing callers' add-only hooks are
+    /// unchanged; the connector folds these into its always-normalize pass via
+    /// [`touched_keys`](ImportReport::touched_keys).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overwritten_keys: Vec<String>,
 }
 
 impl ImportReport {
@@ -303,6 +309,18 @@ impl ImportReport {
             .iter()
             .cloned()
             .chain(self.renamed.iter().map(|(_, n)| n.clone()))
+            .collect()
+    }
+
+    /// Every cite key this import created **or replaced** (added + renamed-to +
+    /// overwritten) — the set whose *content* this import (re)wrote, so a
+    /// content-touching hook (normalize, tag, enrich, PDF) covers them all. The
+    /// connector uses this so its "always normalize a clean entry" contract holds
+    /// under every dup policy, not just on a fresh add.
+    pub fn touched_keys(&self) -> Vec<String> {
+        self.new_keys()
+            .into_iter()
+            .chain(self.overwritten_keys.iter().cloned())
             .collect()
     }
 }
@@ -352,6 +370,7 @@ fn merge_incoming(
                 DupPolicy::Overwrite => {
                     entry.validate()?;
                     let idx = find_entry(&items, &entry.citekey)?;
+                    report.overwritten_keys.push(entry.citekey.clone());
                     items[idx] = BibItem::Entry(entry);
                     report.overwritten += 1;
                 }

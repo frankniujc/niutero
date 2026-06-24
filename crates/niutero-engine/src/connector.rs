@@ -22,9 +22,15 @@
 //! **Routes** (both JSON):
 //! - `GET /ping` → `{app, ok, version, library}` so the extension can show
 //!   whether niutero is up and which library is open.
-//! - `POST /import` with `{identifier?, metadata?, tags?}` → resolve (a DOI /
-//!   `arXiv:` id over the network, or scraped metadata offline), merge with
-//!   skip-on-duplicate, run the import hooks, and answer `{ok, citekey, …}`.
+//! - `POST /import` with `{identifier?, metadata?, tags?}` → resolve, merge with
+//!   the library's dup policy, run the import hooks, and answer `{ok, citekey,
+//!   …}`. Resolution prefers a canonical source: an OpenReview submission id
+//!   (its venue BibTeX, via the OpenReview API), then a DOI / `arXiv:` id (via
+//!   doi.org), and only falls back to the page's scraped metadata. Every
+//!   resolved entry is re-keyed to the library's cite-key pattern and **always
+//!   normalized** — the connector's job is to turn a page into a clean,
+//!   ready-to-use entry, so it normalizes regardless of the `normalize_on_import`
+//!   toggle (which governs bulk/CLI imports).
 //!
 //! Everything but the accept loop is pure and unit-tested; the loop itself is
 //! covered by a loopback integration test.
@@ -39,6 +45,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use niutero_bib::{entries, parse};
 use niutero_core::BibEntry;
 use niutero_vault::Vault;
 
@@ -109,6 +116,7 @@ pub struct ImportOutcome {
     pub citekey: String,
     pub title: String,
     pub added: usize,
+    pub overwritten: usize,
     pub skipped: usize,
 }
 
@@ -294,63 +302,73 @@ fn handle_import(req: &Request, cfg: &ConnectorConfig) -> (&'static str, String)
 // ------------------------------------------------------------ import pipeline
 
 /// Resolve one capture and apply it to `v`, then run the import hooks
-/// (enrich → normalize → PDF fetch → keep-updated refresh → auto-commit, each
-/// gated by config and best-effort). The network resolve runs on the caller's
-/// thread (the server thread), never a UI thread.
+/// (enrich → normalize → PDF fetch → keep-updated refresh → auto-commit,
+/// best-effort). The network resolve runs on the caller's thread (the server
+/// thread), never a UI thread, and **without** the vault lock held.
 pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutcome, String> {
     // Honor the library's configured duplicate policy (Skip if unset), exactly
     // like every other import path.
     let policy = crate::default_dup_policy(v, crate::DupPolicy::Skip);
-    let report = if let Some(id) = req
-        .identifier
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        crate::import_doi(v, &identifier_to_doi(id), policy)?
-    } else if let Some(meta) = &req.metadata {
-        // Hold the vault lock across build + merge, the metadata path's
-        // read-modify-write of references.bib — `import_doi` locks the same way,
-        // and `merge_incoming`'s contract requires the caller to hold the lock.
-        // Scoped to this block so the post-import hooks below can re-lock (the
-        // lock is non-reentrant).
+
+    // Resolve to entries (network happens here, no lock held), then re-key every
+    // entry to the library's cite-key pattern so connector entries follow the
+    // library convention and a re-capture of the same source renders the same
+    // key (so the dup policy can dedupe it instead of letting a twin slip in).
+    let mut incoming = resolve_entries(req)?;
+    for e in &mut incoming {
+        rekey_to_base_pattern(v, e);
+        e.validate()?;
+    }
+
+    // Merge under the vault lock (the read-modify-write of references.bib;
+    // `merge_incoming`'s contract requires the caller to hold it). Scoped to this
+    // block so the post-import hooks below can re-lock (the lock is non-reentrant).
+    let report = {
         let _lock = crate::lock_vault(v)?;
-        let entry = build_entry_from_metadata(v, meta)?;
-        crate::merge_incoming(v, vec![entry], policy)?
-    } else {
-        return Err("the capture had neither an identifier nor metadata".into());
+        crate::merge_incoming(v, incoming, policy)?
     };
 
-    let new_keys = report.new_keys();
+    // Cover every entry this import wrote — added, renamed, AND overwritten — so
+    // the connector's "clean entry" contract holds under every dup policy (under
+    // `on_dup = overwrite`, a re-capture replaces the stored entry, which
+    // `new_keys()` would otherwise omit).
+    let touched = report.touched_keys();
 
     // Tags first (sidecar only) so any later hook sees a complete entry.
-    if !req.tags.is_empty() && !new_keys.is_empty() {
-        let adds: Vec<(String, Vec<String>)> = new_keys
+    if !req.tags.is_empty() && !touched.is_empty() {
+        let adds: Vec<(String, Vec<String>)> = touched
             .iter()
             .map(|k| (k.clone(), req.tags.clone()))
             .collect();
         if let Err(e) = crate::set_tags_bulk(v, &adds) {
-            log::warn!("connector: tagging new entries failed: {e}");
+            log::warn!("connector: tagging entries failed: {e}");
         }
     }
 
-    if !new_keys.is_empty() {
-        if let Err(e) = crate::auto_enrich(v, &new_keys) {
+    if !touched.is_empty() {
+        if let Err(e) = crate::auto_enrich(v, &touched) {
             log::warn!("connector: enrich skipped: {e}");
         }
-        match crate::auto_normalize(v, &new_keys) {
-            Ok(n) if n > 0 => log::info!("connector: normalized {n} new entr(ies)"),
+        // ALWAYS normalize — the connector's whole job is to hand back a clean,
+        // ready-to-use entry — independent of `normalize_on_import` (the toggle
+        // that governs bulk/CLI imports, where you may want a verbatim copy).
+        match crate::normalize_apply_keys(v, &touched, None) {
+            Ok(c) if !c.is_empty() => {
+                log::info!("connector: normalized {} entr(ies)", c.len())
+            }
             Ok(_) => {}
             Err(e) => log::warn!("connector: normalize skipped: {e}"),
         }
-        match crate::auto_fetch_pdfs(v, &new_keys) {
+        match crate::auto_fetch_pdfs(v, &touched) {
             Ok((f, a)) if a > 0 => log::info!("connector: fetched {f}/{a} PDF(s)"),
             Ok(_) => {}
             Err(e) => log::warn!("connector: PDF fetch skipped: {e}"),
         }
     }
 
-    if report.added > 0 {
+    // Refresh keep-updated exports / auto-commit whenever the `.bib` changed —
+    // an overwrite mutates it just as an add does.
+    if report.added > 0 || report.overwritten > 0 || !report.renamed.is_empty() {
         for o in crate::refresh_exports(v).unwrap_or_default() {
             if let Some(e) = o.error {
                 log::warn!(
@@ -366,7 +384,7 @@ pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutc
         }
     }
 
-    let (citekey, title) = match new_keys.first() {
+    let (citekey, title) = match touched.first() {
         Some(k) => {
             let title = crate::show(v, k)
                 .ok()
@@ -380,8 +398,96 @@ pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutc
         citekey,
         title,
         added: report.added,
+        overwritten: report.overwritten,
         skipped: report.skipped,
     })
+}
+
+/// Resolve one capture to the BibTeX entries to merge, preferring a canonical
+/// source over scraped metadata. Network fetches (OpenReview / doi.org) run
+/// here, on the caller's thread, **without** the vault lock held.
+fn resolve_entries(req: &ImportRequest) -> Result<Vec<BibEntry>, String> {
+    if let Some(id) = req
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // OpenReview: the forum page exposes no usable DOI, but the venue's
+        // canonical BibTeX is one API call away — far better than the page's
+        // sparse meta tags.
+        if let Some(or_id) = openreview_id(id) {
+            let src = niutero_online::fetch_openreview_bibtex(&or_id)?;
+            return parsed_entries(&src, &format!("OpenReview {or_id}"));
+        }
+        // Otherwise a DOI / arXiv id, resolved via doi.org content negotiation.
+        let src = niutero_online::fetch_doi_bibtex(&identifier_to_doi(id))?;
+        return parsed_entries(&src, id);
+    }
+    if let Some(meta) = &req.metadata {
+        return Ok(vec![build_entry_from_metadata(meta)?]);
+    }
+    Err("the capture had neither an identifier nor metadata".into())
+}
+
+/// Parse fetched BibTeX into entries, erroring if it held none.
+fn parsed_entries(src: &str, source: &str) -> Result<Vec<BibEntry>, String> {
+    let es: Vec<BibEntry> = entries(&parse(src)).cloned().collect();
+    if es.is_empty() {
+        return Err(format!("no BibTeX entries resolved from {source}"));
+    }
+    Ok(es)
+}
+
+/// Extract an OpenReview submission id from a connector identifier: either an
+/// explicit `openreview:<id>` (what the extension sends) or any `openreview.net`
+/// URL carrying an `id=<id>` query parameter. Returns `None` for non-OpenReview
+/// identifiers, or when the id isn't a plain token — so it can never inject into
+/// the API URL the online layer builds (it's interpolated unescaped).
+fn openreview_id(identifier: &str) -> Option<String> {
+    let s = identifier.trim();
+    let lower = s.to_ascii_lowercase();
+    let raw: String = if lower.starts_with("openreview:") {
+        // The prefix is 11 ASCII bytes regardless of case; slice the original to
+        // keep the (case-sensitive) id intact.
+        s["openreview:".len()..].trim().to_string()
+    } else if lower.contains("openreview.net") {
+        // Drop any `#fragment` (e.g. `forum?id=X#discussion`) before reading the
+        // query, so the anchor doesn't get glued onto the id.
+        let query = s
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("");
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("id="))?
+            .to_string()
+    } else {
+        return None;
+    };
+    let id = raw.trim();
+    (!id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    .then(|| id.to_string())
+}
+
+/// Set `e.citekey` to the library's BASE cite-key pattern (no uniquifying
+/// suffix), falling back to `"ref"` if the pattern renders empty. The base key
+/// is intentional: re-capturing the same source renders the same key, so the dup
+/// policy can skip/rename it rather than let a twin slip in. Computed from the
+/// entry's pre-normalization fields, so a re-capture matches the stored key.
+fn rekey_to_base_pattern(v: &Vault, e: &mut BibEntry) {
+    let base = crate::resolve_pattern(v, None).render(e);
+    e.citekey = if base.trim().is_empty() {
+        "ref".to_string()
+    } else {
+        base
+    };
 }
 
 /// Map a capture identifier to a DOI for the engine's doi.org resolver. An
@@ -410,10 +516,10 @@ fn strip_arxiv_version(id: &str) -> &str {
     id
 }
 
-/// Build a [`BibEntry`] from scraped metadata, keyed with the library's cite-key
-/// pattern (so connector entries match every other entry). Validated by the
-/// caller's `merge_incoming`.
-fn build_entry_from_metadata(v: &Vault, m: &ScrapedMetadata) -> Result<BibEntry, String> {
+/// Build a [`BibEntry`] from scraped metadata — the offline fallback when a
+/// capture carries no resolvable identifier. The caller re-keys it to the
+/// library pattern and validates (so this leaves `citekey` empty).
+fn build_entry_from_metadata(m: &ScrapedMetadata) -> Result<BibEntry, String> {
     let title = m.title.trim();
     if title.is_empty() {
         return Err("the page had no title to build an entry from".into());
@@ -445,17 +551,6 @@ fn build_entry_from_metadata(v: &Vault, m: &ScrapedMetadata) -> Result<BibEntry,
     set_if("publisher", &m.publisher, &mut e);
     set_if("doi", &m.doi, &mut e);
     set_if("url", &m.url, &mut e);
-
-    // The BASE pattern key (no uniquifying suffix) on purpose: re-capturing the
-    // same page must render the same key so the dup policy can skip/rename it,
-    // not slip past as a fresh entry. `merge_incoming` applies the policy.
-    let base = crate::resolve_pattern(v, None).render(&e);
-    e.citekey = if base.trim().is_empty() {
-        "ref".to_string()
-    } else {
-        base
-    };
-    e.validate()?;
     Ok(e)
 }
 
@@ -549,10 +644,11 @@ fn ping_body(library: Option<&str>) -> String {
 
 fn outcome_body(o: &ImportOutcome) -> String {
     format!(
-        "{{\"ok\":true,\"citekey\":{},\"title\":{},\"added\":{},\"skipped\":{}}}",
+        "{{\"ok\":true,\"citekey\":{},\"title\":{},\"added\":{},\"overwritten\":{},\"skipped\":{}}}",
         json_str(&o.citekey),
         json_str(&o.title),
         o.added,
+        o.overwritten,
         o.skipped
     )
 }
@@ -774,6 +870,149 @@ mod tests {
         );
         assert_eq!(identifier_to_doi("doi:10.1/x"), "10.1/x");
         assert_eq!(identifier_to_doi("10.1/x"), "10.1/x");
+    }
+
+    #[test]
+    fn openreview_id_parses_prefix_and_url_forms() {
+        assert_eq!(
+            openreview_id("openreview:2DtxPCL3T5").as_deref(),
+            Some("2DtxPCL3T5")
+        );
+        // Case-insensitive scheme; the id's own case is preserved.
+        assert_eq!(
+            openreview_id("OpenReview:Abc_1-2.3").as_deref(),
+            Some("Abc_1-2.3")
+        );
+        assert_eq!(
+            openreview_id("https://openreview.net/forum?id=2DtxPCL3T5").as_deref(),
+            Some("2DtxPCL3T5")
+        );
+        // The forum `id` wins over a sibling `noteId`.
+        assert_eq!(
+            openreview_id("https://openreview.net/pdf?id=XyZ9&noteId=qq").as_deref(),
+            Some("XyZ9")
+        );
+        // A trailing `#fragment` (a real OpenReview anchor) is dropped, not glued
+        // onto the id.
+        assert_eq!(
+            openreview_id("https://openreview.net/forum?id=2DtxPCL3T5#discussion").as_deref(),
+            Some("2DtxPCL3T5")
+        );
+        // Non-OpenReview identifiers fall through to the DOI/arXiv path.
+        assert_eq!(openreview_id("10.1145/3292500"), None);
+        assert_eq!(openreview_id("arXiv:2301.00001"), None);
+        // An id with URL-injecting characters (or empty) is refused.
+        assert_eq!(openreview_id("openreview:a&b=c"), None);
+        assert_eq!(openreview_id("openreview:"), None);
+        assert_eq!(openreview_id("https://openreview.net/forum"), None);
+    }
+
+    #[test]
+    fn connector_always_normalizes_even_with_the_toggle_off() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        // A fresh vault: `normalize_on_import` is off by default.
+        let mut v = crate::init(dir.path()).unwrap();
+        assert!(!v.config.workflow.normalize_on_import);
+        let req = ImportRequest {
+            identifier: None,
+            metadata: Some(ScrapedMetadata {
+                title: "Captured Paper Title".into(),
+                authors: vec!["Doe, Jane".into()],
+                year: "2024".into(),
+                journal: "Some Journal".into(),
+                ..Default::default()
+            }),
+            tags: vec![],
+        };
+        let out = connector_import(&mut v, &req).unwrap();
+        assert_eq!(out.added, 1);
+
+        let reopened = crate::open(dir.path()).unwrap();
+        let listed = crate::list(&reopened, crate::Filter::All).unwrap();
+        let key = listed[0].citekey.clone();
+        let title = crate::show(&reopened, &key)
+            .unwrap()
+            .fields
+            .get("title")
+            .cloned()
+            .unwrap_or_default();
+        // `protect_title_caps` (a default rule) wrapped the capitalized words in
+        // `{{…}}` — proof the connector normalized despite the toggle being off.
+        assert!(
+            title.contains("{{"),
+            "expected a normalized title, got: {title:?}"
+        );
+    }
+
+    #[test]
+    fn connector_overwrite_recapture_still_normalizes_and_retags() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = crate::init(dir.path()).unwrap();
+        // Opt into overwrite-on-duplicate (the policy the review flagged): a
+        // re-capture replaces the entry, which `new_keys()` omits — so the hooks
+        // must use `touched_keys()` to keep the "always clean" contract.
+        crate::set_workflow(&mut v, None, None, Some("overwrite"), None, None).unwrap();
+        let make = || ScrapedMetadata {
+            title: "Captured Paper Title".into(),
+            authors: vec!["Doe, Jane".into()],
+            year: "2024".into(),
+            journal: "Some Journal".into(),
+            ..Default::default()
+        };
+
+        let first = connector_import(
+            &mut v,
+            &ImportRequest {
+                identifier: None,
+                metadata: Some(make()),
+                tags: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!((first.added, first.overwritten), (1, 0));
+
+        // Re-capture the same page (a fresh vault, as the server opens per
+        // request): it collides and OVERWRITES.
+        let mut v2 = crate::open(dir.path()).unwrap();
+        let second = connector_import(
+            &mut v2,
+            &ImportRequest {
+                identifier: None,
+                metadata: Some(make()),
+                tags: vec!["updated".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (second.added, second.overwritten),
+            (0, 1),
+            "a re-capture under overwrite must replace, not add"
+        );
+
+        let reopened = crate::open(dir.path()).unwrap();
+        let listed = crate::list(&reopened, crate::Filter::All).unwrap();
+        assert_eq!(listed.len(), 1, "overwrite must not create a twin");
+        let key = listed[0].citekey.clone();
+        let title = crate::show(&reopened, &key)
+            .unwrap()
+            .fields
+            .get("title")
+            .cloned()
+            .unwrap_or_default();
+        // The overwritten entry is still normalized, and the re-capture's tag was
+        // applied — both would be skipped if the hooks used `new_keys()`.
+        assert!(
+            title.contains("{{"),
+            "overwritten entry must be normalized, got: {title:?}"
+        );
+        assert!(
+            crate::current_tags(&reopened, &key)
+                .unwrap()
+                .contains(&"updated".to_string()),
+            "tags must be applied on an overwrite re-capture"
+        );
     }
 
     #[test]

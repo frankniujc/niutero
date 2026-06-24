@@ -32,10 +32,13 @@ use niutero still gets a clean, tool-agnostic bibliography.
   duplicate detection + merge (`dedupe`).
 - **Capture from the browser**: `connector` runs a loopback-only server (no
   token — Zotero-style Origin/Host checks), and a Manifest V3 extension
-  (`extension/`, Chrome + Firefox) grabs the citation on the page you're viewing
-  — DOI pages resolve to canonical BibTeX server-side, others build from the
-  page's `citation_*` meta tags. The GUI hosts it while open. Talks only to
-  `127.0.0.1`.
+  (`extension/`, Chrome + Firefox) grabs the citation on the page you're viewing.
+  It resolves to a *canonical* source server-side — **OpenReview** pages fetch
+  the venue's official BibTeX, DOI/arXiv pages resolve via doi.org — and falls
+  back to the page's `citation_*` meta tags only when there's no identifier.
+  Every captured entry is re-keyed to your library's pattern and **normalized**,
+  so a capture lands as a clean, ready-to-use entry. The GUI hosts it while open.
+  Talks only to `127.0.0.1`.
 
 ## Quick start
 

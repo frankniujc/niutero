@@ -28,6 +28,56 @@ pub fn fetch_doi_bibtex(doi: &str) -> Result<String, String> {
     Ok(body)
 }
 
+/// Fetch the canonical BibTeX for an OpenReview submission from the OpenReview
+/// API. `id` is the submission/forum note id (the `id` query parameter of a
+/// `forum?id=…` / `pdf?id=…` page). The venue stores its official BibTeX on the
+/// note, so this is far better than scraping the forum's sparse meta tags. Tries
+/// the v2 API first, then v1 (older venues). Needs network access.
+pub fn fetch_openreview_bibtex(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("no OpenReview id".into());
+    }
+    let default = format!("OpenReview returned no BibTeX for {id}");
+    let mut last = default.clone();
+    for url in openreview_api_urls(id) {
+        log::debug!("openreview fetch: {url}");
+        match ok(&["-fsSL", "--max-time", "30", &url]) {
+            Ok(body) => match extract_openreview_bibtex(&body) {
+                Some(bib) if !bib.trim().is_empty() => return Ok(bib),
+                // 200 but no _bibtex (wrong API version / not a submission): try
+                // the next URL, and let this reached-but-empty result own the
+                // final message rather than an earlier endpoint's transport error.
+                _ => last = default.clone(),
+            },
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The OpenReview note-lookup URLs to try, newest API first. Pure. The id is a
+/// plain token (the caller validates), so it needs no URL-encoding.
+fn openreview_api_urls(id: &str) -> [String; 2] {
+    [
+        format!("https://api2.openreview.net/notes?id={id}"),
+        format!("https://api.openreview.net/notes?id={id}"),
+    ]
+}
+
+/// Pull the note's `_bibtex` out of an OpenReview notes response: `notes[0]
+/// .content._bibtex.value` (API v2 wraps every field as `{ "value": … }`) or the
+/// bare `notes[0].content._bibtex` string (API v1). Pure; `None` (not a panic)
+/// on any shape mismatch.
+fn extract_openreview_bibtex(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let bib = &value["notes"].as_array()?.first()?["content"]["_bibtex"];
+    bib["value"]
+        .as_str()
+        .or_else(|| bib.as_str())
+        .map(str::to_string)
+}
+
 /// Download `url` to `dest` (following redirects). Needs network access.
 pub fn fetch_to_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     log::debug!("download {url} -> {}", dest.display());
@@ -434,6 +484,30 @@ mod tests {
             doi_url("https://aclanthology.org/N19-1423.bib"),
             "https://aclanthology.org/N19-1423.bib"
         );
+    }
+
+    #[test]
+    fn openreview_urls_try_v2_then_v1() {
+        let urls = openreview_api_urls("ABC123");
+        assert_eq!(urls[0], "https://api2.openreview.net/notes?id=ABC123");
+        assert_eq!(urls[1], "https://api.openreview.net/notes?id=ABC123");
+    }
+
+    #[test]
+    fn extract_openreview_bibtex_handles_v2_and_v1_shapes() {
+        // v2: every field is wrapped as { "value": … }.
+        let v2 = r#"{"notes":[{"content":{"title":{"value":"T"},
+            "_bibtex":{"value":"@inproceedings{x,\n title={T}\n}"}}}]}"#;
+        assert!(extract_openreview_bibtex(v2)
+            .unwrap()
+            .contains("@inproceedings"));
+        // v1: _bibtex is a bare string.
+        let v1 = r#"{"notes":[{"content":{"_bibtex":"@article{y, title={Y}}"}}]}"#;
+        assert!(extract_openreview_bibtex(v1).unwrap().contains("@article"));
+        // Empty / missing / non-JSON → None, never a panic.
+        assert!(extract_openreview_bibtex(r#"{"notes":[]}"#).is_none());
+        assert!(extract_openreview_bibtex(r#"{"notes":[{"content":{}}]}"#).is_none());
+        assert!(extract_openreview_bibtex("not json").is_none());
     }
 
     #[test]

@@ -1,10 +1,11 @@
 # niutero browser connector (Chrome / Firefox)
 
 A small Manifest V3 extension: click the toolbar button on a paper's page and
-its reference goes straight into the library you have **open in niutero**. The
-DOI / arXiv id is resolved over the network by niutero (the same path as its
-*Import by DOI*), or scraped Highwire / Dublin Core metadata is used as an
-offline fallback.
+its reference goes straight into the library you have **open in niutero**.
+niutero resolves it to a *canonical* source over the network — an **OpenReview**
+submission's venue BibTeX, or a DOI / arXiv id (the same path as its *Import by
+DOI*) — and falls back to scraped Highwire / Dublin Core metadata only when the
+page carries no identifier.
 
 It talks to nothing but `127.0.0.1` — there is no cloud service and no telemetry.
 
@@ -16,11 +17,13 @@ It talks to nothing but `127.0.0.1` — there is no cloud service and no telemet
 ```
 
 The extension only reads the page: it returns `{ identifier, metadata }` and
-lets **niutero** decide. With a DOI or arXiv id, niutero fetches canonical
-BibTeX from doi.org; otherwise it builds an entry from the scraped meta tags.
-Either way the entry is merged (skip-on-duplicate), your import hooks run
-(enrich / normalize / PDF-fetch / auto-commit, if enabled), and the open
-library refreshes.
+lets **niutero** decide. On an OpenReview page it sends `openreview:<id>` and
+niutero fetches the venue's official BibTeX from the OpenReview API; with a DOI
+or arXiv id niutero fetches canonical BibTeX from doi.org; otherwise it builds an
+entry from the scraped meta tags. Either way the entry is re-keyed to your
+library's pattern, merged (skip-on-duplicate), **normalized**, and the rest of
+your import hooks run (enrich / PDF-fetch / auto-commit, if enabled) before the
+open library refreshes — so a capture lands as a clean, ready-to-use entry.
 
 ## Enable it in niutero first
 

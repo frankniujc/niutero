@@ -53,6 +53,13 @@
     const a = first("citation_arxiv_id");
     if (a) identifier = "arXiv:" + a.trim();
   }
+  // OpenReview: forum/pdf pages expose no usable DOI, but the venue's canonical
+  // BibTeX is one API call away. Hand the server the submission id and let it
+  // fetch the real BibTeX server-side (the extension stays loopback-only).
+  if (!identifier && /(^|\.)openreview\.net$/i.test(location.hostname)) {
+    const orId = new URLSearchParams(location.search).get("id");
+    if (orId) identifier = "openreview:" + orId;
+  }
   if (!identifier) {
     let doi = cleanDoi(
       first("citation_doi", "doi", "dc.identifier.doi", "prism.doi", "bepress_citation_doi"),
