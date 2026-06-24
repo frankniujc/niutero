@@ -413,10 +413,15 @@ fn resolve_entries(req: &ImportRequest) -> Result<Vec<BibEntry>, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        // OpenReview: the forum page exposes no usable DOI, but the venue's
-        // canonical BibTeX is one API call away — far better than the page's
-        // sparse meta tags.
-        if let Some(or_id) = openreview_id(id) {
+        // An OpenReview capture is OpenReview-ONLY: never fall through to doi.org.
+        // (Doing so turns an unreadable id into a baffling `https://doi.org/
+        // openreview:…` → HTTP 400 instead of a clear OpenReview error.) The
+        // forum page exposes no usable DOI, but the venue's canonical BibTeX is
+        // one API call away — far better than the page's sparse meta tags.
+        if is_openreview_identifier(id) {
+            let or_id = openreview_id(id).ok_or_else(|| {
+                format!("'{id}' is an OpenReview link but no submission id could be read from it")
+            })?;
             let src = niutero_online::fetch_openreview_bibtex(&or_id)?;
             return parsed_entries(&src, &format!("OpenReview {or_id}"));
         }
@@ -439,11 +444,19 @@ fn parsed_entries(src: &str, source: &str) -> Result<Vec<BibEntry>, String> {
     Ok(es)
 }
 
+/// Is this identifier meant for OpenReview — an `openreview:<id>` (what the
+/// extension sends) or any `openreview.net` URL? Such an identifier is routed to
+/// the OpenReview resolver *only*, never to doi.org.
+fn is_openreview_identifier(identifier: &str) -> bool {
+    let lower = identifier.trim().to_ascii_lowercase();
+    lower.starts_with("openreview:") || lower.contains("openreview.net")
+}
+
 /// Extract an OpenReview submission id from a connector identifier: either an
 /// explicit `openreview:<id>` (what the extension sends) or any `openreview.net`
-/// URL carrying an `id=<id>` query parameter. Returns `None` for non-OpenReview
-/// identifiers, or when the id isn't a plain token — so it can never inject into
-/// the API URL the online layer builds (it's interpolated unescaped).
+/// URL carrying an `id=<id>` query parameter. Returns `None` when the id isn't a
+/// plain token — so it can never inject into the API URL the online layer builds
+/// (it's interpolated unescaped), and the caller surfaces a clear error.
 fn openreview_id(identifier: &str) -> Option<String> {
     let s = identifier.trim();
     let lower = s.to_ascii_lowercase();
@@ -905,6 +918,33 @@ mod tests {
         assert_eq!(openreview_id("openreview:a&b=c"), None);
         assert_eq!(openreview_id("openreview:"), None);
         assert_eq!(openreview_id("https://openreview.net/forum"), None);
+        // A venue/group id (slashes) is not a submission id → refused.
+        assert_eq!(openreview_id("openreview:ICLR.cc/2024/Conference"), None);
+    }
+
+    #[test]
+    fn an_openreview_identifier_never_falls_through_to_doi() {
+        // The bug behind a real "doi.org HTTP 400": an OpenReview link whose id
+        // can't be read must yield a clear OpenReview error, NOT get shipped to
+        // doi.org as `https://doi.org/openreview:…`. This errors before any
+        // network call (the id is unreadable), so no connectivity is needed.
+        assert!(is_openreview_identifier(
+            "openreview:ICLR.cc/2024/Conference"
+        ));
+        let req = ImportRequest {
+            identifier: Some("openreview:ICLR.cc/2024/Conference".into()),
+            metadata: None,
+            tags: vec![],
+        };
+        let err = resolve_entries(&req).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("openreview"),
+            "expected an OpenReview error, got: {err}"
+        );
+        assert!(
+            !err.contains("doi.org"),
+            "must not attempt doi.org for an OpenReview link, got: {err}"
+        );
     }
 
     #[test]

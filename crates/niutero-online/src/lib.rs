@@ -21,9 +21,12 @@ pub fn fetch_doi_bibtex(doi: &str) -> Result<String, String> {
         "-H",
         "Accept: application/x-bibtex",
         &url,
-    ])?;
+    ])
+    .map_err(|e| {
+        format!("doi.org couldn't return BibTeX for '{doi}' ({e}); the DOI may be wrong or its publisher may not offer BibTeX")
+    })?;
     if body.trim().is_empty() {
-        return Err(format!("doi.org returned no BibTeX for {doi}"));
+        return Err(format!("doi.org returned no BibTeX for '{doi}'"));
     }
     Ok(body)
 }
@@ -38,8 +41,7 @@ pub fn fetch_openreview_bibtex(id: &str) -> Result<String, String> {
     if id.is_empty() {
         return Err("no OpenReview id".into());
     }
-    let default = format!("OpenReview returned no BibTeX for {id}");
-    let mut last = default.clone();
+    let mut last = "no submission with a BibTeX was found".to_string();
     for url in openreview_api_urls(id) {
         log::debug!("openreview fetch: {url}");
         match ok(&["-fsSL", "--max-time", "30", &url]) {
@@ -48,12 +50,12 @@ pub fn fetch_openreview_bibtex(id: &str) -> Result<String, String> {
                 // 200 but no _bibtex (wrong API version / not a submission): try
                 // the next URL, and let this reached-but-empty result own the
                 // final message rather than an earlier endpoint's transport error.
-                _ => last = default.clone(),
+                _ => last = "the note carries no BibTeX".to_string(),
             },
             Err(e) => last = e,
         }
     }
-    Err(last)
+    Err(format!("OpenReview lookup failed for id '{id}': {last}"))
 }
 
 /// The OpenReview note-lookup URLs to try, newest API first. Pure. The id is a
