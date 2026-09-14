@@ -41,6 +41,7 @@ impl NiuteroApp {
                 // handled here rather than in `apply_lib_action`.
                 LibAction::NewEntry(status) => self.dialog = Some(Dialog::new_entry(status)),
                 LibAction::AddByDoi => self.dialog = Some(Dialog::add_by_doi()),
+                LibAction::ExportBib => self.export_bib_flow(),
                 LibAction::AttachPdf => self.attach_pdf_flow(ctx),
                 LibAction::FetchPdf => {
                     if let Some(key) = self.lib.selected.clone() {
@@ -193,6 +194,7 @@ impl NiuteroApp {
             // must not run inside this `lib` borrow).
             LibAction::NewEntry(_)
             | LibAction::AddByDoi
+            | LibAction::ExportBib
             | LibAction::Delete(_)
             | LibAction::AttachPdf
             | LibAction::FetchPdf
@@ -258,14 +260,35 @@ impl NiuteroApp {
                 return;
             }
         };
-        let diffs = engine::normalize_preview(&lib.vault, None).unwrap_or_default();
-        let rekey = engine::rekey_preview(&lib.vault, None).unwrap_or_default();
+        // Surface preview failures (e.g. a malformed norm.toml) instead of
+        // rendering a lying "already clean" — same treatment as `analyze`.
+        let diffs = match engine::normalize_preview(&lib.vault, None) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("normalize preview: {e}");
+                self.toast = Some(format!("Normalize preview failed: {e}"));
+                return;
+            }
+        };
+        let rekey = match engine::rekey_preview(&lib.vault, None) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("rekey preview: {e}");
+                self.toast = Some(format!("Re-key preview failed: {e}"));
+                return;
+            }
+        };
         let pattern = lib
             .vault
             .config
             .citekey_pattern
             .clone()
             .unwrap_or_else(|| "{auth}{year}{title.1}{Title.2}".into());
+        // The Ruleset toggles mirror the vault's norm.toml (not a local guess).
+        match engine::norm_config(&lib.vault) {
+            Ok(cfg) => self.norm.rules = crate::normalize::rules_from_config(&cfg),
+            Err(e) => warn!("norm config: {e}"),
+        }
         let total = report.total;
         self.norm_cache = Some(NormCache {
             report,
@@ -278,7 +301,14 @@ impl NiuteroApp {
 
     fn apply_norm_action(&mut self, action: NormAction, ctx: &egui::Context) {
         match action {
-            NormAction::RunOffline => self.norm.view = NormView::Review,
+            NormAction::RunOffline => {
+                // Recompute from the current library — a cached preview may
+                // predate edits made since it was built.
+                self.norm_cache = None;
+                self.norm.done.clear();
+                self.norm.view = NormView::Review;
+            }
+            NormAction::ToggleRule(i) => self.toggle_norm_rule(i),
             NormAction::StartEnrich => self.start_enrich(ctx),
             NormAction::RefreshRekey => {
                 let res = self
@@ -337,8 +367,76 @@ impl NiuteroApp {
         }
     }
 
+    /// Flip one Ruleset toggle: persist it to `.niutero/norm.toml` through the
+    /// engine, reseed the toggles from what was actually saved, and drop the
+    /// cached preview (the rules changed).
+    fn toggle_norm_rule(&mut self, i: usize) {
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+        let Some(key) = crate::normalize::rule_option_key(i) else {
+            return;
+        };
+        let next = !self.norm.rules.get(i).copied().unwrap_or(true);
+        let value = match (key, next) {
+            ("max_authors", true) => "25",
+            ("max_authors", false) => "0",
+            (_, true) => "true",
+            (_, false) => "false",
+        };
+        match engine::set_norm_option(&lib.vault, key, value) {
+            Ok(cfg) => {
+                self.norm.rules = crate::normalize::rules_from_config(&cfg);
+                self.norm_cache = None;
+            }
+            Err(e) => self.toast = Some(format!("Could not update norm.toml: {e}")),
+        }
+    }
+
+    /// Export the entries the Library currently shows (the active tag + the
+    /// search box; everything when both are empty) to a `.bib` the user picks —
+    /// `engine::export`, so the source-of-truth guard, crossref closure, and
+    /// verbatim blocks apply exactly as in the CLI.
+    fn export_bib_flow(&mut self) {
+        let Some(lib) = self.library.as_ref() else {
+            self.toast = Some("Open a library first".into());
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("BibTeX", &["bib"])
+            .set_file_name("export.bib")
+            .save_file()
+        else {
+            return;
+        };
+        let mut terms: Vec<String> = Vec::new();
+        if let Some(t) = &self.lib.active_tag {
+            terms.push(format!("tag:{t}"));
+        }
+        let q = self.lib.search.trim();
+        if !q.is_empty() {
+            terms.push(q.to_string());
+        }
+        let filter = if terms.is_empty() {
+            engine::Filter::All
+        } else {
+            engine::Filter::Query(terms.join(" "))
+        };
+        match engine::export(&lib.vault, filter, &path, false) {
+            Ok(keys) => {
+                self.toast = Some(format!(
+                    "Exported {} entr(ies) to {}",
+                    keys.len(),
+                    path.display()
+                ))
+            }
+            Err(e) => self.toast = Some(format!("Export failed: {e}")),
+        }
+    }
+
     /// Apply every staged change not rejected: a single atomic `normalize_apply`
-    /// when nothing is rejected, else `edit` per accepted entry.
+    /// when nothing is rejected, else one keyed `normalize_apply_keys` over the
+    /// accepted entries.
     fn apply_all_norm(&mut self) {
         let none_rejected = !self.norm.done.values().any(|v| !v);
         let mut applied = 0usize;
@@ -352,28 +450,33 @@ impl NiuteroApp {
                 }
             }
         } else {
-            let to_apply: Vec<(String, Vec<String>, Vec<String>)> = self
+            // Only the accepted entries — one atomic, validated write through
+            // `normalize_apply_keys` (the old per-entry `edit` loop was O(n)
+            // full rewrites and left the library half-applied on an error).
+            let accepted: Vec<String> = self
                 .norm_cache
                 .as_ref()
                 .map(|c| {
                     c.diffs
                         .iter()
                         .filter(|d| self.norm.done.get(&d.citekey) != Some(&false))
-                        .map(|d| {
-                            let (s, u) = norm_edit_args(d);
-                            (d.citekey.clone(), s, u)
-                        })
+                        .map(|d| d.citekey.clone())
                         .collect()
                 })
                 .unwrap_or_default();
             if let Some(lib) = self.library.as_ref() {
-                for (k, s, u) in &to_apply {
-                    match engine::edit(&lib.vault, k, s, u, None) {
-                        Ok(()) => applied += 1,
-                        Err(e) => {
-                            error = Some(e);
-                            break;
+                if !accepted.is_empty() {
+                    match engine::normalize_apply_keys_report(&lib.vault, &accepted, None) {
+                        Ok(report) => {
+                            applied = report.changes.len();
+                            if !report.skipped.is_empty() {
+                                warn!(
+                                    "normalize: skipped {} invalid proposal(s)",
+                                    report.skipped.len()
+                                );
+                            }
                         }
+                        Err(e) => error = Some(e),
                     }
                 }
             }
@@ -586,26 +689,13 @@ impl NiuteroApp {
                     rep.overwritten,
                 ));
                 // Opt-in post-import hooks (PDF auto-fetch / enrich-on-import)
-                // run off-thread; a no-op when both prefs are off.
-                self.start_post_import(rep.new_keys(), ctx);
+                // run off-thread; a no-op when both prefs are off. Touched
+                // keys, so overwritten entries are re-cleaned too.
+                self.start_post_import(rep.touched_keys(), ctx);
             }
             Err(e) => self.toast = Some(format!("Import failed: {e}")),
         }
     }
-}
-
-/// Translate a normalize change into `engine::edit` arguments: `FIELD=VALUE`
-/// for each set, and field names to unset (a change to nothing).
-fn norm_edit_args(d: &niutero_engine::NormChange) -> (Vec<String>, Vec<String>) {
-    let mut set = Vec::new();
-    let mut unset = Vec::new();
-    for c in &d.diffs {
-        match &c.to {
-            Some(v) => set.push(format!("{}={}", c.field, v)),
-            None => unset.push(c.field.clone()),
-        }
-    }
-    (set, unset)
 }
 
 /// Render the staged normalization changes as a human-readable text patch.

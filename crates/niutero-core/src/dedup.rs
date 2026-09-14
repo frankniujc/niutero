@@ -51,6 +51,46 @@ fn alnum_fold(s: &str) -> String {
         .collect()
 }
 
+/// Content identity: are these two entries the same *work*? True on DOI
+/// equality (trimmed, case-folded, doi.org prefix stripped), URL equality
+/// (trimmed), or a normalized-title match ([`alnum_fold`], both non-empty).
+/// Title-only on purpose: an author-less metadata capture must still match its
+/// stored twin. The connector uses this to tell "same paper re-captured" from
+/// "different paper whose citekey merely collides".
+pub fn same_work(a: &BibEntry, b: &BibEntry) -> bool {
+    fn doi_of(e: &BibEntry) -> Option<String> {
+        // Case-fold first so `DOI:`/`https://DOI.org/` spellings strip too
+        // (DOIs themselves are case-insensitive).
+        let d = e.get("doi")?.trim().to_ascii_lowercase();
+        let d = d
+            .strip_prefix("https://doi.org/")
+            .or_else(|| d.strip_prefix("http://doi.org/"))
+            .or_else(|| d.strip_prefix("https://dx.doi.org/"))
+            .or_else(|| d.strip_prefix("doi:"))
+            .unwrap_or(&d);
+        (!d.is_empty()).then(|| d.to_string())
+    }
+    fn url_of(e: &BibEntry) -> Option<String> {
+        let u = e.get("url")?.trim();
+        (!u.is_empty()).then(|| u.to_string())
+    }
+    fn title_of(e: &BibEntry) -> Option<String> {
+        let t = alnum_fold(e.get("title")?);
+        (!t.is_empty()).then_some(t)
+    }
+    if let (Some(x), Some(y)) = (doi_of(a), doi_of(b)) {
+        if x == y {
+            return true;
+        }
+    }
+    if let (Some(x), Some(y)) = (url_of(a), url_of(b)) {
+        if x == y {
+            return true;
+        }
+    }
+    matches!((title_of(a), title_of(b)), (Some(x), Some(y)) if x == y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +140,45 @@ mod tests {
             BibEntry::new("misc", "y").with_field("title", "T"), // no author
         ];
         assert!(duplicate_groups(&entries).is_empty());
+    }
+
+    #[test]
+    fn same_work_by_doi_in_any_spelling() {
+        let a = BibEntry::new("misc", "a").with_field("doi", "10.1145/1234.5678");
+        let b = BibEntry::new("misc", "b").with_field("doi", "https://doi.org/10.1145/1234.5678");
+        let c = BibEntry::new("misc", "c").with_field("doi", "DOI:10.1145/1234.5678");
+        assert!(same_work(&a, &b));
+        assert!(same_work(&a, &c));
+    }
+
+    #[test]
+    fn same_work_by_title_despite_braces_and_case() {
+        let a = BibEntry::new("misc", "a").with_field("title", "{{Attention}} Is All You Need");
+        let b = BibEntry::new("misc", "b").with_field("title", "attention is all you need!");
+        assert!(same_work(&a, &b));
+    }
+
+    #[test]
+    fn same_work_by_url() {
+        let a = BibEntry::new("misc", "a").with_field("url", "https://openreview.net/forum?id=X1");
+        let b = BibEntry::new("misc", "b")
+            .with_field("title", "Completely Different")
+            .with_field("url", "https://openreview.net/forum?id=X1");
+        assert!(same_work(&a, &b));
+    }
+
+    #[test]
+    fn different_papers_with_a_shared_key_shape_are_not_same_work() {
+        let a = BibEntry::new("misc", "a")
+            .with_field("title", "Learning to Compress Prompts")
+            .with_field("doi", "10.1/x");
+        let b = BibEntry::new("misc", "b")
+            .with_field("title", "Learning to Compress Videos")
+            .with_field("doi", "10.1/y");
+        assert!(!same_work(&a, &b));
+        // and with no doi/url at all, distinct titles stay distinct
+        let c = BibEntry::new("misc", "c").with_field("title", "Alpha");
+        let d = BibEntry::new("misc", "d").with_field("title", "Beta");
+        assert!(!same_work(&c, &d));
     }
 }

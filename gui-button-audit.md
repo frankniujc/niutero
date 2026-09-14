@@ -53,8 +53,9 @@
 >   holds again).
 >
 > **Still mock / unchanged:**
-> - **B.1 Normalize ruleset toggles** — still display-only; engine still has no
->   ruleset read/write.
+> - ~~B.1 Normalize ruleset toggles~~ — **real as of 2026-09-13** (persist to
+>   `norm.toml` via `engine::set_norm_option`); the Library toolbar also gained
+>   a real Export button.
 > - Settings: library name / citekey-pattern fields, workflow toggles,
 >   fonts/density — visual-only; keymap / integrations pages — stubs; the PDF
 >   page's HF-token input is disabled ("coming soon").
@@ -171,7 +172,7 @@ with AI") are listed but flagged, not specced.
 | Review: **Apply all** | **Real** — `engine::normalize_apply` (or per-entry `edit` when some rejected) | — | ✅ wired |
 | Review: Accept / Reject / Reject all / Copy as patch | **Real** — staging + clipboard | — | ✅ wired |
 | Review: **Back to overview** | **Real** — nav | — | — |
-| Ruleset: 6 rule **toggles** | **Placeholder** — flips in-memory `st.rules[i]` only; **not persisted, runs ignore it** (`normalize.rs:614`, doc note) | Read/write the vault's normalize ruleset (`.niutero/norm.toml` profile) and pass it to preview/apply | ❌ **no engine fn** to read/write the ruleset profile (preview/apply only take a *profile name*) |
+| Ruleset: 8 rule **toggles** | **Real** — each toggle calls `engine::set_norm_option` (persists to `.niutero/norm.toml` in its documented form) and the rows are reseeded from `engine::norm_config`; the keep-list row is "always on" (edit the list via `norm-config`) | — | ✅ `norm_config` / `set_norm_option` (CLI: `norm-config`) |
 | Re-key: **Apply re-key** | **Real** — `engine::rekey_apply` | — | ✅ wired |
 | Re-key: **Preview all {n}** | **Placeholder** — click discarded (`normalize.rs:740`) | Run & show the full preview | ✅ `rekey_preview` (likely already computed for the cache — trivial wire) |
 
@@ -208,8 +209,8 @@ These are wired-up-able wins — the engine function is there, nothing in the GU
 | Delete an entry | ✅ `rm(citekey)` | Detail panel / row context menu — **no delete button anywhere** |
 | Merge duplicates | ✅ `dedupe_preview` / `dedupe_merge` | Normalize |
 | Saved views (filters) | ✅ `views` / `add_view` / `remove_view` | Tags sidebar / Reader filter |
-| Export (whole / by keys / by filter) | ✅ `export` / `export_keys` | A menu or Settings — **no export UI** |
-| Keep-updated export targets | ✅ `export_targets` / `_add` / `_remove` / `refresh_exports` | Settings (out of scope) |
+| Export (whole / by keys / by filter) | ✅ `export` / `export_keys` | **Real** — the Library toolbar's Export button (`LibAction::ExportBib`) exports the shown entries (active tag + search) via `engine::export` |
+| Keep-updated export targets | ✅ `export_targets` / `_add` / `_remove` / `refresh_exports` — **the GUI now refreshes registered mirrors after every mutation** (`after_mutation`, with an "emptied" toast); add/remove UI still Settings (out of scope) |
 | LaTeX `\cite` scan | ✅ `tex_scan(tex_files)` | A "used in my paper" feature — no UI |
 | Entry history (git) | ✅ `history(citekey)` | Detail panel — no history view |
 | Capture (browser/paste BibTeX) | ✅ `capture(bibtex)` | Add-entry flow |
@@ -233,9 +234,9 @@ Normalize ruleset**, and **sync**.
 7. **Board card drag-between-columns** → `set_status` (new gesture, engine ready).
 
 ### B. Placeholders that need *new engine work* first
-1. **Normalize ruleset toggles** → need an engine fn to read/write the vault's
-   normalize profile (`.niutero/norm.toml`); today preview/apply only accept a
-   profile *name*. ❌
+1. ~~**Normalize ruleset toggles**~~ — done: `engine::norm_config` /
+   `set_norm_option` + CLI `norm-config`; the toggles persist to
+   `.niutero/norm.toml`. ✅
 
 ### C. Placeholders that are *GUI-only* (no engine; build or drop)
 1. **Board layout toggle (Rows/Grid)** — decide whether to implement the grid

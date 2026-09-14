@@ -186,6 +186,9 @@ pub enum LibAction {
     NewEntry(Option<Status>),
     /// Open the "add by DOI / import a .bib file" dialog.
     AddByDoi,
+    /// Export the entries currently shown (active tag + search) to a `.bib`
+    /// the user picks (`engine::export`).
+    ExportBib,
     /// Delete the entry with this cite key (opens a confirm dialog first).
     Delete(String),
 }
@@ -622,6 +625,12 @@ fn item_list(
                     .clicked()
                 {
                     actions.push(LibAction::AddByDoi);
+                }
+                if icon_btn(ui, theme, Glyph::Doc, false)
+                    .on_hover_text("Export the shown entries to a .bib file")
+                    .clicked()
+                {
+                    actions.push(LibAction::ExportBib);
                 }
                 // search box fills the middle, but bounded so the right toggle fits
                 let search_w = (ui.available_width() - 42.0).max(80.0);
@@ -1669,17 +1678,11 @@ fn matches_filter(e: &EntryView, active_tag: &Option<String>, search_lower: &str
     active_tag.as_ref().is_none_or(|t| e.tags.contains(t)) && matches_search(e, search_lower)
 }
 
+/// The search box speaks the CLI's `--query` language (`tag:` / `status:` /
+/// `stars:` terms plus free text, all ANDed) through the engine — so what the
+/// GUI shows is exactly what `list --query` / `export --query` select.
 fn matches_search(e: &EntryView, q: &str) -> bool {
-    if q.is_empty() {
-        return true;
-    }
-    if e.citekey.to_lowercase().contains(q) {
-        return true;
-    }
-    if e.tags.iter().any(|t| t.to_lowercase().contains(q)) {
-        return true;
-    }
-    e.fields.values().any(|v| v.to_lowercase().contains(q))
+    niutero_engine::view_matches(q, e)
 }
 
 /// Compute the visible row order: filter to the active tag/search, then sort by

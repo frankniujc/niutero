@@ -200,6 +200,27 @@ pub fn fetchable_pdf_url(url: &str) -> Option<String> {
             }
         }
     }
+    // OpenReview: the forum (or pdf) page's `id` names the PDF endpoint —
+    // what every connector capture from openreview.net carries as its url.
+    if path.starts_with("https://openreview.net/forum")
+        || path.starts_with("https://openreview.net/pdf")
+    {
+        let query = u.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let id = query
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("id="))
+            .unwrap_or("");
+        if !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            return Some(format!("https://openreview.net/pdf?id={id}"));
+        }
+    }
     None
 }
 

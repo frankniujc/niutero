@@ -14,7 +14,7 @@
 //! write never overlap.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText};
@@ -94,13 +94,14 @@ impl Library {
 
 /// GUI-hosted browser connector: the server runs (on a background thread) while
 /// the app is open and `enabled`, importing captures into the currently-open
-/// library. `shared` is rewritten each frame to track that library; `refresh` is
-/// set by the server thread after an import so the next frame reloads + toasts.
+/// library. `shared` is rewritten each frame to track that library; the server
+/// thread pushes each capture's outcome into `pending` so the next frame can
+/// toast accurately and reload only when something actually changed.
 struct ConnectorState {
     /// User toggle, persisted machine-local in `UiPrefs::connector_enabled`.
     enabled: bool,
     shared: Arc<Mutex<engine::ConnectorShared>>,
-    refresh: Arc<AtomicBool>,
+    pending: Arc<Mutex<Vec<engine::ImportOutcome>>>,
     handle: Option<engine::ServerHandle>,
     /// Last start failure (e.g. port busy); also gates the start retry.
     error: Option<String>,
@@ -112,7 +113,7 @@ impl Default for ConnectorState {
         Self {
             enabled: false,
             shared: Arc::new(Mutex::new(engine::ConnectorShared::default())),
-            refresh: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(Mutex::new(Vec::new())),
             handle: None,
             error: None,
             port: engine::CONNECTOR_DEFAULT_PORT,
@@ -331,6 +332,31 @@ impl NiuteroApp {
     /// plain open/load, which must not commit a user's pending edits.
     pub(super) fn after_mutation(&mut self) {
         if let Some(lib) = self.library.as_ref() {
+            // Keep-updated export mirrors track every mutation — the CLI does
+            // this after each command; the GUI must not let them diverge.
+            // Cheap when nothing is registered (one registry read).
+            let mut toasts: Vec<String> = Vec::new();
+            match engine::refresh_exports(&lib.vault) {
+                Ok(outcomes) => {
+                    for o in outcomes {
+                        if let Some(e) = o.error {
+                            toasts.push(format!(
+                                "Keep-updated export to {} failed: {e}",
+                                o.out.display()
+                            ));
+                        } else if o.emptied {
+                            toasts
+                                .push(format!("Keep-updated mirror emptied: {}", o.out.display()));
+                        }
+                    }
+                }
+                Err(e) => toasts.push(format!("Keep-updated refresh skipped: {e}")),
+            }
+            for t in toasts {
+                self.set_toast(t);
+            }
+        }
+        if let Some(lib) = self.library.as_ref() {
             if let Err(e) = engine::auto_commit_if_enabled(&lib.vault) {
                 self.set_toast(format!("Auto-commit failed: {e}"));
             }
@@ -357,33 +383,63 @@ impl NiuteroApp {
             }
         }
 
-        // A capture landed on the server thread, which wrote through its own
-        // vault instance (the .bib AND the sidecar tags). Re-open so the GUI's
-        // in-memory config/meta match disk, then re-list; a plain reload would
-        // miss the sidecar changes.
-        if self.connector.refresh.swap(false, Ordering::SeqCst) {
-            if let Some(lib) = self.library.as_mut() {
-                let root = lib.vault.root.clone();
-                match engine::open(&root) {
-                    Ok(v) => lib.vault = v,
-                    Err(e) => warn!("connector refresh: reopen failed: {e}"),
-                }
-                lib.reload();
+        // Captures landed on the server thread, which wrote through its own
+        // vault instance (the .bib AND the sidecar tags). Toast per outcome;
+        // re-open/reload only when something actually changed on disk (a plain
+        // "already in your library" skip must not cost a reopen + git calls).
+        let outcomes: Vec<engine::ImportOutcome> = self
+            .connector
+            .pending
+            .lock()
+            .map(|mut p| p.drain(..).collect())
+            .unwrap_or_default();
+        if !outcomes.is_empty() {
+            let mut changed = false;
+            for o in &outcomes {
+                let wrote = o.added + o.overwritten + o.renamed > 0;
+                // A tags-updated skip still mutated the sidecar → reload too.
+                changed |= wrote || o.tags_updated;
+                let name = if o.title.is_empty() {
+                    o.citekey.clone()
+                } else {
+                    o.title.clone()
+                };
+                let msg = if o.added + o.renamed > 0 {
+                    format!("Captured from the browser: {name}")
+                } else if o.overwritten > 0 {
+                    format!("Updated from the browser: {name}")
+                } else if o.tags_updated {
+                    "Already in the library — tags updated".to_string()
+                } else {
+                    "Already in the library".to_string()
+                };
+                self.set_toast(msg);
             }
-            self.refresh_git();
-            self.set_toast("Captured a reference from the browser");
+            if changed {
+                if let Some(lib) = self.library.as_mut() {
+                    let root = lib.vault.root.clone();
+                    match engine::open(&root) {
+                        Ok(v) => lib.vault = v,
+                        Err(e) => warn!("connector refresh: reopen failed: {e}"),
+                    }
+                    lib.reload();
+                }
+                self.refresh_git();
+            }
         }
 
         // Start or stop to match the toggle.
         if self.connector.enabled {
             if self.connector.handle.is_none() && self.connector.error.is_none() {
-                let refresh = Arc::clone(&self.connector.refresh);
+                let pending = Arc::clone(&self.connector.pending);
                 let ctx = ctx.clone();
                 let cfg = engine::ConnectorConfig {
                     port: self.connector.port,
                     shared: Arc::clone(&self.connector.shared),
-                    on_import: Arc::new(move || {
-                        refresh.store(true, Ordering::SeqCst);
+                    on_import: Arc::new(move |o: &engine::ImportOutcome| {
+                        if let Ok(mut p) = pending.lock() {
+                            p.push(o.clone());
+                        }
                         ctx.request_repaint();
                     }),
                 };

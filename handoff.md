@@ -348,6 +348,159 @@ before pushing:
   initializes `env_logger`; secrets are never logged), plus assorted
   stale-doc / dead-code cleanup.
 
+## 2026-09-13 — second pass: every audit leftover that's fixable offline
+
+User: "能修的都修一下". Everything from the 2026-08-31 deferred list that
+doesn't need an API key, Chrome, or a live network was implemented, with tests
+(`cargo test --workspace` green, clippy `-D warnings` + fmt clean). Still
+UNCOMMITTED together with the 2026-08-31 wave.
+
+**Connector**
+- Requests are served on **per-connection threads** (`serve_loop` only
+  accepts): a capture mid-fetch no longer blocks the next one, and toggling the
+  connector off in the GUI joins only the accept loop — no more freeze through
+  a curl timeout. `engine::lock_vault` now **waits up to ~2 s** for a
+  concurrent holder (was: immediate failure), so a GUI edit racing a capture is
+  a pause, not a lost capture.
+- Metadata fallback entries **keep the failed identifier** (`attach_identifier`:
+  DOI → `doi`, arXiv → `eprint`/`archiveprefix`) so `enrich`/the arXiv pass can
+  finish later; a venue-typed page with a blank venue tag builds `@misc`, not
+  a hollow `@inproceedings`.
+- `fetchable_pdf_url` maps OpenReview forum/pdf urls → `openreview.net/pdf?id=`
+  (PDF auto-fetch now works for connector captures from OpenReview).
+- `scrape.js` recognizes `arxiv.org/html/` pages.
+
+**Normalization**
+- `keep_fields` gains `crossref` + `editor` (deliberate spec deviation; export's
+  crossref closure now survives normalization).
+- Titles containing a LaTeX command keep their brace groups (`\emph{…}`,
+  `{\'e}`) — only bare capitalized words get `{{…}}`.
+- `workflow.normalize_profile` (`config --normalize-profile NAME`, `""` clears,
+  validated): the automatic paths (hooks, connector, `add`) normalize with it.
+- **Ruleset read/write**: `NormConfig::{to_toml, save, set_option}` render the
+  documented `norm.toml` (comments kept, profiles as tables); engine
+  `norm_config` / `set_norm_option`; CLI `norm-config <vault> [--set k=v…]
+  [--json]`; the GUI Ruleset toggles are REAL (persist + reseed from the file;
+  keep-list row is "always on").
+- Per-acronym regexes are cached (`cached_regex`).
+
+**Export / GUI**
+- `export --json` lists the written `keys`; `export --out -` streams to stdout
+  (`engine::export_to_string`; refused with `--json`); `export`/`export_keys`
+  return the keys.
+- GUI Library toolbar **Export** button (`LibAction::ExportBib` →
+  `export_bib_flow`): exports what's shown (active tag + search) through
+  `engine::export`.
+- GUI search = CLI query: `engine::view_matches` wraps
+  `filter::entry_matches`; core free text now also matches **tags** on both
+  sides (one language, one result set).
+- Normalize Review: "Run offline cleanup" recomputes the preview (was stale);
+  partial Apply-all uses one atomic `normalize_apply_keys_report` over the
+  accepted keys (was an O(n) per-entry `edit` loop that could half-apply);
+  `norm_edit_args` removed.
+
+**Left (needs something this machine doesn't have)**: live capture matrix
+(Chrome), Firefox, AI smoke (API key), HF PDF push/pull (token), a JS test
+harness for `extension/`, CI. Profile inheritance stays defaults-based
+(documented). Old-style arXiv ids (`math.GT/0309136`) still build a DataCite DOI
+that may 404 — rescued by the metadata fallback.
+
+## 2026-08-31 — audited bug-fix wave: connector · normalization · export
+
+User report: connector import, normalization, and export were still "not quite
+right" (CIKM captures specifically called out). Three deep audits (~60
+findings) → a user-approved Critical+High fix wave, all landed with regression
+tests (`cargo test --workspace` green, clippy `-D warnings` clean):
+
+**Normalization (`niutero-norm`)**
+- **CIKM root cause fixed**: ACM spells CIKM ≥2021 "Information **&** Knowledge
+  Management"; venue matching now folds `\&`/`&amp;`/`&#38;`/`&` to " and "
+  (`acronym_haystack`), and a new `fix_entities` value pass (default on)
+  decodes HTML entities + escapes bare `&` → `\&` (math spans and url/eprint
+  exempt).
+- **Missing arXiv pass ported** from the spec (`normalize_arxiv`, default on):
+  every arXiv shape collapses to `@misc` + eprint/archiveprefix/url; real
+  venues untouched; JSTOR excluded.
+- **Canonicalization guards** (decision: replace-style kept, guarded):
+  workshop/companion/tutorial/shared-task/co-located signals, foreign paren
+  acronyms (VISAPP, EMNLP-IJCNLP), and disjoint second venues (joint
+  proceedings) block whole-string replacement → append-only fallback. LREC
+  pattern tightened so the LREV *journal* is untouched.
+- **Write safety**: `normalize_apply*` validates every proposal
+  (`NormReport.skipped`, kept-as-is + warning); a library holding an invalid
+  entry refuses to apply at all (any write re-serializes everything).
+  Volume-strip is brace-safe and runs before bare-acronym expansion (spec
+  order — `{ACL (Volume 1: Long Papers)}` now canonicalizes).
+- Config hardening: malformed `norm.toml` / empty `keep_fields` are **errors**
+  (was: silent full-default fallback that would rewrite the library);
+  `keep_fields` lowercased; `doi_to_url = false` now KEEPS the doi; the
+  doi→url note only claims what happened. Math-mode titles skip `{{…}}`
+  protection. New venues: AACL, IJCNLP, ICASSP, Interspeech, ECAI.
+- **One hook pipeline**: `run_import_hooks` (enrich → normalize → PDFs over
+  `touched_keys()`) now used by CLI import, GUI import, GUI DOI-import, and
+  the connector — overwritten entries are re-cleaned (three call sites used
+  `new_keys()` and skipped them). `add`/paste-BibTeX honors
+  `normalize_on_import` too.
+
+**Connector (`niutero-engine/src/connector.rs`, `extension/`)**
+- **CSRF fix**: `Origin: null` no longer accepted; `POST /import` requires a
+  present extension Origin (`/ping` still curl-able); request-head capped
+  (16 KiB → 413).
+- **Different paper, colliding citekey** is now ADDED under a letter-suffixed
+  key (new `dedup::same_work`: DOI ∥ URL ∥ normalized-title identity) — was
+  silently dropped as a "duplicate". Rename-policy re-captures report
+  `renamed` (popup says "Saved", not "Already in your library").
+- **Metadata fallback**: a failed identifier resolution (doi.org 5xx, venue
+  without BibTeX, unreadable OpenReview id) saves from the page's scraped
+  metadata, outcome marked `fallback` (popup: "saved from page metadata").
+  OpenReview still never falls through to doi.org.
+- **Tags on skip**: a duplicate re-capture applies the popup's tags to the
+  stored entry (`tags_updated`); popup re-enables Save.
+- Popup title is brace-stripped for display (stored entry keeps `{{…}}`);
+  `on_import` callback carries the outcome, so the GUI toasts accurately and
+  reloads only when something changed. `scrape.js`: OpenReview check runs
+  before arXiv meta tags and only claims `/forum|/pdf|/attachment` paths.
+  CLI `connector --port` defaults from `engine::CONNECTOR_DEFAULT_PORT`.
+
+**Export (engine + CLI + GUI)**
+- **CRITICAL fixed**: `export`/`export_keys` now run the `resolve_export_out`
+  guard (refuse the vault's own `references.bib` — any casing — and
+  `.niutero/`) and take the vault lock. A zero-match export **errors and
+  writes nothing** unless `--allow-empty`.
+- Exports are self-contained: `@string`/`@preamble`/`@comment` blocks ride
+  along and crossref parents are pulled in (after the citing entries), both
+  paths incl. tex-scan `--out`; every exported entry passes `validate()`.
+- Keep-updated mirrors: `ExportOutcome.emptied` + loud warnings (CLI stderr,
+  GUI toast, connector log); **the GUI now refreshes mirrors after every
+  mutation** (`after_mutation`) — they used to silently diverge.
+- GUI: normalize/rekey preview errors surface as toasts (was: silent "already
+  clean"); the Ruleset tab copy matches the real passes.
+
+**Deliberately deferred (from the audits' Medium/Low leftovers)**
+- Connector: GUI freeze on toggle-off mid-fetch (stop() joins through a curl
+  timeout); vault-lock contention kills a capture (no retry); old-style arXiv
+  ids (`math.GT/0309136`) build a 404 DataCite DOI (now rescued by the
+  metadata fallback); `arxiv.org/html/` pages carry no identifier (ditto);
+  PDF auto-fetch never fires for OpenReview/DOI urls (`fetchable_pdf_url` too
+  narrow); `metadata.doi` in scrape.js is dead code; `already_has_acronym`
+  recompiles its regex per call.
+- Norm: no profile plumbing on automatic paths (always base config); profile
+  inheritance is from built-in defaults (documented footgun); `crossref` not
+  in KEEP_FIELDS (normalize drops it, undermining export's closure);
+  `\emph{}`-style commands still flattened by `strip_all_braces` (spec
+  behavior).
+- Export/GUI: no one-shot export UI; no `--out -` stdout mode; export `--json`
+  doesn't list the exported keys; GUI filter box ≠ CLI query semantics
+  (different implementations); Ruleset toggles still display-only.
+- No JS test harness for `extension/`.
+
+**Still to do**: the live mainstream-venue capture matrix (openreview.net,
+arxiv.org/abs, aclanthology.org, proceedings.mlr.press, openaccess.thecvf.com,
+dl.acm.org **with a CIKM ≥2022 paper**, ieeexplore.ieee.org — check venue
+canonicalized, `\&` stored, citekey pattern, re-capture per policy, popup
+texts) — needs the GUI closed + rebuilt first (stale-exe gotcha), then live
+browsing. And the `NIUTERO_BIB_FIXTURE` corpus run.
+
 ## 2026-06-24 — connector imports a clean entry: OpenReview BibTeX + always-normalize
 
 User report: connector imports weren't good — an OpenReview page like
@@ -388,6 +541,19 @@ apply the normalize rules, so a capture lands as a finished entry. Done:
   (`forum?id=2DtxPCL3T5`) returned `skipped:1` (dedupe + URL-form id parsing both
   work); tags applied. Full gate green: workspace tests (engine 110, online 12),
   fmt + clippy clean.
+- **Follow-up fix (`a719479`, COMMITTED, NOT pushed):** a user capture hit
+  `Not saved: curl failed (… 400)`. Root cause: an OpenReview link whose `?id=`
+  isn't a plain submission id (a venue/group page, e.g.
+  `openreview:ICLR.cc/2024/Conference`) failed `openreview_id`'s charset guard and
+  **fell through to the DOI path** → `https://doi.org/openreview:…` → doi.org
+  HTTP 400 (only doi.org/OpenReview-empty-id produce 400; bogus ids/DOIs 404).
+  Fix: `resolve_entries` routes any OpenReview identifier (new
+  `is_openreview_identifier`) to the OpenReview resolver **only** — an unreadable
+  id now returns a clear "no submission id could be read" error, never a doi.org
+  request. Fetch errors made actionable (`OpenReview lookup failed for id 'X': …`;
+  `fetch_doi_bibtex` names the DOI). Verified live. NOTE: real OpenReview *paper*
+  forum/pdf ids are simple base62 (alnum + `-`), which the guard accepts; only
+  non-paper pages are rejected (correctly — nothing single to import).
 - **Reviewed by a 4-dimension adversarial workflow** (read-only reviewers).
   Fixed all confirmed findings: (1, medium) the **`on_dup = overwrite` path
   bypassed the always-normalize/tag guarantee** — `new_keys()` omits overwritten

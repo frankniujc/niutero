@@ -33,7 +33,8 @@ impl<'a> Facets<'a> {
 /// * `stars:N` / `stars:>=N` / `stars:>N` / `stars:<=N` / `stars:<N` — the
 ///   rating (absent == 0);
 /// * any other term — a case-insensitive substring over the cite key, the
-///   entry type, and the field values.
+///   entry type, the field values, and the tags (so the CLI, the GUI search
+///   box, and `export --query` agree on what "nlp" finds).
 ///
 /// An empty query matches everything.
 pub fn entry_matches(query: &str, entry: &BibEntry, facets: &Facets) -> bool {
@@ -61,6 +62,10 @@ fn term_matches(term: &str, entry: &BibEntry, facets: &Facets) -> bool {
             .fields
             .values()
             .any(|v| v.to_lowercase().contains(&needle))
+        || facets
+            .tags
+            .iter()
+            .any(|t| t.to_lowercase().contains(&needle))
 }
 
 /// Match a `stars:` comparison spec (`N`, `>=N`, `>N`, `<=N`, `<N`) against a
@@ -120,6 +125,13 @@ mod tests {
             &Facets::default()
         ));
         assert!(!entry_matches("theory zzz", &sample(), &Facets::default()));
+    }
+
+    #[test]
+    fn free_text_matches_tags_too() {
+        let tags = vec!["topics:nlp".to_string()];
+        assert!(entry_matches("nlp", &sample(), &Facets::tags(&tags)));
+        assert!(!entry_matches("nlp", &sample(), &Facets::default()));
     }
 
     #[test]

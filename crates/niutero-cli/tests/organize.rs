@@ -252,13 +252,16 @@ fn tags_rename_refreshes_keep_updated_exports() {
         .success();
     assert!(fs::read_to_string(&mirror).unwrap().contains("@misc{k"));
 
-    // After the rename nothing carries `thesis`, so the mirror empties.
+    // After the rename nothing carries `thesis`, so the mirror empties — and
+    // the emptying is called out loudly on stderr (an Overleaf checkout
+    // building against the mirror would fail its next run).
     niutero()
         .arg("tags")
         .arg(d.path())
         .args(["rename", "thesis", "topics:thesis"])
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains("mirror emptied"));
     assert!(!fs::read_to_string(&mirror).unwrap().contains("@misc{k"));
 }
 

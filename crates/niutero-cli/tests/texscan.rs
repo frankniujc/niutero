@@ -95,6 +95,29 @@ fn out_writes_pruned_bib() {
 }
 
 #[test]
+fn tex_scan_out_includes_crossref_parents() {
+    // The pruned bibliography is exactly what gets handed to a paper build —
+    // a cited entry's crossref parent must ride along or bibtex errors.
+    let d = vault_with(
+        "@inproceedings{paper, title={Apple Study}, crossref={proc}}\n\n\
+         @proceedings{proc, booktitle={Some Proceedings}, year={2020}}\n",
+    );
+    let tex = write_tex(&d, "p.tex", r"\cite{paper}");
+    let out = d.path().join("pruned.bib");
+    niutero()
+        .arg("tex-scan")
+        .arg(d.path())
+        .arg(&tex)
+        .arg("--out")
+        .arg(&out)
+        .assert()
+        .success();
+    let w = fs::read_to_string(&out).unwrap();
+    assert!(w.contains("@inproceedings{paper"), "got: {w}");
+    assert!(w.contains("@proceedings{proc"), "parent missing: {w}");
+}
+
+#[test]
 fn json_shape() {
     let d = vault_with("@misc{a}\n@misc{b}\n");
     let tex = write_tex(&d, "p.tex", r"\cite{a,z}");

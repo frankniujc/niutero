@@ -34,7 +34,7 @@ enum Cmd {
     List {
         /// Vault folder.
         vault: PathBuf,
-        /// Filter query: free text and `tag:foo` terms, all ANDed.
+        /// Filter query: free text and `tag:`/`status:`/`stars:` terms, all ANDed.
         #[arg(long)]
         query: Option<String>,
         /// Use a saved view's query (mutually exclusive with --query).
@@ -180,15 +180,19 @@ enum Cmd {
     Export {
         /// Vault folder.
         vault: PathBuf,
-        /// Output file path.
+        /// Output file path (`-` streams the .bib to stdout).
         #[arg(long)]
         out: PathBuf,
-        /// Filter query: free text and `tag:foo` terms, all ANDed.
+        /// Filter query: free text and `tag:`/`status:`/`stars:` terms, all ANDed.
         #[arg(long)]
         query: Option<String>,
         /// Use a saved view's query (mutually exclusive with --query).
         #[arg(long)]
         view: Option<String>,
+        /// Write the file even when the filter matches no entries (without
+        /// this, a zero-match export errors instead of blanking the target).
+        #[arg(long)]
+        allow_empty: bool,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -239,6 +243,20 @@ enum Cmd {
         /// Use a named `[profiles.<name>]` from norm.toml instead of the base config.
         #[arg(long)]
         profile: Option<String>,
+    },
+    /// Show or set the vault's offline normalization options (.niutero/norm.toml).
+    NormConfig {
+        /// Vault folder.
+        vault: PathBuf,
+        /// Set an option as KEY=VALUE (repeatable). Keys: keep_fields (comma
+        /// list), max_authors (0 = off), protect_title_caps, conference_acronyms,
+        /// canonicalize_venues, doi_to_url, tidy_whitespace, fix_entities,
+        /// normalize_arxiv (true/false).
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Print `\cite{key}` for an entry (to paste into LaTeX).
     Cite {
@@ -334,7 +352,7 @@ enum Cmd {
         /// Vault folder.
         vault: PathBuf,
         /// Loopback port to listen on.
-        #[arg(long, default_value_t = 23510)]
+        #[arg(long, default_value_t = engine::CONNECTOR_DEFAULT_PORT)]
         port: u16,
     },
     /// Manage an entry's attached PDF: show its path, --attach a file, --fetch
@@ -451,6 +469,10 @@ enum Cmd {
         /// entries only (offline; off by default).
         #[arg(long)]
         normalize_on_import: Option<bool>,
+        /// The norm.toml profile the automatic paths (import hooks, the browser
+        /// connector, add) normalize with; "" clears it (base config).
+        #[arg(long)]
+        normalize_profile: Option<String>,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -749,16 +771,19 @@ fn sidecar_mutation(cmd: &Cmd) -> Option<PathBuf> {
             auto_commit,
             on_dup,
             normalize_on_import,
+            normalize_profile,
             ..
         } if name.is_some()
             || pattern.is_some()
             || enrich_on_import.is_some()
             || auto_commit.is_some()
             || on_dup.is_some()
-            || normalize_on_import.is_some() =>
+            || normalize_on_import.is_some()
+            || normalize_profile.is_some() =>
         {
             Some(vault.clone())
         }
+        Cmd::NormConfig { vault, set, .. } if !set.is_empty() => Some(vault.clone()),
         Cmd::PdfConfig {
             vault,
             repo,
@@ -832,6 +857,10 @@ fn refresh_keep_updated(vault: &Path) {
         Ok(outcomes) => {
             for o in outcomes {
                 match o.error {
+                    None if o.emptied => eprintln!(
+                        "warning: keep-updated export to {} now matches 0 entries (mirror emptied)",
+                        o.out.display()
+                    ),
                     None => eprintln!("  ↻ {} entr(ies) → {}", o.count, o.out.display()),
                     Some(e) => eprintln!(
                         "warning: keep-updated export to {} failed: {e}",
@@ -909,8 +938,9 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             out,
             query,
             view,
+            allow_empty,
             json,
-        } => cmd_export(&vault, &out, query, view, json).map(ok),
+        } => cmd_export(&vault, &out, query, view, allow_empty, json).map(ok),
         Cmd::TexScan {
             vault,
             tex,
@@ -1001,6 +1031,7 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             auto_commit,
             on_dup,
             normalize_on_import,
+            normalize_profile,
             json,
         } => cmd_config(
             &vault,
@@ -1010,9 +1041,11 @@ fn dispatch(cmd: Cmd) -> Result<ExitCode, String> {
             auto_commit,
             on_dup,
             normalize_on_import,
+            normalize_profile,
             json,
         )
         .map(ok),
+        Cmd::NormConfig { vault, set, json } => cmd_norm_config(&vault, set, json).map(ok),
         Cmd::SyncConfig {
             vault,
             pull,
@@ -1031,9 +1064,14 @@ fn cmd_config(
     auto_commit: Option<bool>,
     on_dup: Option<String>,
     normalize_on_import: Option<bool>,
+    normalize_profile: Option<String>,
     json: bool,
 ) -> Result<(), String> {
     let mut v = open_vault(vault)?;
+    if let Some(p) = normalize_profile.as_deref() {
+        // "" clears it; a named profile must exist in norm.toml.
+        engine::set_normalize_profile(&mut v, Some(p))?;
+    }
     if name.is_some() || pattern.is_some() {
         engine::set_library_meta(&mut v, name.as_deref(), pattern.as_deref())?;
     }
@@ -1063,6 +1101,7 @@ fn cmd_config(
                 "on_dup": c.workflow.on_dup,
                 "auto_fetch_pdf": c.workflow.auto_fetch_pdf,
                 "normalize_on_import": c.workflow.normalize_on_import,
+                "normalize_profile": c.workflow.normalize_profile,
             },
         }))?;
     } else {
@@ -1084,6 +1123,54 @@ fn cmd_config(
         );
         println!("  auto-fetch pdf:   {}", c.workflow.auto_fetch_pdf);
         println!("  normalize on import: {}", c.workflow.normalize_on_import);
+        println!(
+            "  normalize profile:   {}",
+            c.workflow
+                .normalize_profile
+                .as_deref()
+                .unwrap_or("(base config)")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_norm_config(vault: &Path, set: Vec<String>, json: bool) -> Result<(), String> {
+    let v = open_vault(vault)?;
+    let mut cfg = engine::norm_config(&v)?;
+    for kv in &set {
+        let (k, val) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("--set expects KEY=VALUE, got '{kv}'"))?;
+        cfg = engine::set_norm_option(&v, k, val)?;
+    }
+    let mut profiles: Vec<String> = cfg.profiles.keys().cloned().collect();
+    profiles.sort();
+    if json {
+        emit(serde_json::json!({
+            "keep_fields": cfg.keep_fields,
+            "max_authors": cfg.max_authors,
+            "protect_title_caps": cfg.protect_title_caps,
+            "conference_acronyms": cfg.conference_acronyms,
+            "canonicalize_venues": cfg.canonicalize_venues,
+            "doi_to_url": cfg.doi_to_url,
+            "tidy_whitespace": cfg.tidy_whitespace,
+            "fix_entities": cfg.fix_entities,
+            "normalize_arxiv": cfg.normalize_arxiv,
+            "profiles": profiles,
+        }))?;
+    } else {
+        println!("keep_fields:         {}", cfg.keep_fields.join(", "));
+        println!("max_authors:         {}", cfg.max_authors);
+        println!("protect_title_caps:  {}", cfg.protect_title_caps);
+        println!("conference_acronyms: {}", cfg.conference_acronyms);
+        println!("canonicalize_venues: {}", cfg.canonicalize_venues);
+        println!("doi_to_url:          {}", cfg.doi_to_url);
+        println!("tidy_whitespace:     {}", cfg.tidy_whitespace);
+        println!("fix_entities:        {}", cfg.fix_entities);
+        println!("normalize_arxiv:     {}", cfg.normalize_arxiv);
+        if !profiles.is_empty() {
+            println!("profiles:            {}", profiles.join(", "));
+        }
     }
     Ok(())
 }
@@ -1664,27 +1751,26 @@ fn cmd_import(
         (None, Some(d)) => engine::import_doi(&v, &d, policy)?,
         (None, None) => return Err("specify a .bib file or --doi".into()),
     };
-    // Post-import hooks (both opt-in and no-ops without their pref, so the
-    // base import path stays offline). Best-effort, on stderr — they must
-    // never corrupt the --json stdout or fail the import.
-    match engine::auto_fetch_pdfs(&v, &r.new_keys()) {
-        Ok((fetched, attempted)) if attempted > 0 => {
-            eprintln!("  ⤓ auto-fetched {fetched}/{attempted} PDF(s)");
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("warning: PDF auto-fetch skipped: {e}"),
+    // Post-import hooks (all opt-in and no-ops without their pref, so the
+    // base import path stays offline). One shared engine pipeline over every
+    // touched key — overwritten entries are re-cleaned like fresh adds.
+    // Best-effort, on stderr — they must never corrupt the --json stdout or
+    // fail the import.
+    let hooks = engine::run_import_hooks(&v, &r.touched_keys(), false);
+    if hooks.pdfs.1 > 0 {
+        eprintln!("  ⤓ auto-fetched {}/{} PDF(s)", hooks.pdfs.0, hooks.pdfs.1);
     }
-    match engine::auto_enrich(&v, &r.new_keys()) {
-        Ok((filled, attempted)) if attempted > 0 => {
-            eprintln!("  ✚ auto-enriched {filled}/{attempted} entr(ies)");
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("warning: auto-enrich skipped: {e}"),
+    if hooks.enriched.1 > 0 {
+        eprintln!(
+            "  ✚ auto-enriched {}/{} entr(ies)",
+            hooks.enriched.0, hooks.enriched.1
+        );
     }
-    match engine::auto_normalize(&v, &r.new_keys()) {
-        Ok(n) if n > 0 => eprintln!("  ◇ normalized {n} new entr(ies)"),
-        Ok(_) => {}
-        Err(e) => eprintln!("warning: normalize-on-import skipped: {e}"),
+    if hooks.normalized > 0 {
+        eprintln!("  ◇ normalized {} new entr(ies)", hooks.normalized);
+    }
+    for w in &hooks.warnings {
+        eprintln!("warning: {w}");
     }
     if json {
         println!(
@@ -1732,7 +1818,7 @@ fn cmd_connector(vault: &Path, port: u16) -> Result<(), String> {
     let cfg = engine::ConnectorConfig {
         port,
         shared,
-        on_import: std::sync::Arc::new(|| {}),
+        on_import: std::sync::Arc::new(|_| {}),
     };
     let handle = engine::start_connector(cfg).map_err(|e| format!("start connector: {e}"))?;
     println!(
@@ -1913,14 +1999,32 @@ fn cmd_export(
     out: &Path,
     query: Option<String>,
     view: Option<String>,
+    allow_empty: bool,
     json: bool,
 ) -> Result<(), String> {
     let v = open_vault(vault)?;
-    let n = engine::export(&v, filter_from(query, view)?, out)?;
+    let filter = filter_from(query, view)?;
+    // `--out -` streams the .bib to stdout (pipeable); that can't coexist
+    // with --json, whose stdout is the report.
+    if out == Path::new("-") {
+        if json {
+            return Err(
+                "--out - writes the .bib to stdout, which --json also needs; pick one".into(),
+            );
+        }
+        let (text, _) = engine::export_to_string(&v, filter, allow_empty)?;
+        print!("{text}");
+        return Ok(());
+    }
+    let keys = engine::export(&v, filter, out, allow_empty)?;
     if json {
-        emit(serde_json::json!({ "exported": n, "out": out.display().to_string() }))?;
+        emit(serde_json::json!({
+            "exported": keys.len(),
+            "keys": keys,
+            "out": out.display().to_string(),
+        }))?;
     } else {
-        println!("Exported {n} entr(ies) to {}", out.display());
+        println!("Exported {} entr(ies) to {}", keys.len(), out.display());
     }
     Ok(())
 }
@@ -1964,7 +2068,9 @@ fn cmd_tex_scan(
         }
     }
     if let Some(out) = out {
-        let n = engine::export_keys(&v, &report.used, &out)?;
+        // No --allow-empty here: writing an empty bibliography for a paper
+        // that cites nothing (or whose keys are all missing) helps no one.
+        let n = engine::export_keys(&v, &report.used, &out, false)?.len();
         // In --json mode the report JSON is the stdout payload; this notice goes
         // to stderr so it doesn't corrupt the stream for a machine consumer.
         if json {
@@ -2024,7 +2130,13 @@ fn cmd_normalize(
     }
     let v = open_vault(vault)?;
     let changes = if write {
-        engine::normalize_apply(&v, profile.as_deref())?
+        let report = engine::normalize_apply_report(&v, profile.as_deref())?;
+        // Entries whose proposal failed validation were kept as-is; say so on
+        // stderr (never corrupting --json stdout) instead of aborting mid-run.
+        for s in &report.skipped {
+            eprintln!("warning: skipped '{}': {}", s.citekey, s.error);
+        }
+        report.changes
     } else {
         engine::normalize_preview(&v, profile.as_deref())?
     };

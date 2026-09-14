@@ -84,6 +84,11 @@ pub struct WorkflowConfig {
     /// newly-imported entries (only those — never the rest of the library).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub normalize_on_import: bool,
+    /// The `norm.toml` profile the automatic paths (import hooks, the browser
+    /// connector, `add`) normalize with; `None` = the base config. A manual
+    /// `normalize --profile` still overrides per run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalize_profile: Option<String>,
 }
 
 impl WorkflowConfig {

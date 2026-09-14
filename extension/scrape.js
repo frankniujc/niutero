@@ -43,22 +43,34 @@
     return m ? m[0].replace(/[.,;)\]]+$/, "") : "";
   };
 
-  // --- identifier: arXiv (URL or meta), else a DOI from meta / anchor / JSON-LD ---
+  // --- identifier: OpenReview first, then arXiv (URL or meta), then a DOI
+  //     from meta / anchor / JSON-LD ---
   let identifier;
-  const ax = location.href.match(
-    /arxiv\.org\/(?:abs|pdf)\/([0-9]{4}\.[0-9]{4,}|[a-z-]+(?:\.[A-Z]{2})?\/\d{7})(v\d+)?/i,
-  );
-  if (ax) identifier = "arXiv:" + ax[1] + (ax[2] || "");
+  // OpenReview: submission pages expose no usable DOI, but the venue's
+  // canonical BibTeX is one API call away. Hand the server the submission id
+  // and let it fetch the real BibTeX server-side (the extension stays
+  // loopback-only). This check runs FIRST: some venues mirror arXiv meta tags
+  // onto their OpenReview pages, and the server's OpenReview-only routing
+  // must not be bypassed by a stray citation_arxiv_id. Only submission-like
+  // paths qualify — a profile/group/venue page falls through to the metadata
+  // scrape instead of shipping a non-submission id.
+  if (
+    /(^|\.)openreview\.net$/i.test(location.hostname) &&
+    /^\/(forum|pdf|attachment)$/.test(location.pathname)
+  ) {
+    const orId = new URLSearchParams(location.search).get("id");
+    if (orId) identifier = "openreview:" + orId;
+  }
+  if (!identifier) {
+    const ax = location.href.match(
+      // abs / pdf / html (arXiv's own HTML rendering) all name the paper.
+      /arxiv\.org\/(?:abs|pdf|html)\/([0-9]{4}\.[0-9]{4,}|[a-z-]+(?:\.[A-Z]{2})?\/\d{7})(v\d+)?/i,
+    );
+    if (ax) identifier = "arXiv:" + ax[1] + (ax[2] || "");
+  }
   if (!identifier) {
     const a = first("citation_arxiv_id");
     if (a) identifier = "arXiv:" + a.trim();
-  }
-  // OpenReview: forum/pdf pages expose no usable DOI, but the venue's canonical
-  // BibTeX is one API call away. Hand the server the submission id and let it
-  // fetch the real BibTeX server-side (the extension stays loopback-only).
-  if (!identifier && /(^|\.)openreview\.net$/i.test(location.hostname)) {
-    const orId = new URLSearchParams(location.search).get("id");
-    if (orId) identifier = "openreview:" + orId;
   }
   if (!identifier) {
     let doi = cleanDoi(

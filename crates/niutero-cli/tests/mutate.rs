@@ -113,6 +113,45 @@ fn add_appends_after_existing_and_keeps_verbatim() {
 }
 
 #[test]
+fn add_normalizes_when_normalize_on_import_is_on() {
+    // `add` / paste-BibTeX is an import surface too: with the toggle on the
+    // pasted entry lands clean; with it off (the default) it lands verbatim.
+    let d = new_vault();
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args([
+            "--bibtex",
+            "@inproceedings{p1, title={T}, booktitle={ICLR}, abstract={x}}",
+        ])
+        .assert()
+        .success();
+    assert!(bib(&d).contains("abstract"), "default stays verbatim");
+
+    niutero()
+        .arg("config")
+        .arg(d.path())
+        .args(["--normalize-on-import", "true"])
+        .assert()
+        .success();
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args([
+            "--bibtex",
+            "@inproceedings{p2, title={T Two}, booktitle={ICLR}, abstract={y}}",
+        ])
+        .assert()
+        .success();
+    let s = bib(&d);
+    assert!(
+        s.contains("International Conference on Learning Representations (ICLR)"),
+        "got: {s}"
+    );
+    assert!(!s.contains("abstract = {y}"), "p2 not normalized: {s}");
+}
+
+#[test]
 fn add_duplicate_errors() {
     let d = new_vault();
     set_bib(&d, "@misc{dup,\n  title = {x}\n}\n");

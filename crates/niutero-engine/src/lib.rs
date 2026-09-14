@@ -52,10 +52,11 @@ pub(crate) mod test_registry_env {
 }
 
 use indexmap::IndexMap;
-use niutero_bib::{entries, parse, to_bibtex_entries, BibItem};
+use niutero_bib::{entries, parse, to_bibtex, to_bibtex_entries, BibItem};
 use niutero_core::filter::Facets;
 use niutero_core::{dedup, filter, texscan, BibEntry, KeyPattern};
-use niutero_norm::{normalize_entry, NormConfig};
+use niutero_norm::normalize_entry;
+pub use niutero_norm::NormConfig;
 use niutero_sync as git;
 use serde::{Deserialize, Serialize};
 
@@ -146,50 +147,62 @@ pub fn show(v: &Vault, citekey: &str) -> Result<EntryView, String> {
 /// or within the batch); existing entries and verbatim blocks are preserved.
 /// Returns the cite keys added.
 pub fn add(v: &Vault, source: AddSource) -> Result<Vec<String>, String> {
-    let _lock = lock_vault(v)?;
-    let mut items = read_items(v)?;
-    let new_entries: Vec<BibEntry> = match source {
-        AddSource::Bibtex(src) => parse_entries(&src)?,
-        AddSource::File(path) => {
-            let src = std::fs::read_to_string(&path)
-                .map_err(|e| format!("read {}: {e}", path.display()))?;
-            parse_entries(&src)?
-        }
-        AddSource::Fields { type_, key, fields } => {
-            let mut e = BibEntry::new(type_, key);
-            for f in &fields {
-                let (name, value) = split_field(f)?;
-                e.set(name, value);
+    // Inner scope: the vault lock is non-reentrant, and the normalize hook
+    // below takes it again.
+    let keys = {
+        let _lock = lock_vault(v)?;
+        let mut items = read_items(v)?;
+        let new_entries: Vec<BibEntry> = match source {
+            AddSource::Bibtex(src) => parse_entries(&src)?,
+            AddSource::File(path) => {
+                let src = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
+                parse_entries(&src)?
             }
-            // No cite key given: generate one from the library's pattern.
-            if e.citekey.is_empty() {
-                e.citekey = generate_citekey(v, &e, &items);
+            AddSource::Fields { type_, key, fields } => {
+                let mut e = BibEntry::new(type_, key);
+                for f in &fields {
+                    let (name, value) = split_field(f)?;
+                    e.set(name, value);
+                }
+                // No cite key given: generate one from the library's pattern.
+                if e.citekey.is_empty() {
+                    e.citekey = generate_citekey(v, &e, &items);
+                }
+                vec![e]
             }
-            vec![e]
+        };
+
+        // Validate before touching disk so a corrupt entry is never written.
+        for e in &new_entries {
+            e.validate()?;
         }
+
+        let mut seen: std::collections::HashSet<String> =
+            entries(&items).map(|e| e.citekey.clone()).collect();
+        for e in &new_entries {
+            if !seen.insert(e.citekey.clone()) {
+                return Err(format!(
+                    "cite key '{}' already exists (use `edit` to change it)",
+                    e.citekey
+                ));
+            }
+        }
+
+        let keys: Vec<String> = new_entries.iter().map(|e| e.citekey.clone()).collect();
+        for e in new_entries {
+            items.push(BibItem::Entry(e));
+        }
+        write_items(v, &items)?;
+        keys
     };
 
-    // Validate before touching disk so a corrupt entry is never written.
-    for e in &new_entries {
-        e.validate()?;
+    // Same contract as import: with `normalize_on_import` on, an added or
+    // pasted entry lands clean too. No-op (and no lock) when the toggle is
+    // off; best-effort — the add itself already succeeded.
+    if let Err(e) = auto_normalize(v, &keys) {
+        log::warn!("normalize-on-add skipped: {e}");
     }
-
-    let mut seen: std::collections::HashSet<String> =
-        entries(&items).map(|e| e.citekey.clone()).collect();
-    for e in &new_entries {
-        if !seen.insert(e.citekey.clone()) {
-            return Err(format!(
-                "cite key '{}' already exists (use `edit` to change it)",
-                e.citekey
-            ));
-        }
-    }
-
-    let keys: Vec<String> = new_entries.iter().map(|e| e.citekey.clone()).collect();
-    for e in new_entries {
-        items.push(BibItem::Entry(e));
-    }
-    write_items(v, &items)?;
     Ok(keys)
 }
 
@@ -300,6 +313,11 @@ pub struct ImportReport {
     /// [`touched_keys`](ImportReport::touched_keys).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub overwritten_keys: Vec<String>,
+    /// Cite keys of the *existing* entries duplicates were skipped against
+    /// under `DupPolicy::Skip` — so a caller can still act on the entry the
+    /// user meant (the connector applies popup tags to it).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_keys: Vec<String>,
 }
 
 impl ImportReport {
@@ -366,7 +384,10 @@ fn merge_incoming(
     for mut entry in incoming {
         if keys.contains(&entry.citekey) {
             match policy {
-                DupPolicy::Skip => report.skipped += 1,
+                DupPolicy::Skip => {
+                    report.skipped_keys.push(entry.citekey.clone());
+                    report.skipped += 1;
+                }
                 DupPolicy::Overwrite => {
                     entry.validate()?;
                     let idx = find_entry(&items, &entry.citekey)?;
@@ -552,19 +573,121 @@ fn ensure_pdfs_gitignored(v: &Vault) -> Result<(), String> {
 }
 
 /// Write the entries matching `filter` to a standalone `.bib` at `out`.
-/// Returns the number of entries written.
-pub fn export(v: &Vault, filter: Filter, out: &Path) -> Result<usize, String> {
+/// Returns the number of entries written (crossref parents included).
+///
+/// The output is self-contained for BibTeX: it carries the library's verbatim
+/// blocks (`@string`/`@preamble`/`@comment`) and the crossref closure of the
+/// selection. Refuses the vault's own `references.bib` and anything under
+/// `.niutero/` (the same guard as `export-target add` — a filtered export must
+/// never truncate the source of truth), and refuses an empty selection unless
+/// `allow_empty` (a typo'd query must not blank a file, exit 0).
+pub fn export(
+    v: &Vault,
+    filter: Filter,
+    out: &Path,
+    allow_empty: bool,
+) -> Result<Vec<String>, String> {
+    let out = resolve_export_out(v, out)?;
+    let _lock = lock_vault(v)?;
     let items = read_items(v)?;
+    let selected = select_entries(v, &items, filter)?;
+    let (text, keys) = render_export(&items, selected, allow_empty)?;
+    // Atomic (temp + rename), the same guarantee references.bib gets — a crash
+    // mid-write must not truncate a mirror the user builds against.
+    niutero_vault::write_atomic(&out, &text)
+        .map_err(|e| format!("write {}: {e}", out.display()))?;
+    Ok(keys)
+}
+
+/// [`export`] rendered to a string instead of a file (`export --out -`).
+/// Returns the `.bib` text and the cite keys it holds.
+pub fn export_to_string(
+    v: &Vault,
+    filter: Filter,
+    allow_empty: bool,
+) -> Result<(String, Vec<String>), String> {
+    let items = read_items(v)?;
+    let selected = select_entries(v, &items, filter)?;
+    render_export(&items, selected, allow_empty)
+}
+
+fn select_entries(v: &Vault, items: &[BibItem], filter: Filter) -> Result<Vec<BibEntry>, String> {
     let query = resolve_query(v, filter)?;
-    let selected: Vec<BibEntry> = entries(&items)
+    Ok(entries(items)
         .filter(|e| filter::entry_matches(&query, e, &facets_of(v, &e.citekey)))
         .cloned()
+        .collect())
+}
+
+/// The shared export tail: crossref closure → validation → verbatim blocks →
+/// serialized text plus the keys it carries.
+fn render_export(
+    items: &[BibItem],
+    selected: Vec<BibEntry>,
+    allow_empty: bool,
+) -> Result<(String, Vec<String>), String> {
+    let selected = crossref_closure(items, selected);
+    if selected.is_empty() && !allow_empty {
+        return Err(
+            "the export matched no entries — nothing was written (pass --allow-empty to \
+             write an empty file)"
+                .into(),
+        );
+    }
+    // The exported file is handed to third parties — never hand over one a
+    // tolerantly-parsed broken entry would corrupt.
+    let bad: Vec<String> = selected
+        .iter()
+        .filter_map(|e| {
+            e.validate()
+                .err()
+                .map(|err| format!("'{}' ({err})", e.citekey))
+        })
         .collect();
-    // Atomic (temp + rename), the same guarantee references.bib gets — a crash
-    // mid-write must not truncate a keep-updated mirror the user builds against.
-    niutero_vault::write_atomic(out, &to_bibtex_entries(&selected))
-        .map_err(|e| format!("write {}: {e}", out.display()))?;
-    Ok(selected.len())
+    if !bad.is_empty() {
+        return Err(format!(
+            "refusing to export invalid entr(ies): {}",
+            bad.join(", ")
+        ));
+    }
+    // Verbatim blocks ride along (file order, before the entries) so @string
+    // abbreviations and @preamble \newcommand definitions still resolve; loose
+    // non-`@` prose between entries stays behind as noise.
+    let mut out_items: Vec<BibItem> = items
+        .iter()
+        .filter(|it| matches!(it, BibItem::Verbatim(s) if s.trim_start().starts_with('@')))
+        .cloned()
+        .collect();
+    let keys: Vec<String> = selected.iter().map(|e| e.citekey.clone()).collect();
+    out_items.extend(selected.into_iter().map(BibItem::Entry));
+    Ok((to_bibtex(&out_items), keys))
+}
+
+/// The crossref closure of `selected`: each selected entry's `crossref` target
+/// that exists in the library is appended (transitively, discovery order)
+/// AFTER the citing entries — BibTeX requires a cross-referenced entry to
+/// appear after every entry that references it.
+fn crossref_closure(items: &[BibItem], selected: Vec<BibEntry>) -> Vec<BibEntry> {
+    let mut have: std::collections::HashSet<String> =
+        selected.iter().map(|e| e.citekey.clone()).collect();
+    let mut queue: Vec<String> = selected
+        .iter()
+        .filter_map(|e| e.get("crossref").map(|c| c.trim().to_string()))
+        .collect();
+    let mut out = selected;
+    while let Some(k) = queue.pop() {
+        if k.is_empty() || have.contains(&k) {
+            continue;
+        }
+        if let Some(p) = entries(items).find(|e| e.citekey == k) {
+            have.insert(k);
+            if let Some(gp) = p.get("crossref") {
+                queue.push(gp.trim().to_string());
+            }
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------- LaTeX glue
@@ -587,16 +710,25 @@ pub fn tex_scan(v: &Vault, tex_files: &[PathBuf]) -> Result<TexReport, String> {
 
 /// Write only the entries whose cite key is in `keys` to a standalone `.bib`
 /// (e.g. a pruned bibliography for a paper). Returns the number written.
-pub fn export_keys(v: &Vault, keys: &[String], out: &Path) -> Result<usize, String> {
+/// Same self-containedness, guard, and empty-refusal rules as [`export`].
+pub fn export_keys(
+    v: &Vault,
+    keys: &[String],
+    out: &Path,
+    allow_empty: bool,
+) -> Result<Vec<String>, String> {
+    let out = resolve_export_out(v, out)?;
+    let _lock = lock_vault(v)?;
     let items = read_items(v)?;
     let wanted: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
     let selected: Vec<BibEntry> = entries(&items)
         .filter(|e| wanted.contains(e.citekey.as_str()))
         .cloned()
         .collect();
-    niutero_vault::write_atomic(out, &to_bibtex_entries(&selected))
+    let (text, written) = render_export(&items, selected, allow_empty)?;
+    niutero_vault::write_atomic(&out, &text)
         .map_err(|e| format!("write {}: {e}", out.display()))?;
-    Ok(selected.len())
+    Ok(written)
 }
 
 /// `\cite{key}` for an entry (errors if the cite key is absent).
@@ -694,6 +826,10 @@ pub struct ExportOutcome {
     /// Set when *this* target failed to write; the others (and the primary
     /// write that triggered the refresh) still succeeded.
     pub error: Option<String>,
+    /// This refresh emptied a previously non-blank mirror (its filter now
+    /// matches 0 entries) — callers should warn loudly: an Overleaf checkout
+    /// building against it will fail its next run.
+    pub emptied: bool,
 }
 
 /// The keep-updated export targets registered for this vault on this machine.
@@ -726,9 +862,10 @@ pub fn export_target_add(v: &Vault, out: &Path, query: Option<String>) -> Result
     })
     .map_err(|e| format!("update registry: {e}"))?;
     // Initial export (outside the registry lock — it touches the vault, not the
-    // registry) so the registered file is immediately in sync.
+    // registry) so the registered file is immediately in sync. `allow_empty`:
+    // a keep-updated mirror legitimately tracks whatever its filter matches.
     let filter = query.map(Filter::Query).unwrap_or(Filter::All);
-    export(v, filter, &out)?;
+    export(v, filter, &out, true)?;
     Ok(())
 }
 
@@ -761,16 +898,23 @@ pub fn refresh_exports(v: &Vault) -> Result<Vec<ExportOutcome>, String> {
         .into_iter()
         .map(|t| {
             let filter = t.query.clone().map(Filter::Query).unwrap_or(Filter::All);
-            match export(v, filter, &t.out) {
-                Ok(count) => ExportOutcome {
+            // Mirrors track their filter, so an empty result is allowed — but
+            // flag the emptying of a previously non-blank mirror so hosts warn.
+            let was_nonempty = std::fs::read_to_string(&t.out)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            match export(v, filter, &t.out, true) {
+                Ok(keys) => ExportOutcome {
                     out: t.out,
-                    count,
+                    count: keys.len(),
                     error: None,
+                    emptied: was_nonempty && keys.is_empty(),
                 },
                 Err(e) => ExportOutcome {
                     out: t.out,
                     count: 0,
                     error: Some(e),
+                    emptied: false,
                 },
             }
         })
@@ -1172,7 +1316,7 @@ pub struct AnalysisReport {
 /// lookup) and duplicate-merge are intentionally out of scope here.
 pub fn analyze(v: &Vault) -> Result<AnalysisReport, String> {
     let items = read_items(v)?;
-    let cfg = NormConfig::load(&v.niutero_dir());
+    let cfg = NormConfig::load(&v.niutero_dir())?;
     let es: Vec<&BibEntry> = entries(&items).collect();
 
     let offline: Vec<String> = norm_changes(&items, &cfg)
@@ -1455,26 +1599,55 @@ pub struct NormChange {
     pub diffs: Vec<FieldChange>,
 }
 
+/// One entry offline normalization proposed a change for but skipped: the
+/// proposal failed [`BibEntry::validate`], and writing it would corrupt the
+/// `.bib`. The original entry stays byte-identical on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NormSkip {
+    pub citekey: String,
+    pub error: String,
+}
+
+/// The result of applying normalization: what changed, and what was skipped
+/// because its proposal failed validation.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NormReport {
+    pub changes: Vec<NormChange>,
+    pub skipped: Vec<NormSkip>,
+}
+
 /// Preview offline normalization — compute what would change without writing.
 /// `profile` selects a `[profiles.<name>]` from `norm.toml` (None = base config).
 pub fn normalize_preview(v: &Vault, profile: Option<&str>) -> Result<Vec<NormChange>, String> {
     let items = read_items(v)?;
     let cfg = NormConfig::resolve(&v.niutero_dir(), profile)?;
-    Ok(norm_changes(&items, &cfg).1)
+    let (_, changes, skipped) = norm_changes(&items, &cfg);
+    warn_skips(&skipped);
+    Ok(changes)
 }
 
 /// Apply offline normalization, writing the result (only if something changed).
 /// Returns the changes that were applied. `profile` as in [`normalize_preview`].
 pub fn normalize_apply(v: &Vault, profile: Option<&str>) -> Result<Vec<NormChange>, String> {
+    let report = normalize_apply_report(v, profile)?;
+    warn_skips(&report.skipped);
+    Ok(report.changes)
+}
+
+/// [`normalize_apply`], reporting what was skipped as well as what changed —
+/// an entry whose normalized form fails `validate()` is kept as-is and listed
+/// in `skipped` instead of aborting the run or corrupting the file.
+pub fn normalize_apply_report(v: &Vault, profile: Option<&str>) -> Result<NormReport, String> {
     let _lock = lock_vault(v)?;
     let items = read_items(v)?;
+    refuse_invalid_entries(&items)?;
     let cfg = NormConfig::resolve(&v.niutero_dir(), profile)?;
-    let (normalized, changes) = norm_changes(&items, &cfg);
+    let (normalized, changes, skipped) = norm_changes(&items, &cfg);
     if !changes.is_empty() {
         write_items(v, &normalized)?;
         log::info!("normalize: changed {} entr(ies)", changes.len());
     }
-    Ok(changes)
+    Ok(NormReport { changes, skipped })
 }
 
 /// Apply offline normalization to **only** the entries whose citekey is in
@@ -1486,25 +1659,34 @@ pub fn normalize_apply_keys(
     keys: &[String],
     profile: Option<&str>,
 ) -> Result<Vec<NormChange>, String> {
+    let report = normalize_apply_keys_report(v, keys, profile)?;
+    warn_skips(&report.skipped);
+    Ok(report.changes)
+}
+
+/// [`normalize_apply_keys`] with the skip report (see [`normalize_apply_report`]).
+pub fn normalize_apply_keys_report(
+    v: &Vault,
+    keys: &[String],
+    profile: Option<&str>,
+) -> Result<NormReport, String> {
     let _lock = lock_vault(v)?;
     let items = read_items(v)?;
+    refuse_invalid_entries(&items)?;
     let cfg = NormConfig::resolve(&v.niutero_dir(), profile)?;
     let want: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
     let mut out = Vec::with_capacity(items.len());
     let mut changes = Vec::new();
+    let mut skipped = Vec::new();
     for it in &items {
         match it {
             BibItem::Entry(e) if want.contains(e.citekey.as_str()) => {
-                let (normalized, notes) = normalize_entry(e, &cfg);
-                let diffs = entry_field_diff(e, &normalized);
-                if !notes.is_empty() || !diffs.is_empty() {
-                    changes.push(NormChange {
-                        citekey: e.citekey.clone(),
-                        notes,
-                        diffs,
-                    });
-                }
-                out.push(BibItem::Entry(normalized));
+                out.push(BibItem::Entry(checked_normalize(
+                    e,
+                    &cfg,
+                    &mut changes,
+                    &mut skipped,
+                )));
             }
             other => out.push(other.clone()),
         }
@@ -1517,7 +1699,74 @@ pub fn normalize_apply_keys(
             keys.len()
         );
     }
-    Ok(changes)
+    Ok(NormReport { changes, skipped })
+}
+
+fn warn_skips(skipped: &[NormSkip]) {
+    for s in skipped {
+        log::warn!("normalize: skipped '{}': {}", s.citekey, s.error);
+    }
+}
+
+/// A write rewrites the *whole* file, re-serializing every entry — so an
+/// already-invalid entry (a hand-edited, tolerantly-parsed one) would be
+/// corrupted by ANY apply, not just its own. Refuse loudly instead.
+fn refuse_invalid_entries(items: &[BibItem]) -> Result<(), String> {
+    for e in entries(items) {
+        if let Err(err) = e.validate() {
+            return Err(format!(
+                "entry '{}' is invalid ({err}); fix it before normalize can write",
+                e.citekey
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What the post-import hook pipeline did, per hook: `(done, attempted)`
+/// counts plus any warnings. Hooks are best-effort by contract — a failure
+/// degrades to a warning, never fails the import that already happened.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct HookSummary {
+    /// `(filled, attempted)` from [`auto_enrich`].
+    pub enriched: (usize, usize),
+    /// Entries the normalize pass changed.
+    pub normalized: usize,
+    /// `(fetched, attempted)` from [`auto_fetch_pdfs`].
+    pub pdfs: (usize, usize),
+    pub warnings: Vec<String>,
+}
+
+/// The one post-import hook pipeline every front-end runs, over every key an
+/// import touched — pass [`touched_keys`](ImportReport::touched_keys) (added +
+/// renamed + overwritten), so an overwritten entry is re-cleaned exactly like
+/// a fresh add. Order: enrich first (it can fill the url a PDF fetch needs),
+/// then normalize, then PDFs. `force_normalize` normalizes even when
+/// `workflow.normalize_on_import` is off — the connector's "a capture always
+/// lands clean" contract.
+pub fn run_import_hooks(v: &Vault, keys: &[String], force_normalize: bool) -> HookSummary {
+    let mut s = HookSummary::default();
+    if keys.is_empty() {
+        return s;
+    }
+    match auto_enrich(v, keys) {
+        Ok(counts) => s.enriched = counts,
+        Err(e) => s.warnings.push(format!("auto-enrich skipped: {e}")),
+    }
+    let normalized = if force_normalize {
+        normalize_apply_keys(v, keys, auto_profile(v)).map(|c| c.len())
+    } else {
+        auto_normalize(v, keys)
+    };
+    match normalized {
+        Ok(n) => s.normalized = n,
+        Err(e) => s.warnings.push(format!("normalize-on-import skipped: {e}")),
+    }
+    match auto_fetch_pdfs(v, keys) {
+        Ok(counts) => s.pdfs = counts,
+        Err(e) => s.warnings.push(format!("PDF auto-fetch skipped: {e}")),
+    }
+    s
 }
 
 /// **Import hook.** When `workflow.normalize_on_import` is set, normalize just
@@ -1527,33 +1776,112 @@ pub fn auto_normalize(v: &Vault, keys: &[String]) -> Result<usize, String> {
     if !v.config.workflow.normalize_on_import || keys.is_empty() {
         return Ok(0);
     }
-    Ok(normalize_apply_keys(v, keys, None)?.len())
+    Ok(normalize_apply_keys(v, keys, auto_profile(v))?.len())
 }
 
-fn norm_changes(items: &[BibItem], cfg: &NormConfig) -> (Vec<BibItem>, Vec<NormChange>) {
+/// The `norm.toml` profile the automatic paths normalize with
+/// (`workflow.normalize_profile`; `None` = the base config).
+fn auto_profile(v: &Vault) -> Option<&str> {
+    v.config.workflow.normalize_profile.as_deref()
+}
+
+/// Set (or clear, with `None`) the profile the automatic normalization paths
+/// use — import hooks, the connector, `add`. Validated against `norm.toml`.
+pub fn set_normalize_profile(v: &mut Vault, profile: Option<&str>) -> Result<(), String> {
+    let _lock = lock_vault(v)?;
+    let profile = profile.map(str::trim).filter(|p| !p.is_empty());
+    if let Some(name) = profile {
+        // Fail now, not on the next import: the profile must exist.
+        NormConfig::resolve(&v.niutero_dir(), Some(name))?;
+    }
+    v.config.workflow.normalize_profile = profile.map(str::to_string);
+    v.save_sidecar().map_err(|e| format!("save config: {e}"))
+}
+
+/// The vault's offline normalization config (`.niutero/norm.toml`, defaults
+/// when absent) — what the GUI Ruleset shows and `norm-config` prints.
+pub fn norm_config(v: &Vault) -> Result<NormConfig, String> {
+    NormConfig::load(&v.niutero_dir())
+}
+
+/// Set one `norm.toml` option (`key=value`, see [`NormConfig::set_option`])
+/// and persist the documented file. Returns the updated config.
+pub fn set_norm_option(v: &Vault, key: &str, value: &str) -> Result<NormConfig, String> {
+    let _lock = lock_vault(v)?;
+    let mut cfg = NormConfig::load(&v.niutero_dir())?;
+    cfg.set_option(key, value)?;
+    cfg.save(&v.niutero_dir())?;
+    Ok(cfg)
+}
+
+/// Does an already-listed entry match a filter query? The same
+/// [`filter::entry_matches`] the CLI's `list`/`export` use, over the view's
+/// fields and sidecar facets — so the GUI search box and `--query` agree.
+pub fn view_matches(query: &str, view: &EntryView) -> bool {
+    let mut e = BibEntry::new(&view.entry_type, &view.citekey);
+    e.fields = view.fields.clone();
+    let facets = Facets {
+        tags: &view.tags,
+        status: Some(view.status.as_str()),
+        stars: view.stars,
+    };
+    filter::entry_matches(query, &e, &facets)
+}
+
+fn norm_changes(
+    items: &[BibItem],
+    cfg: &NormConfig,
+) -> (Vec<BibItem>, Vec<NormChange>, Vec<NormSkip>) {
     let mut out = Vec::with_capacity(items.len());
     let mut changes = Vec::new();
+    let mut skipped = Vec::new();
     for it in items {
         match it {
             BibItem::Entry(e) => {
-                let (normalized, notes) = normalize_entry(e, cfg);
-                let diffs = entry_field_diff(e, &normalized);
-                // `notes` and `diffs` are non-empty together today; the `||` is
-                // defensive, so a future rule that mutates a field without a note
-                // is still recorded (and surfaced in the structured diff).
-                if !notes.is_empty() || !diffs.is_empty() {
-                    changes.push(NormChange {
-                        citekey: e.citekey.clone(),
-                        notes,
-                        diffs,
-                    });
-                }
-                out.push(BibItem::Entry(normalized));
+                out.push(BibItem::Entry(checked_normalize(
+                    e,
+                    cfg,
+                    &mut changes,
+                    &mut skipped,
+                )));
             }
             BibItem::Verbatim(s) => out.push(BibItem::Verbatim(s.clone())),
         }
     }
-    (out, changes)
+    (out, changes, skipped)
+}
+
+/// Normalize one entry, but never past the serializer's gate: a proposal that
+/// fails [`BibEntry::validate`] is discarded — the original entry is returned
+/// unchanged and the failure recorded — so a rule bug can degrade a run, never
+/// corrupt the library.
+fn checked_normalize(
+    e: &BibEntry,
+    cfg: &NormConfig,
+    changes: &mut Vec<NormChange>,
+    skipped: &mut Vec<NormSkip>,
+) -> BibEntry {
+    let (normalized, notes) = normalize_entry(e, cfg);
+    let diffs = entry_field_diff(e, &normalized);
+    // `notes` and `diffs` are non-empty together today; the `||` is
+    // defensive, so a future rule that mutates a field without a note
+    // is still recorded (and surfaced in the structured diff).
+    if notes.is_empty() && diffs.is_empty() {
+        return normalized;
+    }
+    if let Err(err) = normalized.validate() {
+        skipped.push(NormSkip {
+            citekey: e.citekey.clone(),
+            error: err,
+        });
+        return e.clone();
+    }
+    changes.push(NormChange {
+        citekey: e.citekey.clone(),
+        notes,
+        diffs,
+    });
+    normalized
 }
 
 /// The field-level delta between an entry and its normalized form: the entry
@@ -1681,8 +2009,26 @@ pub(crate) fn save_sidecar(v: &Vault) -> Result<(), String> {
 /// Take the vault's exclusive lock for a mutating operation; held until the
 /// returned guard drops. Serializes concurrent `niutero` processes so a
 /// read-modify-write race can't lose an update.
+/// How long a mutating op waits for the vault lock before giving up. The lock
+/// is held only for one read-modify-write (milliseconds), so a brief wait
+/// turns "a GUI edit landed at the same instant as a capture" from a failed
+/// capture into a short pause; a genuinely stuck holder still errors.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(crate) fn lock_vault(v: &Vault) -> Result<niutero_vault::VaultLock, String> {
-    v.lock().map_err(|e| format!("lock library: {e}"))
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match v.lock() {
+            Ok(l) => return Ok(l),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err(e) => return Err(format!("lock library: {e}")),
+        }
+    }
 }
 
 pub(crate) fn read_items(v: &Vault) -> Result<Vec<BibItem>, String> {
@@ -2574,9 +2920,16 @@ mod tests {
         add(&v, fields("misc", "b", &["title=Banana"])).unwrap();
         let out = d.path().join("out.bib");
 
-        assert_eq!(export(&v, Filter::All, &out).unwrap(), 2);
+        assert_eq!(export(&v, Filter::All, &out, false).unwrap().len(), 2);
 
-        assert_eq!(export(&v, Filter::Query("apple".into()), &out).unwrap(), 1);
+        assert_eq!(
+            export(&v, Filter::Query("apple".into()), &out, false).unwrap(),
+            vec!["a".to_string()]
+        );
+        // the string form carries the same keys and the same text
+        let (text, keys) = export_to_string(&v, Filter::Query("apple".into()), false).unwrap();
+        assert_eq!(keys, vec!["a".to_string()]);
+        assert_eq!(text, std::fs::read_to_string(&out).unwrap());
         let written = std::fs::read_to_string(&out).unwrap();
         assert!(written.contains("@article{a,"));
         assert!(!written.contains("@misc{b,"));
@@ -2594,7 +2947,10 @@ mod tests {
         assert_eq!(report.unused, vec!["unused1".to_string()]);
 
         let out = d.path().join("cited.bib");
-        assert_eq!(export_keys(&v, &report.used, &out).unwrap(), 1);
+        assert_eq!(
+            export_keys(&v, &report.used, &out, false).unwrap(),
+            vec!["used1".to_string()]
+        );
         let w = std::fs::read_to_string(&out).unwrap();
         assert!(w.contains("@article{used1,"));
         assert!(!w.contains("unused1"));
@@ -3161,6 +3517,213 @@ mod tests {
         assert!(normalize_preview(&v, Some("nope"))
             .unwrap_err()
             .contains("no normalize profile 'nope'"));
+    }
+
+    #[test]
+    fn normalize_refuses_to_write_over_an_invalid_entry() {
+        let (_d, v) = vault();
+        // A hand-edited library with a tolerantly-parsed, unbalanced value:
+        // any rewrite re-serializes every entry, so apply must refuse and
+        // leave the file byte-identical.
+        std::fs::write(
+            v.bib_path(),
+            "@article{good, title = {Fine Title}, abstract = {y}}\n\n\
+             @article{bad, title = {Hello\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(v.bib_path()).unwrap();
+        let err = normalize_apply_report(&v, None).unwrap_err();
+        assert!(err.contains("bad"), "err: {err}");
+        assert_eq!(
+            std::fs::read_to_string(v.bib_path()).unwrap(),
+            before,
+            "apply must not touch a library holding an invalid entry"
+        );
+        // Preview (no write) still works.
+        assert!(normalize_preview(&v, None).is_ok());
+    }
+
+    #[test]
+    fn a_proposal_that_fails_validation_is_skipped_not_recorded() {
+        // The unbalanced `note` survives normalization untouched while the
+        // droppable `abstract` makes the proposal a real change — so the
+        // proposal as a whole fails validate(). The gate must keep the
+        // original and record a skip — a rule bug (or a pre-broken field)
+        // degrades a run, never corrupts data.
+        let cfg = NormConfig::default();
+        let e = BibEntry::new("article", "k")
+            .with_field("note", "a}b{c")
+            .with_field("abstract", "x");
+        let mut changes = Vec::new();
+        let mut skipped = Vec::new();
+        let out = checked_normalize(&e, &cfg, &mut changes, &mut skipped);
+        assert_eq!(out, e);
+        assert!(changes.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].citekey, "k");
+    }
+
+    #[test]
+    fn run_import_hooks_covers_touched_not_just_new() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{k, title={T}, abstract={x}}".into()),
+        )
+        .unwrap();
+        set_workflow(&mut v, None, None, None, None, Some(true)).unwrap();
+
+        // Re-import the same key with on_dup=overwrite: the entry is replaced,
+        // not added — new_keys() misses it, touched_keys() must not.
+        let dir = tempfile::tempdir().unwrap();
+        let incoming = dir.path().join("in.bib");
+        std::fs::write(&incoming, "@article{k, title={New T}, abstract={z}}\n").unwrap();
+        let rep = import(&v, &incoming, DupPolicy::Overwrite).unwrap();
+        assert_eq!(rep.overwritten, 1);
+        assert!(rep.new_keys().is_empty(), "overwrite is not a new key");
+
+        let hooks = run_import_hooks(&v, &rep.touched_keys(), false);
+        assert_eq!(hooks.normalized, 1, "warnings: {:?}", hooks.warnings);
+        assert!(
+            show(&v, "k").unwrap().fields.get("abstract").is_none(),
+            "the overwritten entry was not re-cleaned"
+        );
+    }
+
+    #[test]
+    fn view_matches_speaks_the_cli_query_language() {
+        let (_d, mut v) = vault();
+        add(
+            &v,
+            AddSource::Bibtex("@article{k, title={Attention Is All}, year={2017}}".into()),
+        )
+        .unwrap();
+        set_tags(&mut v, "k", &["topics:nlp".into()], &[]).unwrap();
+        let view = show(&v, "k").unwrap();
+        assert!(view_matches("attention", &view));
+        assert!(view_matches("tag:topics:nlp", &view));
+        assert!(view_matches("nlp", &view), "free text also matches tags");
+        assert!(view_matches("attention 2017", &view), "terms AND");
+        assert!(!view_matches("attention zzz", &view));
+        assert!(view_matches("status:unread", &view));
+        assert!(!view_matches("stars:>=1", &view));
+    }
+
+    #[test]
+    fn lock_waits_briefly_for_a_concurrent_holder() {
+        let (_d, v) = vault();
+        let held = v.lock().unwrap();
+        // Release from another thread after a short hold: the engine's lock
+        // must wait it out instead of failing the caller immediately.
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let start = std::time::Instant::now();
+        lock_vault(&v).expect("lock_vault should wait for the holder");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(200));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn normalize_profile_drives_the_automatic_paths() {
+        let (_d, mut v) = vault();
+        // Base config drops `abstract`; the `keepall` profile keeps it. With
+        // the profile configured, the import hook must normalize with it.
+        std::fs::write(
+            v.niutero_dir().join("norm.toml"),
+            "protect_title_caps = false\n\n[profiles.keepall]\nkeep_fields = [\"title\", \"abstract\"]\nprotect_title_caps = false\n",
+        )
+        .unwrap();
+        assert!(
+            set_normalize_profile(&mut v, Some("nope")).is_err(),
+            "an unknown profile must be refused up front"
+        );
+        set_normalize_profile(&mut v, Some("keepall")).unwrap();
+        set_workflow(&mut v, None, None, None, None, Some(true)).unwrap();
+        let reopened = open(&v.root).unwrap();
+        assert_eq!(
+            reopened.config.workflow.normalize_profile.as_deref(),
+            Some("keepall")
+        );
+        add(
+            &reopened,
+            AddSource::Bibtex("@article{k, title={T}, abstract={keep me}, month={jan}}".into()),
+        )
+        .unwrap();
+        let view = show(&reopened, "k").unwrap();
+        assert!(
+            view.fields.get("abstract").is_some(),
+            "profile keep-list ignored"
+        );
+        assert!(
+            view.fields.get("month").is_none(),
+            "profile keep-list not applied"
+        );
+        // clearing goes back to the base config
+        let mut again = open(&v.root).unwrap();
+        set_normalize_profile(&mut again, Some("")).unwrap();
+        assert!(open(&v.root)
+            .unwrap()
+            .config
+            .workflow
+            .normalize_profile
+            .is_none());
+    }
+
+    #[test]
+    fn norm_config_options_round_trip_through_norm_toml() {
+        let (_d, v) = vault();
+        assert!(norm_config(&v).unwrap().fix_entities);
+        let cfg = set_norm_option(&v, "fix_entities", "false").unwrap();
+        assert!(!cfg.fix_entities);
+        assert!(!norm_config(&v).unwrap().fix_entities, "must persist");
+        assert!(set_norm_option(&v, "nope", "1").is_err());
+        // the written file is the documented form and still loads
+        let text = std::fs::read_to_string(v.niutero_dir().join("norm.toml")).unwrap();
+        assert!(
+            text.contains("# Whitelist of fields to keep"),
+            "got: {text}"
+        );
+        assert!(text.contains("fix_entities = false"), "got: {text}");
+    }
+
+    #[test]
+    fn openreview_forum_urls_map_to_their_pdf() {
+        use pdf_ops::fetchable_pdf_url;
+        assert_eq!(
+            fetchable_pdf_url("https://openreview.net/forum?id=2DtxPCL3T5").as_deref(),
+            Some("https://openreview.net/pdf?id=2DtxPCL3T5")
+        );
+        assert_eq!(
+            fetchable_pdf_url("https://openreview.net/forum?id=Ab_1-2.3#discussion").as_deref(),
+            Some("https://openreview.net/pdf?id=Ab_1-2.3")
+        );
+        // a group/profile page is not a paper; a doi.org landing page still isn't a PDF
+        assert_eq!(
+            fetchable_pdf_url("https://openreview.net/group?id=ICLR.cc/2024"),
+            None
+        );
+        assert_eq!(fetchable_pdf_url("https://doi.org/10.1145/1234"), None);
+    }
+
+    #[test]
+    fn add_normalizes_when_normalize_on_import_is_on() {
+        let (_d, mut v) = vault();
+        set_workflow(&mut v, None, None, None, None, Some(true)).unwrap();
+        add(
+            &v,
+            AddSource::Bibtex(
+                "@inproceedings{p, title={T}, booktitle={ICLR}, abstract={x}}".into(),
+            ),
+        )
+        .unwrap();
+        let view = show(&v, "p").unwrap();
+        assert!(view.fields.get("abstract").is_none());
+        assert_eq!(
+            view.fields.get("booktitle").map(String::as_str),
+            Some("International Conference on Learning Representations (ICLR)")
+        );
     }
 
     #[test]

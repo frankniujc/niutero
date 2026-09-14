@@ -13,3 +13,4 @@ regex = { workspace = true }
 [dev-dependencies]
 # Parse real `.bib` text in the integration tests (no cycle: bib doesn't use norm).
 niutero-bib = { path = "../niutero-bib" }
+tempfile = { workspace = true }

@@ -230,25 +230,21 @@ impl NiuteroApp {
                 // The library's configured duplicate default applies here too.
                 let policy = engine::default_dup_policy(&v, engine::DupPolicy::Skip);
                 let rep = engine::import_doi(&v, &doi, policy)?;
-                // Opt-in post-import hooks; both are no-ops without their pref.
+                // Opt-in post-import hooks; all no-ops without their pref.
+                // Touched keys, so an overwrite is re-cleaned too.
+                let hooks = engine::run_import_hooks(&v, &rep.touched_keys(), false);
                 let mut extra = String::new();
-                let keys = rep.new_keys();
-                if !keys.is_empty() {
-                    if let Ok((f, a)) = engine::auto_fetch_pdfs(&v, &keys) {
-                        if a > 0 {
-                            extra.push_str(&format!(" · {f}/{a} PDF(s)"));
-                        }
-                    }
-                    if let Ok((f, a)) = engine::auto_enrich(&v, &keys) {
-                        if a > 0 {
-                            extra.push_str(&format!(" · enriched {f}/{a}"));
-                        }
-                    }
-                    if let Ok(n) = engine::auto_normalize(&v, &keys) {
-                        if n > 0 {
-                            extra.push_str(&format!(" · normalized {n}"));
-                        }
-                    }
+                if hooks.pdfs.1 > 0 {
+                    extra.push_str(&format!(" · {}/{} PDF(s)", hooks.pdfs.0, hooks.pdfs.1));
+                }
+                if hooks.enriched.1 > 0 {
+                    extra.push_str(&format!(
+                        " · enriched {}/{}",
+                        hooks.enriched.0, hooks.enriched.1
+                    ));
+                }
+                if hooks.normalized > 0 {
+                    extra.push_str(&format!(" · normalized {}", hooks.normalized));
                 }
                 Ok((rep, extra))
             }) {
@@ -291,25 +287,27 @@ impl NiuteroApp {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let msg = match engine::open(&root).and_then(|v| {
+            let msg = match engine::open(&root).map(|v| {
+                let hooks = engine::run_import_hooks(&v, &keys, false);
                 let mut parts = Vec::new();
-                let (f, a) = engine::auto_fetch_pdfs(&v, &keys)?;
-                if a > 0 {
-                    parts.push(format!("{f}/{a} PDF(s)"));
+                if hooks.pdfs.1 > 0 {
+                    parts.push(format!("{}/{} PDF(s)", hooks.pdfs.0, hooks.pdfs.1));
                 }
-                let (f, a) = engine::auto_enrich(&v, &keys)?;
-                if a > 0 {
-                    parts.push(format!("enriched {f}/{a}"));
+                if hooks.enriched.1 > 0 {
+                    parts.push(format!(
+                        "enriched {}/{}",
+                        hooks.enriched.0, hooks.enriched.1
+                    ));
                 }
-                let n = engine::auto_normalize(&v, &keys)?;
-                if n > 0 {
-                    parts.push(format!("normalized {n}"));
+                if hooks.normalized > 0 {
+                    parts.push(format!("normalized {}", hooks.normalized));
                 }
-                Ok(if parts.is_empty() {
+                parts.extend(hooks.warnings);
+                if parts.is_empty() {
                     "nothing applicable".to_string()
                 } else {
                     parts.join(" · ")
-                })
+                }
             }) {
                 Ok(s) => BgMsg::Done(format!("Post-import: {s}")),
                 Err(e) => BgMsg::Failed(format!("Post-import hooks failed: {e}")),

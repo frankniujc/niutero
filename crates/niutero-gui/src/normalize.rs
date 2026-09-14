@@ -7,8 +7,9 @@
 //!   Accept applies that entry's changes via `engine::edit`, Apply-all uses
 //!   `engine::normalize_apply` when nothing is rejected (a single atomic pass).
 //! - Re-key renders `engine::rekey_preview`; Apply uses `engine::rekey_apply`.
-//! - Ruleset shows the real rule classes; the toggles are display-only for now
-//!   (the engine has no per-rule persistence API — runs use `.niutero/norm.toml`).
+//! - Ruleset shows the real rule classes; each toggle persists to
+//!   `.niutero/norm.toml` through `engine::set_norm_option` and the rows are
+//!   reseeded from `engine::norm_config` whenever the tool's cache is rebuilt.
 //!
 //! Like the Library views, this is a pure render over engine data ([`NormCache`],
 //! refreshed by the app) plus view-local [`NormalizeState`]; engine-touching
@@ -32,46 +33,79 @@ pub enum NormView {
     Rekey,
 }
 
-/// The rule classes the cleanup engine applies (display + their defaults). The
-/// toggles are not yet persisted — see the module doc.
-const RULES: [(&str, &str, &str, bool); 6] = [
+/// The rule classes the cleanup engine applies: name, tag, description, and
+/// the `norm.toml` option the row toggles (`None` = always on). Toggling goes
+/// through `engine::set_norm_option`, so the file is the source of truth.
+/// NB: keep in sync with `niutero-norm`'s offline passes (`normalize_entry`).
+const RULES: [(&str, &str, &str, Option<&str>); 8] = [
     (
         "Venue canonicalization",
-        "146 aliases",
-        "Map venue aliases to one canonical name (e.g. “Proc. of ICML” → “ICML”).",
-        true,
+        "one name",
+        "Collapse every spelling of a known venue to one canonical name; workshops, companion volumes, and joint proceedings are guarded.",
+        Some("canonicalize_venues"),
     ),
     (
-        "Title casing",
-        "Title Case",
-        "Normalize paper titles to a consistent Title Case.",
-        true,
+        "Title capital protection",
+        "{{…}}",
+        "Wrap capitalized title words in {{…}} so BibTeX styles can't lowercase them; math-mode titles are left alone.",
+        Some("protect_title_caps"),
     ),
     (
-        "Promote arXiv → published",
-        "online",
-        "When a published version exists, promote the arXiv preprint to it.",
-        true,
+        "Field whitelist",
+        "keep-list",
+        "Drop noise fields (abstract, month, …) that aren't on the keep-list (edit the list in norm.toml or with norm-config).",
+        None,
     ),
     (
-        "Required fields",
-        "url · year · author",
-        "Flag entries missing fields the library expects.",
-        true,
+        "doi → url",
+        "doi.org",
+        "Convert a doi field into a url (and drop the doi).",
+        Some("doi_to_url"),
     ),
     (
-        "Duplicate detection",
-        "off",
-        "Cluster likely-duplicate entries by title/DOI similarity.",
-        false,
+        "Author clipping",
+        "max 25",
+        "Truncate very long author lists to “… and others”.",
+        Some("max_authors"),
     ),
     (
-        "Author name format",
-        "Last, First",
-        "Normalize author names to “Last, First”.",
-        true,
+        "Whitespace tidy",
+        "collapse",
+        "Collapse runs of whitespace and trim each field value.",
+        Some("tidy_whitespace"),
     ),
-]; // NB: keep in sync with the engine's offline passes.
+    (
+        "Entities & ampersands",
+        "\\&",
+        "Decode stray HTML entities (&amp; …) and escape a bare & to \\& so values are LaTeX-safe.",
+        Some("fix_entities"),
+    ),
+    (
+        "arXiv canonicalization",
+        "@misc",
+        "Collapse arXiv preprints to @misc with eprint / archiveprefix / url; entries with a real venue are never touched.",
+        Some("normalize_arxiv"),
+    ),
+];
+
+/// The `norm.toml` option a Ruleset row toggles (`None` = always on).
+pub fn rule_option_key(i: usize) -> Option<&'static str> {
+    RULES.get(i).and_then(|r| r.3)
+}
+
+/// The Ruleset toggles as the vault's config has them (row order of [`RULES`]).
+pub fn rules_from_config(cfg: &niutero_engine::NormConfig) -> [bool; 8] {
+    [
+        cfg.canonicalize_venues,
+        cfg.protect_title_caps,
+        true,
+        cfg.doi_to_url,
+        cfg.max_authors > 0,
+        cfg.tidy_whitespace,
+        cfg.fix_entities,
+        cfg.normalize_arxiv,
+    ]
+}
 
 /// View-local UI state for the Normalize tool.
 pub struct NormalizeState {
@@ -81,7 +115,7 @@ pub struct NormalizeState {
     /// Per-entry accept (`true`) / reject (`false`) decisions (Review).
     pub done: HashMap<String, bool>,
     /// Local ruleset toggles (display-only; see module doc).
-    pub rules: [bool; 6],
+    pub rules: [bool; 8],
     /// Measured row heights for the virtualized Review / Re-key lists (so only
     /// on-screen cards/rows are built each frame). Reseeded when the list size
     /// changes; see [`widgets::virtual_list`].
@@ -95,7 +129,8 @@ impl Default for NormalizeState {
             view: NormView::Overview,
             picked: None,
             done: HashMap::new(),
-            rules: RULES.map(|r| r.3),
+            // Reseeded from the vault's norm.toml when the tool's cache is built.
+            rules: [true; 8],
             review_heights: Vec::new(),
             rekey_heights: Vec::new(),
         }
@@ -125,6 +160,8 @@ pub enum NormAction {
     ApplyRekey,
     /// Recompute the re-key preview from the current library (`rekey_preview`).
     RefreshRekey,
+    /// Flip Ruleset row `i` (persisted to norm.toml via `engine::set_norm_option`).
+    ToggleRule(usize),
 }
 
 /// Render the Normalize tool.
@@ -181,7 +218,7 @@ pub fn normalize(
                             widgets::centered_column(ui, 880.0, |ui| match st.view {
                                 NormView::Overview => overview(ui, theme, cache, st, actions),
                                 NormView::Review => review(ui, theme, entries, cache, st, actions),
-                                NormView::Ruleset => ruleset(ui, theme, st),
+                                NormView::Ruleset => ruleset(ui, theme, st, actions),
                                 NormView::Rekey => rekey(ui, theme, cache, st, actions),
                             });
                         });
@@ -598,7 +635,12 @@ fn value_chip(ui: &mut egui::Ui, text: &str, color: egui::Color32, strike: bool)
 
 // ------------------------------------------------------------------- Ruleset
 
-fn ruleset(ui: &mut egui::Ui, theme: &Theme, st: &mut NormalizeState) {
+fn ruleset(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    st: &mut NormalizeState,
+    actions: &mut Vec<NormAction>,
+) {
     widgets::tab_header(
         ui,
         theme,
@@ -607,7 +649,7 @@ fn ruleset(ui: &mut egui::Ui, theme: &Theme, st: &mut NormalizeState) {
         "",
     );
     widgets::card(theme).show(ui, |ui| {
-        for (i, (name, meta, desc, _)) in RULES.iter().enumerate() {
+        for (i, (name, meta, desc, key)) in RULES.iter().enumerate() {
             egui::Frame::default()
                 .inner_margin(egui::Margin::symmetric(20, 16))
                 .show(ui, |ui| {
@@ -623,8 +665,12 @@ fn ruleset(ui: &mut egui::Ui, theme: &Theme, st: &mut NormalizeState) {
                             ui.label(RichText::new(*desc).size(13.0).color(theme.text_2));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::toggle(ui, theme, st.rules[i]) {
-                                st.rules[i] = !st.rules[i];
+                            if key.is_some() {
+                                if widgets::toggle(ui, theme, st.rules[i]) {
+                                    actions.push(NormAction::ToggleRule(i));
+                                }
+                            } else {
+                                ui.label(RichText::new("always on").size(11.5).color(theme.faint));
                             }
                         });
                     });
@@ -641,7 +687,7 @@ fn ruleset(ui: &mut egui::Ui, theme: &Theme, st: &mut NormalizeState) {
     ui.add_space(10.0);
     ui.label(
         RichText::new(
-            "Toggle changes aren't persisted yet — runs use the library's norm.toml profile.",
+            "Toggles are saved to the library's .niutero/norm.toml (the base config); named profiles are edited in that file.",
         )
         .size(11.5)
         .color(theme.faint),

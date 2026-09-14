@@ -16,14 +16,21 @@ It talks to nothing but `127.0.0.1` — there is no cloud service and no telemet
                                                      (niutero hosts the server)
 ```
 
-The extension only reads the page: it returns `{ identifier, metadata }` and
-lets **niutero** decide. On an OpenReview page it sends `openreview:<id>` and
-niutero fetches the venue's official BibTeX from the OpenReview API; with a DOI
-or arXiv id niutero fetches canonical BibTeX from doi.org; otherwise it builds an
-entry from the scraped meta tags. Either way the entry is re-keyed to your
-library's pattern, merged (skip-on-duplicate), **normalized**, and the rest of
-your import hooks run (enrich / PDF-fetch / auto-commit, if enabled) before the
-open library refreshes — so a capture lands as a clean, ready-to-use entry.
+The extension only reads the page: it POSTs `{ identifier, metadata, tags }`
+and lets **niutero** decide. On an OpenReview *submission* page (forum/pdf) it
+sends `openreview:<id>` and niutero fetches the venue's official BibTeX from
+the OpenReview API; with a DOI or arXiv id (an `arxiv.org/abs/`, `/pdf/`, or
+`/html/` page, or a `citation_arxiv_id` tag) niutero fetches canonical BibTeX
+from doi.org; otherwise it builds an entry from the scraped meta tags. If an
+identifier fails to resolve (a flaky publisher, a venue without BibTeX),
+niutero **falls back to the page's metadata** instead of losing the capture —
+the popup then says "(saved from page metadata)". Either way the entry is
+re-keyed to your library's pattern, merged under your duplicate policy (a
+*different* paper whose key merely collides is added under a suffixed key, and
+a skipped duplicate still receives the tags you typed), **normalized**, and
+the rest of your import hooks run (enrich / PDF-fetch / auto-commit, if
+enabled) before the open library refreshes — so a capture lands as a clean,
+ready-to-use entry.
 
 ## Enable it in niutero first
 
@@ -54,8 +61,11 @@ processes:
 
 - bound to **`127.0.0.1` only**;
 - rejects any request whose **`Host`** is not loopback (anti DNS-rebinding);
-- requires an **extension `Origin`** (`chrome-extension://` / `moz-extension://`);
-  ordinary web origins are refused (anti CSRF);
+- `POST /import` requires a **present extension `Origin`**
+  (`chrome-extension://` / `moz-extension://`); ordinary web origins, a
+  missing `Origin`, and the forgeable `Origin: null` (what a sandboxed iframe
+  or a `file:` page sends) are all refused (anti CSRF). The read-only
+  `GET /ping` tolerates a missing `Origin` so `curl` debugging works;
 - sends **no `Access-Control-Allow-*`**, so a web page's script can't read
   responses, while this extension's `host_permissions` fetch is unaffected.
 
@@ -66,5 +76,6 @@ only when you click.
 ## Port
 
 The endpoint is `http://127.0.0.1:23510`. It is referenced in three places that
-must stay in sync if you change it: the Rust `connector::DEFAULT_PORT`,
-`manifest.json` (`host_permissions`), and `popup.js` (`NIUTERO`).
+must stay in sync if you change it: the Rust `connector::DEFAULT_PORT` (the
+CLI's `connector --port` defaults from the same constant), `manifest.json`
+(`host_permissions`), and `popup.js` (`NIUTERO`).

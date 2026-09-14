@@ -79,12 +79,24 @@ async function save() {
     });
     const j = await r.json();
     if (j && j.ok) {
-      if (j.added > 0) {
-        setStatus("result", "Saved: " + (j.title || j.citekey || "done"), "ok");
+      // Every check is undefined-tolerant so an old server (no `renamed` /
+      // `tags_updated` / `fallback` fields) degrades to the plain messages.
+      const name = j.title || j.citekey || "done";
+      if (j.added > 0 || j.renamed > 0) {
+        setStatus("result", "Saved: " + name, "ok");
       } else if (j.overwritten > 0) {
-        setStatus("result", "Updated: " + (j.title || j.citekey || "done"), "ok");
+        setStatus("result", "Updated: " + name, "ok");
+      } else if (j.tags_updated) {
+        setStatus("result", "Already in your library — tags updated", "ok");
+        $("save").disabled = false; // allow another tag pass
       } else {
         setStatus("result", "Already in your library", "muted");
+        $("save").disabled = false;
+      }
+      if (j.fallback) {
+        // The identifier couldn't be resolved; the entry came from the page's
+        // own metadata (venue/fields may be less polished).
+        $("result").textContent += " (saved from page metadata)";
       }
     } else {
       setStatus("result", "Not saved: " + ((j && j.error) || "unknown error"), "bad");

@@ -96,6 +96,136 @@ fn check_exits_two_when_dirty_zero_when_clean() {
 }
 
 #[test]
+fn malformed_norm_toml_fails_with_exit_1() {
+    // A config typo must fail loudly — never silently revert every rule to
+    // its default and rewrite the library.
+    let d = vault_with(DIRTY);
+    let before = bib(&d);
+    fs::write(
+        d.path().join(".niutero").join("norm.toml"),
+        "keep_fields = [unclosed",
+    )
+    .unwrap();
+    niutero()
+        .arg("normalize")
+        .arg(d.path())
+        .arg("--write")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("norm.toml"));
+    assert_eq!(bib(&d), before, "nothing may be written on a config error");
+}
+
+#[test]
+fn norm_config_shows_and_sets_options() {
+    let d = vault_with(DIRTY);
+    niutero()
+        .arg("norm-config")
+        .arg(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fix_entities:        true"));
+    niutero()
+        .arg("norm-config")
+        .arg(d.path())
+        .args([
+            "--set",
+            "protect_title_caps=false",
+            "--set",
+            "max_authors=3",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("protect_title_caps:  false"))
+        .stdout(predicate::str::contains("max_authors:         3"));
+    // persisted: the next normalize no longer brace-protects the title
+    niutero()
+        .arg("normalize")
+        .arg(d.path())
+        .arg("--write")
+        .assert()
+        .success();
+    let s = bib(&d);
+    assert!(s.contains("title = {A B}"), "got: {s}");
+    // --json shape + a bad key errors
+    let out = niutero()
+        .arg("norm-config")
+        .arg(d.path())
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["max_authors"], serde_json::json!(3));
+    assert_eq!(v["protect_title_caps"], serde_json::json!(false));
+    niutero()
+        .arg("norm-config")
+        .arg(d.path())
+        .args(["--set", "nope=true"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("unknown normalize option"));
+}
+
+#[test]
+fn config_normalize_profile_selects_the_hooks_profile() {
+    let d = vault_with(DIRTY);
+    fs::write(
+        d.path().join(".niutero").join("norm.toml"),
+        "[profiles.keepall]\nkeep_fields = [\"title\", \"abstract\"]\nprotect_title_caps = false\n",
+    )
+    .unwrap();
+    // unknown profile is refused up front
+    niutero()
+        .arg("config")
+        .arg(d.path())
+        .args(["--normalize-profile", "nope"])
+        .assert()
+        .failure()
+        .code(1);
+    niutero()
+        .arg("config")
+        .arg(d.path())
+        .args([
+            "--normalize-profile",
+            "keepall",
+            "--normalize-on-import",
+            "true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("normalize profile:   keepall"));
+    // the hook now normalizes with the profile: abstract kept, title untouched
+    niutero()
+        .arg("add")
+        .arg(d.path())
+        .args([
+            "--bibtex",
+            "@article{p, title={Keep Case}, abstract={kept}, month={jan}}",
+        ])
+        .assert()
+        .success();
+    let s = bib(&d);
+    assert!(s.contains("abstract = {kept}"), "got: {s}");
+    assert!(s.contains("title = {Keep Case}"), "got: {s}");
+    assert!(!s.contains("month"), "got: {s}");
+    // "" clears it
+    niutero()
+        .arg("config")
+        .arg(d.path())
+        .args(["--normalize-profile", ""])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "normalize profile:   (base config)",
+        ));
+}
+
+#[test]
 fn write_and_check_are_mutually_exclusive() {
     let d = vault_with(DIRTY);
     niutero()

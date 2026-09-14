@@ -14,8 +14,11 @@
 //! local processes, so instead of a token:
 //! 1. bind **`127.0.0.1` only** (never `0.0.0.0`);
 //! 2. require a **loopback `Host`** header (defeats DNS rebinding);
-//! 3. require an **extension `Origin`** (`*-extension://`), rejecting ordinary
-//!    web origins (defeats page CSRF);
+//! 3. `POST /import` requires a **present extension `Origin`**
+//!    (`*-extension://`): ordinary web origins, a missing `Origin`, and the
+//!    opaque `Origin: null` (what a sandboxed iframe or `file:` page sends) are
+//!    all refused (defeats page CSRF). The read-only `GET /ping` tolerates a
+//!    missing `Origin` so `curl` debugging works; it leaks nothing.
 //! 4. send **no `Access-Control-Allow-*`** — a web page's script can't read our
 //!    responses, while the extension's `host_permissions` fetch is unaffected.
 //!
@@ -56,6 +59,10 @@ pub const DEFAULT_PORT: u16 = 23510;
 /// Largest accepted request body (one entry's worth of metadata). Anything
 /// larger gets `413` without allocation.
 const MAX_BODY: usize = 64 * 1024;
+
+/// Largest accepted request head (request line + headers) — a drip-fed header
+/// stream can't grow memory or wedge the single-threaded accept loop.
+const MAX_HEAD: usize = 16 * 1024;
 
 /// Per-connection socket read/write timeout — a slow client can't wedge the loop.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
@@ -114,10 +121,20 @@ pub struct ImportRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ImportOutcome {
     pub citekey: String,
+    /// Display title — brace protection stripped for the popup toast; the
+    /// stored entry keeps its `{{…}}`.
     pub title: String,
     pub added: usize,
     pub overwritten: usize,
     pub skipped: usize,
+    /// Same-paper re-captures added under a new key (`on_dup = rename`).
+    pub renamed: usize,
+    /// The popup's tags were applied to at least one entry — including the
+    /// stored twin of a skipped duplicate.
+    pub tags_updated: bool,
+    /// Set when the identifier couldn't be resolved and the entry was built
+    /// from the page's scraped metadata instead (holds the reason).
+    pub fallback: Option<String>,
 }
 
 // ------------------------------------------------------------- server config
@@ -140,8 +157,9 @@ pub struct ConnectorConfig {
     pub port: u16,
     /// Shared, host-updated target library (and `/ping` status).
     pub shared: Arc<Mutex<ConnectorShared>>,
-    /// Called after a successful import so a UI host can refresh. No-op for CLI.
-    pub on_import: Arc<dyn Fn() + Send + Sync>,
+    /// Called with the outcome after a successful import so a UI host can
+    /// toast accurately and refresh only when something changed. No-op for CLI.
+    pub on_import: Arc<dyn Fn(&ImportOutcome) + Send + Sync>,
 }
 
 /// A running server. Drop (or [`stop`](ServerHandle::stop)) shuts it down.
@@ -181,6 +199,7 @@ pub fn start(cfg: ConnectorConfig) -> io::Result<ServerHandle> {
     listener.set_nonblocking(true)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let shut = Arc::clone(&shutdown);
+    let cfg = Arc::new(cfg);
     let join = std::thread::Builder::new()
         .name("niutero-connector".to_string())
         .spawn(move || serve_loop(listener, cfg, shut))?;
@@ -192,15 +211,29 @@ pub fn start(cfg: ConnectorConfig) -> io::Result<ServerHandle> {
     })
 }
 
-fn serve_loop(listener: TcpListener, cfg: ConnectorConfig, shutdown: Arc<AtomicBool>) {
+/// The accept loop only accepts: each connection is served on its own thread,
+/// so a capture mid-fetch (an OpenReview/doi.org call, a PDF download) neither
+/// blocks the next capture nor wedges [`ServerHandle::stop`] — stopping joins
+/// this loop (≤ one `ACCEPT_POLL` tick), while an in-flight request finishes on
+/// its own thread after the listener is already released.
+fn serve_loop(listener: TcpListener, cfg: Arc<ConnectorConfig>, shutdown: Arc<AtomicBool>) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                // One bad connection must not kill the server. Debug, not warn:
-                // client-caused, and port scanners would spam warns.
-                if let Err(e) = handle_connection(&mut stream, &cfg) {
-                    log::debug!("connector: connection error: {e}");
+                let cfg = Arc::clone(&cfg);
+                let spawned = std::thread::Builder::new()
+                    .name("niutero-connector-req".to_string())
+                    .spawn(move || {
+                        // One bad connection must not kill the server. Debug,
+                        // not warn: client-caused, and port scanners would
+                        // spam warns.
+                        if let Err(e) = handle_connection(&mut stream, &cfg) {
+                            log::debug!("connector: connection error: {e}");
+                        }
+                    });
+                if let Err(e) = spawned {
+                    log::warn!("connector: could not spawn a request thread: {e}");
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -252,7 +285,9 @@ fn route(req: &Request, cfg: &ConnectorConfig) -> (&'static str, String) {
             }
         }
         ("POST", "/import") => {
-            if !origin_ok(req.origin.as_deref()) {
+            // Stricter than /ping: a mutating request needs a PRESENT
+            // extension Origin — missing or `null` is refused.
+            if !origin_ok_for_import(req.origin.as_deref()) {
                 forbidden_origin()
             } else {
                 handle_import(req, cfg)
@@ -292,7 +327,7 @@ fn handle_import(req: &Request, cfg: &ConnectorConfig) -> (&'static str, String)
     // always reads a structured body (only transport/parse errors are non-200).
     match connector_import(&mut v, &parsed) {
         Ok(o) => {
-            (cfg.on_import)();
+            (cfg.on_import)(&o);
             ("200 OK", outcome_body(&o))
         }
         Err(e) => ("200 OK", json_error(&e)),
@@ -314,18 +349,52 @@ pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutc
     // entry to the library's cite-key pattern so connector entries follow the
     // library convention and a re-capture of the same source renders the same
     // key (so the dup policy can dedupe it instead of letting a twin slip in).
-    let mut incoming = resolve_entries(req)?;
+    let resolved = resolve_entries(req)?;
+    let fallback = resolved.fallback;
+    let mut incoming = resolved.entries;
     for e in &mut incoming {
         rekey_to_base_pattern(v, e);
         e.validate()?;
     }
 
-    // Merge under the vault lock (the read-modify-write of references.bib;
-    // `merge_incoming`'s contract requires the caller to hold it). Scoped to this
-    // block so the post-import hooks below can re-lock (the lock is non-reentrant).
+    // Under the vault lock (the read-modify-write of references.bib;
+    // `merge_incoming`'s contract requires the caller to hold it — scoped so
+    // the post-import hooks below can re-lock): content-identity triage, then
+    // merge. A base-key collision is only a *duplicate* when it is the same
+    // work; a DIFFERENT paper that happens to render the same key gets a
+    // letter suffix and is added — never silently dropped. A same-work
+    // collision under `rename` is suffixed here too, so connector adds use
+    // the letter style (`key` → `keya`) rather than bulk-import's `key-2`.
     let report = {
         let _lock = crate::lock_vault(v)?;
-        crate::merge_incoming(v, incoming, policy)?
+        let items = crate::read_items(v)?;
+        let existing: std::collections::HashMap<String, BibEntry> = entries(&items)
+            .map(|e| (e.citekey.clone(), e.clone()))
+            .collect();
+        let mut taken: std::collections::HashSet<String> = existing.keys().cloned().collect();
+        let mut pre_renamed: Vec<(String, String)> = Vec::new();
+        for e in &mut incoming {
+            if let Some(old) = existing.get(&e.citekey) {
+                if !niutero_core::dedup::same_work(old, e) {
+                    e.citekey = crate::next_free_key(&e.citekey, &taken).0;
+                } else if policy == crate::DupPolicy::Rename {
+                    let new = crate::next_free_key(&e.citekey, &taken).0;
+                    pre_renamed.push((e.citekey.clone(), new.clone()));
+                    e.citekey = new;
+                }
+                // Same work + Skip/Overwrite: leave the key; merge applies it.
+            }
+            taken.insert(e.citekey.clone());
+        }
+        let mut report = crate::merge_incoming(v, incoming, policy)?;
+        // The pre-resolved renames reached merge as plain adds — fold them
+        // back so counters (and the popup) tell the truth.
+        for (old, new) in pre_renamed {
+            report.added -= 1;
+            report.added_keys.retain(|k| k != &new);
+            report.renamed.push((old, new));
+        }
+        report
     };
 
     // Cover every entry this import wrote — added, renamed, AND overwritten — so
@@ -334,36 +403,40 @@ pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutc
     // `new_keys()` would otherwise omit).
     let touched = report.touched_keys();
 
-    // Tags first (sidecar only) so any later hook sees a complete entry.
-    if !req.tags.is_empty() && !touched.is_empty() {
-        let adds: Vec<(String, Vec<String>)> = touched
+    // Tags first (sidecar only) so any later hook sees a complete entry. A
+    // skipped duplicate still gets the popup's tags — that capture was the
+    // user's way of tagging the stored entry.
+    let mut tag_targets = touched.clone();
+    tag_targets.extend(report.skipped_keys.iter().cloned());
+    let mut tags_updated = false;
+    if !req.tags.is_empty() && !tag_targets.is_empty() {
+        let adds: Vec<(String, Vec<String>)> = tag_targets
             .iter()
             .map(|k| (k.clone(), req.tags.clone()))
             .collect();
-        if let Err(e) = crate::set_tags_bulk(v, &adds) {
-            log::warn!("connector: tagging entries failed: {e}");
+        match crate::set_tags_bulk(v, &adds) {
+            Ok(_) => tags_updated = true,
+            Err(e) => log::warn!("connector: tagging entries failed: {e}"),
         }
     }
 
-    if !touched.is_empty() {
-        if let Err(e) = crate::auto_enrich(v, &touched) {
-            log::warn!("connector: enrich skipped: {e}");
-        }
-        // ALWAYS normalize — the connector's whole job is to hand back a clean,
-        // ready-to-use entry — independent of `normalize_on_import` (the toggle
-        // that governs bulk/CLI imports, where you may want a verbatim copy).
-        match crate::normalize_apply_keys(v, &touched, None) {
-            Ok(c) if !c.is_empty() => {
-                log::info!("connector: normalized {} entr(ies)", c.len())
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!("connector: normalize skipped: {e}"),
-        }
-        match crate::auto_fetch_pdfs(v, &touched) {
-            Ok((f, a)) if a > 0 => log::info!("connector: fetched {f}/{a} PDF(s)"),
-            Ok(_) => {}
-            Err(e) => log::warn!("connector: PDF fetch skipped: {e}"),
-        }
+    // The shared post-import pipeline (enrich → normalize → PDFs), with
+    // normalization FORCED — the connector's whole job is to hand back a
+    // clean, ready-to-use entry, independent of `normalize_on_import` (the
+    // toggle that governs bulk/CLI imports, where you may want a verbatim copy).
+    let hooks = crate::run_import_hooks(v, &touched, true);
+    for w in &hooks.warnings {
+        log::warn!("connector: {w}");
+    }
+    if hooks.normalized > 0 {
+        log::info!("connector: normalized {} entr(ies)", hooks.normalized);
+    }
+    if hooks.pdfs.1 > 0 {
+        log::info!(
+            "connector: fetched {}/{} PDF(s)",
+            hooks.pdfs.0,
+            hooks.pdfs.1
+        );
     }
 
     // Refresh keep-updated exports / auto-commit whenever the `.bib` changed —
@@ -384,13 +457,19 @@ pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutc
         }
     }
 
-    let (citekey, title) = match touched.first() {
+    // The entry to show in the popup: what was written, else the stored twin a
+    // skip matched (so "Already in your library" can still name the paper).
+    let shown = touched
+        .first()
+        .or_else(|| report.skipped_keys.first())
+        .cloned();
+    let (citekey, title) = match shown {
         Some(k) => {
-            let title = crate::show(v, k)
+            let title = crate::show(v, &k)
                 .ok()
                 .and_then(|view| view.fields.get("title").cloned())
                 .unwrap_or_default();
-            (k.clone(), title)
+            (k, display_title(&title))
         }
         None => (String::new(), String::new()),
     };
@@ -400,13 +479,65 @@ pub fn connector_import(v: &mut Vault, req: &ImportRequest) -> Result<ImportOutc
         added: report.added,
         overwritten: report.overwritten,
         skipped: report.skipped,
+        renamed: report.renamed.len(),
+        tags_updated,
+        fallback,
     })
+}
+
+/// The title as the popup should show it: brace protection stripped. The
+/// stored entry keeps its `{{…}}` — this is display-only.
+fn display_title(s: &str) -> String {
+    s.replace(['{', '}'], "")
+}
+
+/// What a capture resolved to: the entries to merge, and — when the
+/// identifier's canonical resolution failed but the page's scraped metadata
+/// was usable — the reason the capture fell back to it.
+#[derive(Debug)]
+struct Resolved {
+    entries: Vec<BibEntry>,
+    fallback: Option<String>,
 }
 
 /// Resolve one capture to the BibTeX entries to merge, preferring a canonical
 /// source over scraped metadata. Network fetches (OpenReview / doi.org) run
 /// here, on the caller's thread, **without** the vault lock held.
-fn resolve_entries(req: &ImportRequest) -> Result<Vec<BibEntry>, String> {
+///
+/// A resolution failure no longer loses the capture: when the request also
+/// carries usable page metadata, the entry is built from that and the outcome
+/// marked as a fallback (a transient doi.org 5xx or a venue without BibTeX
+/// must not throw away a paper the extension already described).
+fn resolve_entries(req: &ImportRequest) -> Result<Resolved, String> {
+    // Fall back to the scraped metadata for `reason`, or surface `reason` as
+    // the error when the metadata can't make an entry either.
+    let identifier = req
+        .identifier
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let fall_back = |reason: String| -> Result<Resolved, String> {
+        match req.metadata.as_ref().map(build_entry_from_metadata) {
+            Some(Ok(mut e)) => {
+                // The identifier that failed to *resolve* is still the paper's
+                // identity: keep it on the entry so `enrich` (a DOI) or the
+                // arXiv pass (an eprint) can finish the job later.
+                if let Some(id) = identifier {
+                    attach_identifier(&mut e, id);
+                }
+                log::info!("connector: using page metadata ({reason})");
+                Ok(Resolved {
+                    entries: vec![e],
+                    fallback: Some(reason),
+                })
+            }
+            _ => Err(reason),
+        }
+    };
+    let ok = |entries: Vec<BibEntry>| Resolved {
+        entries,
+        fallback: None,
+    };
     if let Some(id) = req
         .identifier
         .as_deref()
@@ -417,22 +548,59 @@ fn resolve_entries(req: &ImportRequest) -> Result<Vec<BibEntry>, String> {
         // (Doing so turns an unreadable id into a baffling `https://doi.org/
         // openreview:…` → HTTP 400 instead of a clear OpenReview error.) The
         // forum page exposes no usable DOI, but the venue's canonical BibTeX is
-        // one API call away — far better than the page's sparse meta tags.
+        // one API call away — far better than the page's sparse meta tags. On
+        // failure the fallback is the page METADATA, never doi.org.
         if is_openreview_identifier(id) {
-            let or_id = openreview_id(id).ok_or_else(|| {
-                format!("'{id}' is an OpenReview link but no submission id could be read from it")
-            })?;
-            let src = niutero_online::fetch_openreview_bibtex(&or_id)?;
-            return parsed_entries(&src, &format!("OpenReview {or_id}"));
+            let Some(or_id) = openreview_id(id) else {
+                return fall_back(format!(
+                    "'{id}' is an OpenReview link but no submission id could be read from it"
+                ));
+            };
+            return match niutero_online::fetch_openreview_bibtex(&or_id)
+                .and_then(|src| parsed_entries(&src, &format!("OpenReview {or_id}")))
+            {
+                Ok(es) => Ok(ok(es)),
+                Err(e) => fall_back(e),
+            };
         }
         // Otherwise a DOI / arXiv id, resolved via doi.org content negotiation.
-        let src = niutero_online::fetch_doi_bibtex(&identifier_to_doi(id))?;
-        return parsed_entries(&src, id);
+        return match niutero_online::fetch_doi_bibtex(&identifier_to_doi(id))
+            .and_then(|src| parsed_entries(&src, id))
+        {
+            Ok(es) => Ok(ok(es)),
+            Err(e) => fall_back(e),
+        };
     }
     if let Some(meta) = &req.metadata {
-        return Ok(vec![build_entry_from_metadata(meta)?]);
+        return Ok(ok(vec![build_entry_from_metadata(meta)?]));
     }
     Err("the capture had neither an identifier nor metadata".into())
+}
+
+/// Put a capture's identifier onto a metadata-built entry: a DOI as `doi`
+/// (unless one is present), an arXiv id as `eprint` + `archiveprefix`. An
+/// OpenReview id has no BibTeX field — the page url already names it.
+fn attach_identifier(e: &mut BibEntry, id: &str) {
+    let id = id.trim();
+    if is_openreview_identifier(id) {
+        return;
+    }
+    if let Some(rest) = id
+        .strip_prefix("arXiv:")
+        .or_else(|| id.strip_prefix("arxiv:"))
+        .or_else(|| id.strip_prefix("arXiv/"))
+    {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            e.set("eprint", rest);
+            e.set("archiveprefix", "arXiv");
+        }
+        return;
+    }
+    let doi = id.strip_prefix("doi:").unwrap_or(id).trim();
+    if !doi.is_empty() && e.get("doi").is_none_or(|d| d.trim().is_empty()) {
+        e.set("doi", doi);
+    }
 }
 
 /// Parse fetched BibTeX into entries, erroring if it held none.
@@ -556,6 +724,13 @@ fn build_entry_from_metadata(m: &ScrapedMetadata) -> Result<BibEntry, String> {
         "inproceedings" | "incollection" if !m.booktitle.trim().is_empty() => {
             e.set("booktitle", m.booktitle.trim())
         }
+        // A venue-typed page whose venue tag was blank: an `@inproceedings`
+        // with no booktitle is a hollow shell — a `@misc` is honest, and the
+        // journal (if any) is still worth keeping.
+        "inproceedings" | "incollection" | "article" => {
+            e.set_type("misc");
+            set_if("journal", &m.journal, &mut e);
+        }
         _ => {}
     }
     set_if("volume", &m.volume, &mut e);
@@ -613,17 +788,26 @@ fn host_is_loopback(value: &str) -> bool {
         || host == "::1"
 }
 
-/// An extension `Origin` (defeats page CSRF). A missing `Origin` is allowed: the
-/// extension's background fetch may omit it, and loopback already gates us.
+/// Origin rule for the read-only routes (`/ping`): an extension `Origin`, or
+/// none at all (`curl` debugging; the loopback bind already gates us, and the
+/// route leaks nothing).
 fn origin_ok(origin: Option<&str>) -> bool {
     origin.is_none_or(origin_is_extension)
 }
 
-/// Pure: is this `Origin` an extension scheme (or the opaque `null`)?
+/// Origin rule for the mutating route (`POST /import`): a PRESENT extension
+/// `Origin` is required. The extension's cross-origin fetches always send one;
+/// a missing `Origin` or the opaque `Origin: null` (what a sandboxed iframe or
+/// a `file:` page sends) would be a blind-POST CSRF hole and is refused.
+fn origin_ok_for_import(origin: Option<&str>) -> bool {
+    origin.is_some_and(origin_is_extension)
+}
+
+/// Pure: is this `Origin` an extension scheme? `null` is NOT accepted — any
+/// hostile page can forge it; no extension needs it.
 fn origin_is_extension(value: &str) -> bool {
     let o = value.trim();
-    o == "null"
-        || o.starts_with("chrome-extension://")
+    o.starts_with("chrome-extension://")
         || o.starts_with("moz-extension://")
         || o.starts_with("safari-web-extension://")
 }
@@ -656,14 +840,23 @@ fn ping_body(library: Option<&str>) -> String {
 }
 
 fn outcome_body(o: &ImportOutcome) -> String {
-    format!(
-        "{{\"ok\":true,\"citekey\":{},\"title\":{},\"added\":{},\"overwritten\":{},\"skipped\":{}}}",
+    let mut s = format!(
+        "{{\"ok\":true,\"citekey\":{},\"title\":{},\"added\":{},\"overwritten\":{},\
+         \"skipped\":{},\"renamed\":{},\"tags_updated\":{}",
         json_str(&o.citekey),
         json_str(&o.title),
         o.added,
         o.overwritten,
-        o.skipped
-    )
+        o.skipped,
+        o.renamed,
+        o.tags_updated
+    );
+    if let Some(f) = &o.fallback {
+        s.push_str(",\"fallback\":");
+        s.push_str(&json_str(f));
+    }
+    s.push('}');
+    s
 }
 
 fn json_error(msg: &str) -> String {
@@ -721,6 +914,11 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadError> {
         let n = reader.read_line(&mut line)?;
         if n == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        // Cap the head like the body — a drip-fed header stream must not grow
+        // memory or wedge the single-threaded accept loop.
+        if head.len() + line.len() > MAX_HEAD {
+            return Err(ReadError::TooLarge);
         }
         head.push_str(&line);
     }
@@ -796,7 +994,7 @@ mod tests {
         let cfg = ConnectorConfig {
             port: 0,
             shared,
-            on_import: Arc::new(|| {}),
+            on_import: Arc::new(|_| {}),
         };
         let handle = start(cfg).unwrap();
         let port = handle.port();
@@ -846,9 +1044,11 @@ mod tests {
         ] {
             assert!(!host_is_loopback(h), "should reject Host {h:?}");
         }
-        // Missing Host is allowed (the bind is the barrier); missing Origin too.
+        // Missing Host is allowed (the bind is the barrier). Missing Origin is
+        // allowed on the read-only routes — but never on /import.
         assert!(host_ok(None));
         assert!(origin_ok(None));
+        assert!(!origin_ok_for_import(None));
     }
 
     #[test]
@@ -857,7 +1057,6 @@ mod tests {
             "chrome-extension://abcdefghijklmnop",
             "moz-extension://1234-5678",
             "safari-web-extension://deadbeef",
-            "null",
         ] {
             assert!(origin_is_extension(o), "should accept Origin {o:?}");
         }
@@ -865,6 +1064,9 @@ mod tests {
             "https://evil.example.com",
             "http://localhost:3000",
             "https://niutero.example",
+            // `null` is what a sandboxed iframe / file: page sends — a blind
+            // CSRF write if accepted. Refused.
+            "null",
             "",
         ] {
             assert!(!origin_is_extension(o), "should reject Origin {o:?}");
@@ -1086,6 +1288,12 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
         assert!(resp.contains("\"ok\":true"), "got: {resp}");
         assert!(resp.contains("\"added\":1"), "got: {resp}");
+        // The response title is for the popup: brace protection stripped
+        // (the STORED entry keeps its {{…}} — other tests pin that).
+        assert!(
+            !resp.contains("{{"),
+            "response title must be display-clean, got: {resp}"
+        );
 
         let reopened = crate::open(dir.path()).unwrap();
         // Keyed by the library pattern, tagged in the sidecar.
@@ -1174,5 +1382,292 @@ mod tests {
             "GET /ping HTTP/1.1\r\nHost: evil.example.com\r\nOrigin: chrome-extension://abc\r\n\r\n",
         );
         assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+    }
+
+    #[test]
+    fn import_rejects_null_and_missing_origin() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let v = crate::init(dir.path()).unwrap();
+        let body = r#"{"metadata":{"title":"X"}}"#;
+        for origin_header in ["Origin: null\r\n", ""] {
+            let resp = run_request(
+                shared_for(Some(v.root.clone()), Some("L")),
+                &format!(
+                    "POST /import HTTP/1.1\r\nHost: 127.0.0.1\r\n{origin_header}\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            );
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "origin {origin_header:?} must be refused, got: {resp}"
+            );
+        }
+        // ...while /ping without an Origin still answers (curl debugging).
+        let resp = run_request(
+            shared_for(None, Some("L")),
+            "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+        // and no import happened
+        let reopened = crate::open(dir.path()).unwrap();
+        assert!(crate::list(&reopened, crate::Filter::All)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn oversized_headers_are_413() {
+        let _env = isolated_registry();
+        let junk = "x".repeat(MAX_HEAD + 1024);
+        let resp = run_request(
+            shared_for(None, Some("L")),
+            &format!("GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Junk: {junk}\r\n\r\n"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 413"), "got: {resp}");
+    }
+
+    #[test]
+    fn different_paper_with_colliding_key_is_added_with_letter_suffix() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = crate::init(dir.path()).unwrap();
+        let capture = |title: &str| ImportRequest {
+            identifier: None,
+            metadata: Some(ScrapedMetadata {
+                title: title.into(),
+                authors: vec!["Mu, Jesse".into()],
+                year: "2023".into(),
+                journal: "J".into(),
+                ..Default::default()
+            }),
+            tags: vec![],
+        };
+        let first = connector_import(&mut v, &capture("Learning to Compress Prompts")).unwrap();
+        assert_eq!(first.added, 1);
+
+        // A DIFFERENT paper whose base key collides must be ADDED under a
+        // suffixed key — never silently "skipped as a duplicate".
+        let mut v2 = crate::open(dir.path()).unwrap();
+        let second = connector_import(&mut v2, &capture("Learning to Compress Videos")).unwrap();
+        assert_eq!(
+            (second.added, second.skipped),
+            (1, 0),
+            "a different paper must not be dropped as a duplicate"
+        );
+        let reopened = crate::open(dir.path()).unwrap();
+        let listed = crate::list(&reopened, crate::Filter::All).unwrap();
+        assert_eq!(listed.len(), 2, "both papers must be in the library");
+        assert!(
+            second.citekey.starts_with(&first.citekey) && second.citekey != first.citekey,
+            "expected a suffixed key, got {:?} vs {:?}",
+            second.citekey,
+            first.citekey
+        );
+    }
+
+    #[test]
+    fn rename_policy_reports_renamed_with_letter_suffix() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = crate::init(dir.path()).unwrap();
+        crate::set_workflow(&mut v, None, None, Some("rename"), None, None).unwrap();
+        let req = ImportRequest {
+            identifier: None,
+            metadata: Some(ScrapedMetadata {
+                title: "Captured Paper Title".into(),
+                authors: vec!["Doe, Jane".into()],
+                year: "2024".into(),
+                journal: "J".into(),
+                ..Default::default()
+            }),
+            tags: vec![],
+        };
+        let first = connector_import(&mut v, &req).unwrap();
+        assert_eq!((first.added, first.renamed), (1, 0));
+
+        // Re-capturing the SAME paper under `rename` adds a suffixed twin —
+        // and must say so ("renamed"), never "already in your library".
+        let mut v2 = crate::open(dir.path()).unwrap();
+        let second = connector_import(&mut v2, &req).unwrap();
+        assert_eq!(
+            (second.added, second.renamed, second.skipped),
+            (0, 1, 0),
+            "a rename must be reported as renamed"
+        );
+        assert!(
+            second.citekey.starts_with(&first.citekey) && second.citekey != first.citekey,
+            "letter-suffix style expected: {:?} vs {:?}",
+            second.citekey,
+            first.citekey
+        );
+        let body = outcome_body(&second);
+        assert!(body.contains("\"renamed\":1"), "got: {body}");
+    }
+
+    #[test]
+    fn skip_recapture_still_applies_tags() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = crate::init(dir.path()).unwrap();
+        let make = |tags: Vec<String>| ImportRequest {
+            identifier: None,
+            metadata: Some(ScrapedMetadata {
+                title: "Captured Paper Title".into(),
+                authors: vec!["Doe, Jane".into()],
+                year: "2024".into(),
+                journal: "J".into(),
+                ..Default::default()
+            }),
+            tags,
+        };
+        let first = connector_import(&mut v, &make(vec![])).unwrap();
+        assert_eq!(first.added, 1);
+
+        // Re-capture with a tag: skipped as a duplicate, but the tag must land
+        // on the stored entry (that capture WAS the user's tagging gesture).
+        let mut v2 = crate::open(dir.path()).unwrap();
+        let second = connector_import(&mut v2, &make(vec!["to-read".into()])).unwrap();
+        assert_eq!((second.added, second.skipped), (0, 1));
+        assert!(second.tags_updated, "tags_updated must be reported");
+        assert_eq!(second.citekey, first.citekey, "the stored twin is named");
+        let body = outcome_body(&second);
+        assert!(body.contains("\"tags_updated\":true"), "got: {body}");
+
+        let reopened = crate::open(dir.path()).unwrap();
+        assert!(
+            crate::current_tags(&reopened, &first.citekey)
+                .unwrap()
+                .contains(&"to-read".to_string()),
+            "the popup tag must reach the stored entry"
+        );
+    }
+
+    #[test]
+    fn resolve_failure_with_usable_metadata_falls_back() {
+        let _env = isolated_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = crate::init(dir.path()).unwrap();
+        // An OpenReview link whose id can't be read (a profile/group page):
+        // with usable page metadata the capture must still land, marked as a
+        // fallback — not error out.
+        let req = ImportRequest {
+            identifier: Some("openreview:ICLR.cc/2024/Conference".into()),
+            metadata: Some(ScrapedMetadata {
+                title: "Rescued From Metadata".into(),
+                authors: vec!["Doe, Jane".into()],
+                year: "2024".into(),
+                booktitle: "Some Venue".into(),
+                item_type: "conference".into(),
+                ..Default::default()
+            }),
+            tags: vec![],
+        };
+        let out = connector_import(&mut v, &req).unwrap();
+        assert_eq!(out.added, 1);
+        let reason = out
+            .fallback
+            .clone()
+            .expect("outcome must be marked as a fallback");
+        assert!(
+            reason.to_lowercase().contains("openreview"),
+            "got: {reason}"
+        );
+        let body = outcome_body(&out);
+        assert!(body.contains("\"fallback\":"), "got: {body}");
+    }
+
+    #[test]
+    fn resolve_failure_without_metadata_still_errors() {
+        let req = ImportRequest {
+            identifier: Some("openreview:ICLR.cc/2024/Conference".into()),
+            metadata: None,
+            tags: vec![],
+        };
+        let err = resolve_entries(&req).unwrap_err();
+        assert!(err.to_lowercase().contains("openreview"), "got: {err}");
+    }
+
+    #[test]
+    fn metadata_fallback_keeps_the_failed_identifier_on_the_entry() {
+        let mut e = BibEntry::new("misc", "").with_field("title", "T");
+        attach_identifier(&mut e, "10.1145/1234.5678");
+        assert_eq!(e.get("doi"), Some("10.1145/1234.5678"));
+        // an existing doi is never clobbered
+        attach_identifier(&mut e, "doi:10.9/other");
+        assert_eq!(e.get("doi"), Some("10.1145/1234.5678"));
+        let mut a = BibEntry::new("misc", "").with_field("title", "T");
+        attach_identifier(&mut a, "arXiv:2301.00001v2");
+        assert_eq!(a.get("eprint"), Some("2301.00001v2"));
+        assert_eq!(a.get("archiveprefix"), Some("arXiv"));
+        let mut o = BibEntry::new("misc", "").with_field("title", "T");
+        attach_identifier(&mut o, "openreview:abc");
+        assert_eq!(o.fields.len(), 1, "an OpenReview id has no BibTeX field");
+    }
+
+    #[test]
+    fn venue_typed_page_without_a_venue_becomes_misc() {
+        // `citation_conference_title` present but blank: an @inproceedings
+        // with no booktitle is a hollow shell.
+        let m = ScrapedMetadata {
+            title: "Hollow".into(),
+            item_type: "conference".into(),
+            booktitle: "   ".into(),
+            ..Default::default()
+        };
+        let e = build_entry_from_metadata(&m).unwrap();
+        assert_eq!(e.entry_type(), "misc");
+        assert_eq!(e.get("booktitle"), None);
+        // ...while a real venue keeps its type
+        let m = ScrapedMetadata {
+            title: "Solid".into(),
+            item_type: "conference".into(),
+            booktitle: "Some Conference".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_entry_from_metadata(&m).unwrap().entry_type(),
+            "inproceedings"
+        );
+    }
+
+    #[test]
+    fn requests_are_served_concurrently() {
+        // Two pings on two connections at once: with per-connection threads
+        // the second must not wait for the first (the old single-threaded
+        // accept loop serialized every capture behind an in-flight fetch).
+        let _env = isolated_registry();
+        let shared = shared_for(None, Some("L"));
+        let cfg = ConnectorConfig {
+            port: 0,
+            shared,
+            on_import: Arc::new(|_| {}),
+        };
+        let handle = start(cfg).unwrap();
+        let port = handle.port();
+        // First client opens a connection and stalls (sends nothing yet).
+        let mut slow = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Second client must get an answer while the first is still silent.
+        let mut fast = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        fast.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        fast.write_all(
+            b"GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: chrome-extension://abc\r\n\r\n",
+        )
+        .unwrap();
+        let mut resp = String::new();
+        let _ = fast.read_to_string(&mut resp);
+        assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+        let _ = slow.write_all(b"\r\n");
+        handle.stop();
+    }
+
+    #[test]
+    fn outcome_title_is_brace_free_for_display() {
+        assert_eq!(
+            display_title("{{Attention}} {{Is}} All {{You}} Need"),
+            "Attention Is All You Need"
+        );
     }
 }
